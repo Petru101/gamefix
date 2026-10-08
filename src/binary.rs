@@ -28,6 +28,9 @@ pub struct Elf {
 pub struct Pe {
     pub bits: u8,
     pub installer: Option<&'static str>,
+    /// A .NET program (it has a CLR header): Mono runs these on Linux too, so next to a Linux
+    /// program it's usually part of the Linux build, not a Windows one (Terraria).
+    pub dotnet: bool,
 }
 
 pub fn identify(path: &Path) -> Option<Binary> {
@@ -202,15 +205,19 @@ fn elf(f: &mut File, h: &[u8]) -> Option<Elf> {
 
 fn pe(f: &mut File, h: &[u8]) -> Option<Pe> {
     let lfanew = u32le(h, 0x3c) as u64;
-    let nt = read_at(f, lfanew, 26)?;
+    let nt = read_at(f, lfanew, 24 + 240)?;
     if &nt[..4] != b"PE\0\0" {
         return None;
     }
-    let bits = match u16le(&nt, 24) {
-        0x10b => 32,
-        0x20b => 64,
+    // The optional header follows the 24-byte signature and COFF header; its data directories
+    // start at 96 (PE32) or 112 (PE32+), and entry 14 is the CLR runtime header.
+    let (bits, dirs) = match u16le(&nt, 24) {
+        0x10b => (32, 24 + 96),
+        0x20b => (64, 24 + 112),
         _ => return None,
     };
+    let count = u32le(&nt, dirs - 4) as usize;
+    let dotnet = count > 14 && u32le(&nt, dirs + 14 * 8) != 0;
     // Installer stubs name themselves in their resources, near the start of the file.
     let mut stub = Vec::new();
     f.seek(SeekFrom::Start(0)).ok()?;
@@ -219,5 +226,5 @@ fn pe(f: &mut File, h: &[u8]) -> Option<Pe> {
         .into_iter()
         .find(|(marker, _)| stub.windows(marker.len()).any(|w| w == marker.as_bytes()))
         .map(|(_, name)| name);
-    Some(Pe { bits, installer })
+    Some(Pe { bits, installer, dotnet })
 }

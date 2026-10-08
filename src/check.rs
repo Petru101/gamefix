@@ -62,6 +62,7 @@ pub struct Report {
 const OPTIONAL_PLUGINS: &[(&str, &str)] = &[
     ("ScreenSelector.so", "Unity's start-up resolution window"),
     ("libcoreclrtraceptprovider.so", ".NET's developer tracing"),
+    ("yad", "GOG's error-message window"),
 ];
 
 fn optional_plugin(path: &std::path::Path) -> Option<&'static str> {
@@ -76,7 +77,7 @@ pub fn check(game: &Game, system: &System) -> Report {
         if let Binary::Pe(pe) = &f.binary {
             match pe.installer {
                 Some(kind) => installers.push((f.path.clone(), kind)),
-                None if !scan::not_the_game(&f.path) => windows.push((f.path.clone(), pe.bits)),
+                None if !scan::not_the_game(&f.path) && !(pe.dotnet && game.main.is_some()) => windows.push((f.path.clone(), pe.bits)),
                 None => {}
             }
         }
