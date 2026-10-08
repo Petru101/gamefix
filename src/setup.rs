@@ -39,9 +39,12 @@ fn data_home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/share"))
 }
 
+/// File-name-safe form of a game's name. Letters of any alphabet stay ("ᗢ" is a game), and a
+/// name with nothing usable falls back to a number, so records never collide on an empty name.
 fn slug(name: &str) -> String {
-    let s: String = name.chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' }).collect();
-    s.split('-').filter(|p| !p.is_empty()).collect::<Vec<_>>().join("-")
+    let s: String = name.chars().map(|c| if c.is_alphanumeric() { c.to_lowercase().next().unwrap_or(c) } else { '-' }).collect();
+    let s = s.split('-').filter(|p| !p.is_empty()).collect::<Vec<_>>().join("-");
+    if s.is_empty() { format!("game-{:08x}", name.bytes().fold(0u32, |h, b| h.wrapping_mul(31).wrapping_add(b as u32))) } else { s }
 }
 
 fn record_path(game: &Game) -> PathBuf {
@@ -340,6 +343,13 @@ fn refresh_menu() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slugs_keep_any_alphabet() {
+        assert_eq!(slug("Final Shot"), "final-shot");
+        assert_eq!(slug("ᗢ"), "ᗢ");
+        assert!(slug("!!!").starts_with("game-"));
+    }
 
     #[test]
     fn launch_options_fit_around_existing_ones() {
