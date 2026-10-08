@@ -55,6 +55,18 @@ impl Steam {
         })
     }
 
+    /// Asks Steam to quit properly (saving its settings) and waits up to a minute.
+    pub fn shut_down(&self) -> bool {
+        let _ = std::process::Command::new("steam").arg("-shutdown").stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn();
+        for _ in 0..60 {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            if !self.running() {
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn running(&self) -> bool {
         let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
         [home.join(".steam/steam.pid"), home.join(".var/app/com.valvesoftware.Steam/.steam/steam.pid")].iter().any(|f| {

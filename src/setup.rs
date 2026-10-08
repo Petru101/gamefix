@@ -50,7 +50,7 @@ fn record_path(game: &Game) -> PathBuf {
 
 /// One argument of a desktop entry's Exec line, quoted by the spec's rules: inside double
 /// quotes `"`, `` ` ``, `$` and `\` take a backslash, and string escaping then doubles every `\`.
-fn exec_arg(arg: &str) -> String {
+pub fn exec_arg(arg: &str) -> String {
     let arg = arg.replace('%', "%%");
     if !arg.is_empty() && arg.chars().all(|c| c.is_ascii_alphanumeric() || "/-_.=+:,".contains(c)) {
         return arg;
@@ -272,6 +272,11 @@ fn launch_options(env: &[(&str, String)], hide_helpers: bool, existing: &str) ->
     };
     let line = settings.into_iter().chain([rest]).collect::<Vec<_>>().join(" ");
     if hide_helpers { format!("{HIDE_HELPERS} {line}") } else { line }
+}
+
+/// Whether undoing this game's setup changes Steam's files.
+pub fn touches_steam(game: &Game) -> bool {
+    fs::read_to_string(record_path(game)).is_ok_and(|r| r.lines().any(|l| l.starts_with("steam-")))
 }
 
 /// Reverses a setup, newest change first. Returns what was undone.
