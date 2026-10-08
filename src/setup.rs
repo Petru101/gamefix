@@ -84,7 +84,10 @@ fn icon(game: &Game, main: &Path) -> String {
 
 pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome, String> {
     let Some((main, _)) = game.main() else {
-        return Err("No Linux program in this folder. Setting up Windows games isn't supported yet.".into());
+        return match game.windows {
+            Some(i) => setup_windows(game, &game.files[i], targets),
+            None => Err("No game program in this folder. If it's an installer, install the game first and set up the folder it installs to.".into()),
+        };
     };
     if report.problems.iter().any(|p| matches!(p, Problem::WrongMachine(_))) {
         return Err("The program is built for a different processor; nothing can make it run here.".into());
@@ -207,6 +210,44 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
     Ok(Outcome { done, not_fixed })
 }
 
+/// A Windows-only game: a non-Steam shortcut forced to Proton, like ticking "Force the use of a
+/// specific Steam Play compatibility tool" in its properties.
+fn setup_windows(game: &Game, exe: &crate::scan::Found, targets: &Targets) -> Result<Outcome, String> {
+    if !targets.steam {
+        return Err("Windows games can only be set up in Steam for now: add --steam.".into());
+    }
+    let steam = Steam::find().ok_or("Steam isn't installed, or nobody has logged in to it yet.")?;
+    if steam.running() {
+        return Err(STEAM_OPEN.into());
+    }
+    let proton = steam.proton().ok_or("No Proton is installed in Steam. Install \"Proton Experimental\" from the Steam library (it's listed under Tools) and try again.")?;
+    if record_path(game).exists() {
+        undo(game)?;
+    }
+    let program = game.full(exe);
+    let workdir = program.parent().unwrap_or(&game.root);
+    let file = steam.shortcuts();
+    let shortcut = steam::Shortcut { name: &game.name, exe: &program, start_dir: workdir, icon: "", launch_options: "" };
+    let appid = steam::add_shortcut(&file, &shortcut)?;
+    let mut record = vec![format!("steam-shortcut\t{appid}\t{}", file.display())];
+    let config = steam.config();
+    let previous = steam::compat_tool(&config, appid)?;
+    steam::set_compat_tool(&config, appid, Some(&proton))?;
+    record.push(format!("steam-compat\t{appid}\t{}\t{}", config.display(), previous.map_or("-".to_string(), |p| format!("={p}"))));
+
+    let record_file = record_path(game);
+    fs::create_dir_all(record_file.parent().unwrap()).map_err(|e| e.to_string())?;
+    fs::write(&record_file, record.join("\n") + "\n").map_err(|e| e.to_string())?;
+    let mut not_fixed = Vec::new();
+    if targets.menu {
+        not_fixed.push("App-menu entries for Windows games aren't supported yet; start it from Steam.".into());
+    }
+    Ok(Outcome {
+        done: vec![format!("Added \"{}\" to Steam as a non-Steam game.", game.name), format!("Set it to run with Proton ({proton}).")],
+        not_fixed,
+    })
+}
+
 /// Steam runs launch options with `sh -c`, `%command%` standing for its launch helpers and the
 /// game. Settings go first and the wrapper right before `%command%`, so they fit around options
 /// already there (`gamemoderun %command%`, or bare game arguments like `-insecure`). Steam
@@ -242,11 +283,20 @@ pub fn undo(game: &Game) -> Result<Vec<String>, String> {
     }
     let mut undone = Vec::new();
     for line in record.lines().rev() {
-        if let ["steam-launch", appid, file, previous] = line.splitn(4, '\t').collect::<Vec<_>>().as_slice() {
-            let previous = previous.strip_prefix('=');
-            steam::set_launch_options(Path::new(file), appid.parse().map_err(|_| "bad record")?, previous)?;
-            undone.push(format!("Restored its launch options in Steam ({})", previous.unwrap_or("none")));
-            continue;
+        match line.splitn(4, '\t').collect::<Vec<_>>().as_slice() {
+            ["steam-launch", appid, file, previous] => {
+                let previous = previous.strip_prefix('=');
+                steam::set_launch_options(Path::new(file), appid.parse().map_err(|_| "bad record")?, previous)?;
+                undone.push(format!("Restored its launch options in Steam ({})", previous.unwrap_or("none")));
+                continue;
+            }
+            ["steam-compat", appid, file, previous] => {
+                let previous = previous.strip_prefix('=');
+                steam::set_compat_tool(Path::new(file), appid.parse().map_err(|_| "bad record")?, previous)?;
+                undone.push(format!("Restored its compatibility tool in Steam ({})", previous.unwrap_or("none")));
+                continue;
+            }
+            _ => {}
         }
         let parts: Vec<&str> = line.splitn(3, '\t').collect();
         match parts.as_slice() {

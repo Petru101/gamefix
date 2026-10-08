@@ -238,8 +238,11 @@ impl Report {
                 .map(|e| format!(", {}{}", e.name, e.version.as_ref().map(|v| format!(" {v}")).unwrap_or_default()))
                 .unwrap_or_default();
             let _ = writeln!(out, "  Runs:  {} (Linux, {}-bit{engine})", main.path.display(), elf.bits);
+        } else if let Some(Binary::Pe(pe)) = game.windows.map(|i| &game.files[i].binary) {
+            let engine = game.engine.as_ref().map(|e| format!(", {}{}", e.name, e.version.as_ref().map(|v| format!(" {v}")).unwrap_or_default())).unwrap_or_default();
+            let _ = writeln!(out, "  Runs:  {} (Windows, {}-bit{engine})", game.files[game.windows.unwrap()].path.display(), pe.bits);
         }
-        if !self.windows.is_empty() {
+        if !self.windows.is_empty() && game.windows.is_none() {
             let _ = writeln!(out, "  {}: {}", if game.main().is_some() { "Also has a Windows build" } else { "Windows build" }, self.windows.iter().map(|(p, bits)| format!("{} ({bits}-bit)", p.display())).collect::<Vec<_>>().join(", "));
         }
         for (p, kind) in &self.installers {
@@ -261,9 +264,9 @@ impl Report {
         for problem in &self.problems {
             match problem {
                 Problem::NoLinuxBuild => {
-                    let _ = writeln!(out, "✗ No Linux program found in this folder.");
-                    if !self.windows.is_empty() {
-                        let _ = writeln!(out, "    Fix: run the Windows build with Proton.");
+                    let _ = writeln!(out, "✗ No Linux version of the game in this folder.");
+                    if let Some(i) = game.windows {
+                        let _ = writeln!(out, "    Fix: run {} with Proton: gamefix setup --steam adds it to Steam that way.", game.files[i].path.display());
                     } else if !self.installers.is_empty() {
                         let _ = writeln!(out, "    It's an installer: run it with Proton first, then check the folder it installs to.");
                     }

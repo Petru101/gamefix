@@ -28,6 +28,8 @@ pub struct Game {
     pub files: Vec<Found>,
     /// Index into `files` of the Linux program to run.
     pub main: Option<usize>,
+    /// Index into `files` of the Windows program to run, when there's no Linux one.
+    pub windows: Option<usize>,
     pub engine: Option<Engine>,
 }
 
@@ -55,16 +57,22 @@ pub fn scan(path: &Path) -> Option<Game> {
     let mut files = Vec::new();
     walk(&root, Path::new(""), 0, &mut files);
 
-    let main = match chosen {
-        Some(c) => files.iter().position(|f| f.path == c),
+    let main = match &chosen {
+        Some(c) => files.iter().position(|f| &f.path == c),
         None => pick_main(&root, &files),
     };
-    let engine = main.and_then(|i| engine(&root, &files[i].path, &files));
-    let name = main
+    let windows = match (main, &chosen) {
+        (Some(_), _) => None,
+        (None, Some(c)) => files.iter().position(|f| &f.path == c && matches!(f.binary, Binary::Pe(_))),
+        (None, None) => pick_windows(&root, &files),
+    };
+    let program = main.or(windows);
+    let engine = program.and_then(|i| engine(&root, &files[i].path, &files));
+    let name = program
         .and_then(|i| unity_product(&root, &files[i].path))
         .or_else(|| root.file_name().map(|n| n.to_string_lossy().into_owned()))
         .unwrap_or_else(|| root.display().to_string());
-    Some(Game { root, name, files, main, engine })
+    Some(Game { root, name, files, main, windows, engine })
 }
 
 fn walk(root: &Path, rel: &Path, depth: usize, out: &mut Vec<Found>) {
@@ -126,6 +134,38 @@ fn pick_main(root: &Path, files: &[Found]) -> Option<usize> {
             if elf.machine == EM_X86_64 {
                 score += 2;
             } else if elf.machine == EM_386 {
+                score += 1;
+            }
+            Some((score, i))
+        })
+        .max_by_key(|&(score, i)| (score, std::cmp::Reverse(i)))
+        .map(|(_, i)| i)
+}
+
+/// The Windows game program: not an installer, helper or .NET part of a Linux build.
+fn pick_windows(root: &Path, files: &[Found]) -> Option<usize> {
+    let folder = root.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+    files
+        .iter()
+        .enumerate()
+        .filter_map(|(i, f)| {
+            let Binary::Pe(pe) = &f.binary else { return None };
+            if pe.installer.is_some() || not_the_game(&f.path) {
+                return None;
+            }
+            let dir = root.join(f.path.parent().unwrap_or(Path::new("")));
+            let s = stem(&f.path);
+            let mut score = 0;
+            if dir.join(format!("{s}_Data")).is_dir() {
+                score += 10;
+            }
+            if f.path.components().count() == 1 {
+                score += 3;
+            }
+            if folder.contains(&s.to_lowercase()) || s.to_lowercase().contains(&folder) {
+                score += 2;
+            }
+            if pe.bits == 64 {
                 score += 1;
             }
             Some((score, i))

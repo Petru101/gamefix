@@ -7,6 +7,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 pub struct Steam {
+    pub root: PathBuf,
     /// `userdata/<account id>` of the most recent user.
     pub user: PathBuf,
 }
@@ -19,7 +20,7 @@ impl Steam {
             .map(|p| home.join(p))
             .find(|p| p.join("userdata").is_dir())?;
         let user = most_recent_user(&root)?;
-        Some(Steam { user })
+        Some(Steam { root, user })
     }
 
     pub fn shortcuts(&self) -> PathBuf {
@@ -28,6 +29,30 @@ impl Steam {
 
     pub fn localconfig(&self) -> PathBuf {
         self.user.join("config/localconfig.vdf")
+    }
+
+    pub fn config(&self) -> PathBuf {
+        self.root.join("config/config.vdf")
+    }
+
+    /// The Proton to use for Windows games: Valve's Experimental if installed, else any
+    /// other Proton Steam knows about. These are Steam's internal names.
+    pub fn proton(&self) -> Option<String> {
+        let common = self.root.join("steamapps/common");
+        for (dir, name) in [("Proton - Experimental", "proton_experimental"), ("Proton 10.0", "proton_10"), ("Proton 9.0", "proton_9")] {
+            if common.join(dir).join("proton").is_file() {
+                return Some(name.into());
+            }
+        }
+        // Custom ones (GE-Proton) name themselves in compatibilitytool.vdf.
+        let custom = fs::read_dir(self.root.join("compatibilitytools.d")).ok()?;
+        custom.flatten().find_map(|d| {
+            let doc = vdf::parse(&fs::read_to_string(d.path().join("compatibilitytool.vdf")).ok()?).ok()?;
+            match vdf::get(&doc, &["compatibilitytools", "compat_tools"])? {
+                vdf::Node::Map(tools) => tools.first().map(|(name, _)| vdf::unescape(name)),
+                _ => None,
+            }
+        })
     }
 
     pub fn running(&self) -> bool {
@@ -82,6 +107,37 @@ pub fn set_launch_options(file: &Path, appid: u32, options: Option<&str>) -> Res
     path[5] = &id;
     let block = vdf::block(&mut doc, &path)?;
     vdf::replace(block, "LaunchOptions", options.map(|o| vdf::Node::Str(vdf::escape(o))));
+    fs::copy(file, file.with_extension("vdf.gamefix-backup")).map_err(|e| e.to_string())?;
+    let tmp = file.with_extension("vdf.gamefix-tmp");
+    fs::write(&tmp, vdf::write(&doc)).map_err(|e| e.to_string())?;
+    fs::rename(&tmp, file).map_err(|e| e.to_string())
+}
+
+const COMPAT_TOOLS: [&str; 5] = ["InstallConfigStore", "Software", "Valve", "Steam", "CompatToolMapping"];
+
+/// The compatibility tool forced for an app or shortcut, if any.
+pub fn compat_tool(file: &Path, appid: u32) -> Result<Option<String>, String> {
+    let doc = vdf::parse(&fs::read_to_string(file).map_err(|e| format!("{}: {e}", file.display()))?)?;
+    let id = appid.to_string();
+    Ok(match vdf::get(&doc, &[&COMPAT_TOOLS[..], &[id.as_str(), "name"]].concat()) {
+        Some(vdf::Node::Str(name)) => Some(vdf::unescape(name)),
+        _ => None,
+    })
+}
+
+/// Forces (or with None un-forces) a compatibility tool, as Properties → Compatibility does.
+pub fn set_compat_tool(file: &Path, appid: u32, tool: Option<&str>) -> Result<(), String> {
+    let text = fs::read_to_string(file).map_err(|e| format!("{}: {e}", file.display()))?;
+    let mut doc = vdf::parse(&text).map_err(|e| format!("{}: {e}, not changing it", file.display()))?;
+    let mapping = vdf::block(&mut doc, &COMPAT_TOOLS)?;
+    let entry = tool.map(|t| {
+        vdf::Node::Map(vec![
+            ("name".into(), vdf::Node::Str(vdf::escape(t))),
+            ("config".into(), vdf::Node::Str(String::new())),
+            ("priority".into(), vdf::Node::Str("250".into())),
+        ])
+    });
+    vdf::replace(mapping, &appid.to_string(), entry);
     fs::copy(file, file.with_extension("vdf.gamefix-backup")).map_err(|e| e.to_string())?;
     let tmp = file.with_extension("vdf.gamefix-tmp");
     fs::write(&tmp, vdf::write(&doc)).map_err(|e| e.to_string())?;
