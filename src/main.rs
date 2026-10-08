@@ -3,6 +3,7 @@ mod check;
 mod scan;
 mod setup;
 mod steam;
+mod vdf;
 mod system;
 
 use std::path::PathBuf;

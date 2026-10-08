@@ -2,6 +2,7 @@
 //!
 //! Steam rewrites its config files when it quits, so they are only changed while it's closed.
 
+use crate::vdf;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -25,6 +26,10 @@ impl Steam {
         self.user.join("config/shortcuts.vdf")
     }
 
+    pub fn localconfig(&self) -> PathBuf {
+        self.user.join("config/localconfig.vdf")
+    }
+
     pub fn running(&self) -> bool {
         let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
         [home.join(".steam/steam.pid"), home.join(".var/app/com.valvesoftware.Steam/.steam/steam.pid")].iter().any(|f| {
@@ -33,6 +38,54 @@ impl Steam {
             })
         })
     }
+}
+
+/// The Steam app installed in this folder (`<library>/steamapps/common/<installdir>`), from the
+/// library's `appmanifest_<appid>.acf` files.
+pub fn installed_app(dir: &Path) -> Option<u32> {
+    let common = dir.parent()?;
+    if common.file_name()? != "common" {
+        return None;
+    }
+    let installdir = dir.file_name()?.to_str()?;
+    fs::read_dir(common.parent()?).ok()?.flatten().find_map(|entry| {
+        let name = entry.file_name().into_string().ok()?;
+        let appid: u32 = name.strip_prefix("appmanifest_")?.strip_suffix(".acf")?.parse().ok()?;
+        let doc = vdf::parse(&fs::read_to_string(entry.path()).ok()?).ok()?;
+        match vdf::get(&doc, &["AppState", "installdir"])? {
+            vdf::Node::Str(dir) if vdf::unescape(dir) == installdir => Some(appid),
+            _ => None,
+        }
+    })
+}
+
+const LAUNCH_OPTIONS: [&str; 6] = ["UserLocalConfigStore", "Software", "Valve", "Steam", "apps", ""];
+
+/// A Steam game's launch options (unescaped), if it has any.
+pub fn launch_options(file: &Path, appid: u32) -> Result<Option<String>, String> {
+    let doc = vdf::parse(&fs::read_to_string(file).map_err(|e| format!("{}: {e}", file.display()))?)?;
+    let id = appid.to_string();
+    let mut path = LAUNCH_OPTIONS;
+    path[5] = &id;
+    Ok(match vdf::get(&doc, &[&path[..], &["LaunchOptions"]].concat()) {
+        Some(vdf::Node::Str(v)) => Some(vdf::unescape(v)),
+        _ => None,
+    })
+}
+
+/// Sets (or with None removes) a Steam game's launch options.
+pub fn set_launch_options(file: &Path, appid: u32, options: Option<&str>) -> Result<(), String> {
+    let text = fs::read_to_string(file).map_err(|e| format!("{}: {e}", file.display()))?;
+    let mut doc = vdf::parse(&text).map_err(|e| format!("{}: {e}, not changing it", file.display()))?;
+    let id = appid.to_string();
+    let mut path = LAUNCH_OPTIONS;
+    path[5] = &id;
+    let block = vdf::block(&mut doc, &path)?;
+    vdf::replace(block, "LaunchOptions", options.map(|o| vdf::Node::Str(vdf::escape(o))));
+    fs::copy(file, file.with_extension("vdf.gamefix-backup")).map_err(|e| e.to_string())?;
+    let tmp = file.with_extension("vdf.gamefix-tmp");
+    fs::write(&tmp, vdf::write(&doc)).map_err(|e| e.to_string())?;
+    fs::rename(&tmp, file).map_err(|e| e.to_string())
 }
 
 /// The user marked "MostRecent" in loginusers.vdf; their folder is the SteamID64's low 32 bits.

@@ -22,6 +22,12 @@ pub struct Targets {
     pub steam: bool,
 }
 
+const BWRAP: &str = "/usr/bin/bwrap";
+
+/// A private process namespace with its own /proc. bwrap stays process 1 there, so the game
+/// still gets ordinary signals (Steam's Stop button); everything else is the normal system.
+const HIDE_OTHER_PROGRAMS: [&str; 8] = [BWRAP, "--dev-bind", "/", "/", "--proc", "/proc", "--unshare-pid", "--die-with-parent"];
+
 const STEAM_OPEN: &str = "Steam is open. Close it first (Steam → Exit): it rewrites its game list when it quits, which would undo the change.";
 
 fn data_home() -> PathBuf {
@@ -96,6 +102,8 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
     let program = game.full(main);
     // Launch-time settings, as (name, value).
     let mut env: Vec<(&str, String)> = Vec::new();
+    // A program the game is started through.
+    let mut wrapper: Vec<String> = Vec::new();
     let mut done = Vec::new();
     let mut not_fixed = Vec::new();
     let mut record = Vec::new();
@@ -122,7 +130,14 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
                 }
             }
             Problem::MissingLibs { .. } => not_fixed.push("Missing libraries: needs the Steam Linux Runtime, which setup doesn't do yet.".into()),
-            Problem::UnitySingleInstance => not_fixed.push("Old Unity \"Player is already running\": not handled yet. If it happens, close Steam before starting.".into()),
+            Problem::UnitySingleInstance => {
+                if Path::new(BWRAP).is_file() {
+                    wrapper.extend(HIDE_OTHER_PROGRAMS.iter().map(|w| w.to_string()));
+                    done.push("Starts it where it can't see other programs, so it can't mistake them for itself (at launch).".into());
+                } else {
+                    not_fixed.push("Old Unity \"Player is already running\": needs bwrap, which isn't installed. If it happens, close Steam before starting.".into());
+                }
+            }
             Problem::NoLinuxBuild | Problem::WrongMachine(_) => {}
         }
     }
@@ -135,6 +150,7 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
             exec.push("env".to_string());
             exec.extend(env.iter().map(|(k, v)| exec_arg(&format!("{k}={v}"))));
         }
+        exec.extend(wrapper.iter().map(|w| exec_arg(w)));
         exec.push(exec_arg(&program.display().to_string()));
         let entry_text = format!(
             "[Desktop Entry]\nType=Application\nName={}\nComment=Set up by gamefix\nExec={}\nPath={}\nIcon={}\nCategories=Game;\nTerminal=false\nX-Gamefix-Game={}\n",
@@ -152,14 +168,25 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
         done.push(format!("Added \"{}\" to the app menu, under Games.", game.name));
     }
 
-    if let Some(steam) = &steam {
+    if let (Some(steam), Some(appid)) = (&steam, steam::installed_app(&game.root)) {
+        // A Steam game: its own launch options, keeping whatever was there.
+        let file = steam.localconfig();
+        let previous = steam::launch_options(&file, appid)?;
+        let options = launch_options(&env, &wrapper, previous.as_deref().unwrap_or(""));
+        if options != previous.clone().unwrap_or_default() {
+            steam::set_launch_options(&file, appid, Some(&options))?;
+            let previous = previous.map_or("-".to_string(), |p| format!("={p}"));
+            record.push(format!("steam-launch\t{appid}\t{}\t{previous}", file.display()));
+            done.push(format!("Set its launch options in Steam: {options}"));
+        }
+    } else if let Some(steam) = &steam {
         let file = steam.shortcuts();
         let shortcut = steam::Shortcut {
             name: &game.name,
             exe: &program,
             start_dir: workdir,
             icon: if icon.starts_with('/') { &icon } else { "" },
-            launch_options: &launch_options(&env),
+            launch_options: &launch_options(&env, &wrapper, ""),
         };
         let appid = steam::add_shortcut(&file, &shortcut)?;
         record.push(format!("steam-shortcut\t{appid}\t{}", file.display()));
@@ -175,29 +202,47 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
     Ok(Outcome { done, not_fixed })
 }
 
-/// Steam runs launch options through a shell with `%command%` standing for the game. Steam
-/// itself preloads its overlay, so LD_PRELOAD adds to it instead of replacing it.
-fn launch_options(env: &[(&str, String)]) -> String {
-    if env.is_empty() {
-        return String::new();
+/// Steam runs launch options through a shell with `%command%` standing for the game. Settings
+/// go first and the wrapper right before `%command%`, so they fit around options already there
+/// (`gamemoderun %command%`, or bare game arguments like `-insecure`). Steam itself preloads its
+/// overlay, so LD_PRELOAD adds to it instead of replacing it.
+fn launch_options(env: &[(&str, String)], wrapper: &[String], existing: &str) -> String {
+    if env.is_empty() && wrapper.is_empty() {
+        return existing.to_string();
     }
-    let mut parts: Vec<String> = env
+    let quote = |v: &str| if v.chars().all(|c| c.is_ascii_alphanumeric() || "/-_.=+:,".contains(c)) { v.to_string() } else { format!("'{}'", v.replace('\'', "'\\''")) };
+    let settings: Vec<String> = env
         .iter()
-        .map(|(k, v)| if *k == "LD_PRELOAD" { format!("LD_PRELOAD=\"$LD_PRELOAD:{v}\"") } else { format!("{k}='{}'", v.replace('\'', "'\\''")) })
+        .map(|(k, v)| if *k == "LD_PRELOAD" { format!("LD_PRELOAD=\"$LD_PRELOAD:{v}\"") } else { format!("{k}={}", quote(v)) })
         .collect();
-    parts.push("%command%".into());
-    parts.join(" ")
+    let command: Vec<String> = wrapper.iter().map(|w| quote(w)).chain(["%command%".to_string()]).collect();
+    let command = command.join(" ");
+    let existing = existing.trim();
+    let rest = if existing.contains("%command%") {
+        existing.replacen("%command%", &command, 1)
+    } else if existing.is_empty() {
+        command
+    } else {
+        format!("{command} {existing}")
+    };
+    settings.into_iter().chain([rest]).collect::<Vec<_>>().join(" ")
 }
 
 /// Reverses a setup, newest change first. Returns what was undone.
 pub fn undo(game: &Game) -> Result<Vec<String>, String> {
     let record_file = record_path(game);
     let record = fs::read_to_string(&record_file).map_err(|_| format!("{} wasn't set up by gamefix.", game.name))?;
-    if record.lines().any(|l| l.starts_with("steam-shortcut\t")) && Steam::find().is_some_and(|s| s.running()) {
+    if record.lines().any(|l| l.starts_with("steam-")) && Steam::find().is_some_and(|s| s.running()) {
         return Err(STEAM_OPEN.into());
     }
     let mut undone = Vec::new();
     for line in record.lines().rev() {
+        if let ["steam-launch", appid, file, previous] = line.splitn(4, '\t').collect::<Vec<_>>().as_slice() {
+            let previous = previous.strip_prefix('=');
+            steam::set_launch_options(Path::new(file), appid.parse().map_err(|_| "bad record")?, previous)?;
+            undone.push(format!("Restored its launch options in Steam ({})", previous.unwrap_or("none")));
+            continue;
+        }
         let parts: Vec<&str> = line.splitn(3, '\t').collect();
         match parts.as_slice() {
             ["created", path] => {
@@ -230,4 +275,19 @@ pub fn undo(game: &Game) -> Result<Vec<String>, String> {
 /// KDE notices new entries by itself, but only after a while; this makes it immediate.
 fn refresh_menu() {
     let _ = Command::new("kbuildsycoca6").arg("--noincremental").output();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn launch_options_fit_around_existing_ones() {
+        let env = [("GLIBC_TUNABLES", "glibc.rtld.execstack=2".to_string())];
+        let wrap = ["bwrap".to_string(), "--unshare-pid".to_string()];
+        assert_eq!(launch_options(&env, &wrap, ""), "GLIBC_TUNABLES=glibc.rtld.execstack=2 bwrap --unshare-pid %command%");
+        assert_eq!(launch_options(&[], &wrap, "STEAM_COMPAT_LAUNCHER_SERVICE=proton %command%"), "STEAM_COMPAT_LAUNCHER_SERVICE=proton bwrap --unshare-pid %command%");
+        assert_eq!(launch_options(&[], &wrap, "-insecure"), "bwrap --unshare-pid %command% -insecure");
+        assert_eq!(launch_options(&[], &[], "-insecure"), "-insecure");
+    }
 }
