@@ -24,9 +24,12 @@ pub struct Targets {
 
 const BWRAP: &str = "/usr/bin/bwrap";
 
-/// A private process namespace with its own /proc. bwrap stays process 1 there, so the game
-/// still gets ordinary signals (Steam's Stop button); everything else is the normal system.
-const HIDE_OTHER_PROGRAMS: [&str; 8] = [BWRAP, "--dev-bind", "/", "/", "--proc", "/proc", "--unshare-pid", "--die-with-parent"];
+/// Shell code that leaves `"$@"` as a bwrap command hiding the command line of every program
+/// started as `/proc/self/exe` (Steam's and Chrome's helpers), which old Unity mistakes for
+/// itself. Everything else, Steam included, stays visible: a private PID namespace hid Steam
+/// too, so Steamworks games hung and Steam lost track of them. The helpers' numbers change, so
+/// they are looked up at each launch.
+const HIDE_HELPERS: &str = "set -- /usr/bin/bwrap --dev-bind / /; for p in /proc/[0-9]*; do [ \"$(tr '\\0' '\\n' < $p/cmdline 2>/dev/null | head -n 1)\" = /proc/self/exe ] && set -- \"$@\" --ro-bind /dev/null $p/cmdline; done;";
 
 const STEAM_OPEN: &str = "Steam is open. Close it first (Steam → Exit): it rewrites its game list when it quits, which would undo the change.";
 
@@ -102,8 +105,8 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
     let program = game.full(main);
     // Launch-time settings, as (name, value).
     let mut env: Vec<(&str, String)> = Vec::new();
-    // A program the game is started through.
-    let mut wrapper: Vec<String> = Vec::new();
+    // Whether to start it through HIDE_HELPERS.
+    let mut hide_helpers = false;
     let mut done = Vec::new();
     let mut not_fixed = Vec::new();
     let mut record = Vec::new();
@@ -132,8 +135,8 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
             Problem::MissingLibs { .. } => not_fixed.push("Missing libraries: needs the Steam Linux Runtime, which setup doesn't do yet.".into()),
             Problem::UnitySingleInstance => {
                 if Path::new(BWRAP).is_file() {
-                    wrapper.extend(HIDE_OTHER_PROGRAMS.iter().map(|w| w.to_string()));
-                    done.push("Starts it where it can't see other programs, so it can't mistake them for itself (at launch).".into());
+                    hide_helpers = true;
+                    done.push("Hides the browser helpers it would mistake for itself (at launch).".into());
                 } else {
                     not_fixed.push("Old Unity \"Player is already running\": needs bwrap, which isn't installed. If it happens, close Steam before starting.".into());
                 }
@@ -150,7 +153,9 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
             exec.push("env".to_string());
             exec.extend(env.iter().map(|(k, v)| exec_arg(&format!("{k}={v}"))));
         }
-        exec.extend(wrapper.iter().map(|w| exec_arg(w)));
+        if hide_helpers {
+            exec.extend(["sh", "-c", &format!("{HIDE_HELPERS} exec \"$@\" \"$0\"")].map(exec_arg));
+        }
         exec.push(exec_arg(&program.display().to_string()));
         let entry_text = format!(
             "[Desktop Entry]\nType=Application\nName={}\nComment=Set up by gamefix\nExec={}\nPath={}\nIcon={}\nCategories=Game;\nTerminal=false\nX-Gamefix-Game={}\n",
@@ -172,7 +177,7 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
         // A Steam game: its own launch options, keeping whatever was there.
         let file = steam.localconfig();
         let previous = steam::launch_options(&file, appid)?;
-        let options = launch_options(&env, &wrapper, previous.as_deref().unwrap_or(""));
+        let options = launch_options(&env, hide_helpers, previous.as_deref().unwrap_or(""));
         if options != previous.clone().unwrap_or_default() {
             steam::set_launch_options(&file, appid, Some(&options))?;
             let previous = previous.map_or("-".to_string(), |p| format!("={p}"));
@@ -186,7 +191,7 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
             exe: &program,
             start_dir: workdir,
             icon: if icon.starts_with('/') { &icon } else { "" },
-            launch_options: &launch_options(&env, &wrapper, ""),
+            launch_options: &launch_options(&env, hide_helpers, ""),
         };
         let appid = steam::add_shortcut(&file, &shortcut)?;
         record.push(format!("steam-shortcut\t{appid}\t{}", file.display()));
@@ -202,12 +207,12 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
     Ok(Outcome { done, not_fixed })
 }
 
-/// Steam runs launch options through a shell with `%command%` standing for the game. Settings
-/// go first and the wrapper right before `%command%`, so they fit around options already there
-/// (`gamemoderun %command%`, or bare game arguments like `-insecure`). Steam itself preloads its
-/// overlay, so LD_PRELOAD adds to it instead of replacing it.
-fn launch_options(env: &[(&str, String)], wrapper: &[String], existing: &str) -> String {
-    if env.is_empty() && wrapper.is_empty() {
+/// Steam runs launch options with `sh -c`, `%command%` standing for its launch helpers and the
+/// game. Settings go first and the wrapper right before `%command%`, so they fit around options
+/// already there (`gamemoderun %command%`, or bare game arguments like `-insecure`). Steam
+/// itself preloads its overlay, so LD_PRELOAD adds to it instead of replacing it.
+fn launch_options(env: &[(&str, String)], hide_helpers: bool, existing: &str) -> String {
+    if env.is_empty() && !hide_helpers {
         return existing.to_string();
     }
     let quote = |v: &str| if v.chars().all(|c| c.is_ascii_alphanumeric() || "/-_.=+:,".contains(c)) { v.to_string() } else { format!("'{}'", v.replace('\'', "'\\''")) };
@@ -215,17 +220,17 @@ fn launch_options(env: &[(&str, String)], wrapper: &[String], existing: &str) ->
         .iter()
         .map(|(k, v)| if *k == "LD_PRELOAD" { format!("LD_PRELOAD=\"$LD_PRELOAD:{v}\"") } else { format!("{k}={}", quote(v)) })
         .collect();
-    let command: Vec<String> = wrapper.iter().map(|w| quote(w)).chain(["%command%".to_string()]).collect();
-    let command = command.join(" ");
+    let command = if hide_helpers { "\"$@\" %command%" } else { "%command%" };
     let existing = existing.trim();
     let rest = if existing.contains("%command%") {
-        existing.replacen("%command%", &command, 1)
+        existing.replacen("%command%", command, 1)
     } else if existing.is_empty() {
-        command
+        command.to_string()
     } else {
         format!("{command} {existing}")
     };
-    settings.into_iter().chain([rest]).collect::<Vec<_>>().join(" ")
+    let line = settings.into_iter().chain([rest]).collect::<Vec<_>>().join(" ");
+    if hide_helpers { format!("{HIDE_HELPERS} {line}") } else { line }
 }
 
 /// Reverses a setup, newest change first. Returns what was undone.
@@ -284,10 +289,16 @@ mod tests {
     #[test]
     fn launch_options_fit_around_existing_ones() {
         let env = [("GLIBC_TUNABLES", "glibc.rtld.execstack=2".to_string())];
-        let wrap = ["bwrap".to_string(), "--unshare-pid".to_string()];
-        assert_eq!(launch_options(&env, &wrap, ""), "GLIBC_TUNABLES=glibc.rtld.execstack=2 bwrap --unshare-pid %command%");
-        assert_eq!(launch_options(&[], &wrap, "STEAM_COMPAT_LAUNCHER_SERVICE=proton %command%"), "STEAM_COMPAT_LAUNCHER_SERVICE=proton bwrap --unshare-pid %command%");
-        assert_eq!(launch_options(&[], &wrap, "-insecure"), "bwrap --unshare-pid %command% -insecure");
-        assert_eq!(launch_options(&[], &[], "-insecure"), "-insecure");
+        assert_eq!(launch_options(&env, false, ""), "GLIBC_TUNABLES=glibc.rtld.execstack=2 %command%");
+        assert_eq!(launch_options(&[], true, "STEAM_COMPAT_LAUNCHER_SERVICE=proton %command%"), format!("{HIDE_HELPERS} STEAM_COMPAT_LAUNCHER_SERVICE=proton \"$@\" %command%"));
+        assert_eq!(launch_options(&env, false, "-insecure"), "GLIBC_TUNABLES=glibc.rtld.execstack=2 %command% -insecure");
+        assert_eq!(launch_options(&[], false, "-insecure"), "-insecure");
+    }
+
+    /// The snippet must hide exactly the /proc/self/exe helpers and run the command after it.
+    #[test]
+    fn hide_helpers_runs_the_command() {
+        let out = std::process::Command::new("sh").arg("-c").arg(format!("{HIDE_HELPERS} printf '%s ' \"$@\"")).output().unwrap();
+        assert!(String::from_utf8_lossy(&out.stdout).starts_with("/usr/bin/bwrap --dev-bind / / "));
     }
 }
