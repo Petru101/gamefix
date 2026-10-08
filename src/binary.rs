@@ -112,6 +112,25 @@ pub fn symbols(path: &Path) -> Option<Symbols> {
     Some(out)
 }
 
+/// Whether the file holds these bytes anywhere.
+pub fn contains(path: &Path, needle: &[u8]) -> bool {
+    let Ok(mut f) = File::open(path) else { return false };
+    let mut buf = vec![0u8; 1 << 20];
+    let mut carry = 0;
+    loop {
+        let Ok(n) = f.read(&mut buf[carry..]) else { return false };
+        if n == 0 {
+            return false;
+        }
+        let end = carry + n;
+        if buf[..end].windows(needle.len()).any(|w| w == needle) {
+            return true;
+        }
+        carry = (needle.len() - 1).min(end);
+        buf.copy_within(end - carry..end, 0);
+    }
+}
+
 fn read_at(f: &mut File, off: u64, len: usize) -> Option<Vec<u8>> {
     let mut buf = vec![0; len];
     f.seek(SeekFrom::Start(off)).ok()?;

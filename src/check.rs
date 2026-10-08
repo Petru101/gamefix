@@ -264,7 +264,7 @@ impl Report {
         for problem in &self.problems {
             match problem {
                 Problem::NoLinuxBuild => {
-                    let _ = writeln!(out, "✗ No Linux version of the game in this folder.");
+                    let _ = writeln!(out, "✗ There is no Linux version of this game.");
                     if let Some(i) = game.windows {
                         let _ = writeln!(out, "    Fix: run {} with Proton: gamefix setup --steam adds it to Steam that way.", game.files[i].path.display());
                     } else if !self.installers.is_empty() {

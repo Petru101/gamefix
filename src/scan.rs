@@ -55,24 +55,41 @@ pub fn scan(path: &Path) -> Option<Game> {
         (path.parent()?.to_path_buf(), Some(PathBuf::from(path.file_name()?)))
     };
     let mut files = Vec::new();
-    walk(&root, Path::new(""), 0, &mut files);
+    match &chosen {
+        // A loose download among others: the file is the whole game.
+        Some(c) if shared_folder(&root) => {
+            if let Some(binary) = binary::identify(&root.join(c)) {
+                files.push(Found { path: c.clone(), binary });
+            }
+        }
+        _ => walk(&root, Path::new(""), 0, &mut files),
+    }
 
-    let main = match &chosen {
-        Some(c) => files.iter().position(|f| &f.path == c),
-        None => pick_main(&root, &files),
+    let picked = |want_elf: bool| {
+        let c = chosen.as_ref()?;
+        files.iter().position(|f| &f.path == c && matches!((&f.binary, want_elf), (Binary::Elf(_), true) | (Binary::Pe(_), false)))
     };
-    let windows = match (main, &chosen) {
-        (Some(_), _) => None,
-        (None, Some(c)) => files.iter().position(|f| &f.path == c && matches!(f.binary, Binary::Pe(_))),
-        (None, None) => pick_windows(&root, &files),
+    let main = if chosen.is_some() { picked(true) } else { pick_main(&root, &files) };
+    let windows = match main {
+        Some(_) => None,
+        None if chosen.is_some() => picked(false),
+        None => pick_windows(&root, &files),
     };
     let program = main.or(windows);
     let engine = program.and_then(|i| engine(&root, &files[i].path, &files));
     let name = program
         .and_then(|i| unity_product(&root, &files[i].path))
+        .or_else(|| chosen.as_ref().filter(|_| shared_folder(&root)).map(|c| stem(c)))
         .or_else(|| root.file_name().map(|n| n.to_string_lossy().into_owned()))
         .unwrap_or_else(|| root.display().to_string());
     Some(Game { root, name, files, main, windows, engine })
+}
+
+/// Folders that hold unrelated downloads rather than one game.
+fn shared_folder(dir: &Path) -> bool {
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+    let dir = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    ["", "Downloads", "Desktop", "Documents"].iter().any(|d| fs::canonicalize(home.join(d)).is_ok_and(|h| h == dir))
 }
 
 fn walk(root: &Path, rel: &Path, depth: usize, out: &mut Vec<Found>) {
@@ -190,6 +207,10 @@ fn engine(root: &Path, main: &Path, files: &[Found]) -> Option<Engine> {
         return Some(Engine { name: "Unreal Engine", version: None });
     }
     if dir.join("assets/game.unx").is_file() || dir.join("game.unx").is_file() {
+        return Some(Engine { name: "GameMaker", version: None });
+    }
+    // GameMaker games ship data.win next to the program, or packed inside it.
+    if dir.join("data.win").is_file() || (main.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe")) && binary::contains(&dir.join(main.file_name()?), b"data.win")) {
         return Some(Engine { name: "GameMaker", version: None });
     }
     if root.join("renpy").is_dir() {
