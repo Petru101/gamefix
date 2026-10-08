@@ -15,6 +15,8 @@ pub enum Problem {
     /// Library name → the game's files that need it.
     MissingLibs { bits: u8, libs: BTreeMap<String, Vec<PathBuf>> },
     ExecStack(Vec<PathBuf>),
+    /// Unity before 5.4: its single-instance check mistakes other programs for the game.
+    UnitySingleInstance,
 }
 
 pub struct Report {
@@ -102,6 +104,14 @@ pub fn check(game: &Game, system: &System) -> Report {
         problems.push(Problem::ExecStack(exec_stack));
     }
 
+    let old_unity = game.engine.as_ref().filter(|e| e.name == "Unity").and_then(|e| e.version.as_deref()).and_then(|v| {
+        let mut parts = v.split('.');
+        Some((parts.next()?.parse::<u32>().ok()?, parts.next()?.parse::<u32>().ok()?))
+    });
+    if old_unity.is_some_and(|v| v < (5, 4)) {
+        problems.push(Problem::UnitySingleInstance);
+    }
+
     report.problems = problems;
     report
 }
@@ -176,6 +186,13 @@ impl Report {
                     let _ = writeln!(out, "  screen; whatever uses it (often the sound) just doesn't work:");
                     list(&mut out, paths);
                     let _ = writeln!(out, "    Fix (at launch): GLIBC_TUNABLES=glibc.rtld.execstack=2");
+                }
+                Problem::UnitySingleInstance => {
+                    let _ = writeln!(out, "✗ Unity before 5.4 may quit at once with \"Player is already running\" while Steam or");
+                    let _ = writeln!(out, "  another Chrome-based app is open: its check that it isn't running twice mistakes their");
+                    let _ = writeln!(out, "  helper processes for the game (Particle Fleet, Creeper World 3).");
+                    let _ = writeln!(out, "    Fix: start it where it can't see other programs (a private process namespace),");
+                    let _ = writeln!(out, "    or run the Windows build with Proton.");
                 }
             }
             let _ = writeln!(out);
