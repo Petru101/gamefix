@@ -1,6 +1,6 @@
 //! Turns what the scan found into problems, each with what it means and how to fix it.
 
-use crate::binary::{Binary, Elf, EM_386, EM_X86_64};
+use crate::binary::{self, Binary, Elf, EM_386, EM_X86_64};
 use crate::scan::{self, Game};
 use crate::system::System;
 use std::collections::{BTreeMap, HashSet};
@@ -15,6 +15,9 @@ pub enum Problem {
     /// Library name → the game's files that need it.
     MissingLibs { bits: u8, libs: BTreeMap<String, Vec<PathBuf>> },
     ExecStack(Vec<PathBuf>),
+    /// Unity's player carries its own FMOD and exports it, so the game's FMOD Studio library
+    /// binds to that one and refuses the version: no sound. Holds the libraries to preload.
+    FmodClash(Vec<PathBuf>),
     /// Unity before 5.4: its single-instance check mistakes other programs for the game.
     UnitySingleInstance,
 }
@@ -104,6 +107,10 @@ pub fn check(game: &Game, system: &System) -> Report {
         problems.push(Problem::ExecStack(exec_stack));
     }
 
+    if let Some(libs) = fmod_clash(game, &same) {
+        problems.push(Problem::FmodClash(libs));
+    }
+
     let old_unity = game.engine.as_ref().filter(|e| e.name == "Unity").and_then(|e| e.version.as_deref()).and_then(|v| {
         let mut parts = v.split('.');
         Some((parts.next()?.parse::<u32>().ok()?, parts.next()?.parse::<u32>().ok()?))
@@ -114,6 +121,18 @@ pub fn check(game: &Game, system: &System) -> Report {
 
     report.problems = problems;
     report
+}
+
+/// FMOD Studio resolves its core calls (FMOD::System::getVersion first) through the global
+/// symbol scope, where UnityPlayer.so, loaded before any plugin, already exports Unity's own FMOD.
+fn fmod_clash(game: &Game, same: &[(&PathBuf, &Elf)]) -> Option<Vec<PathBuf>> {
+    const PROBE: &[u8] = b"_ZN4FMOD6System10getVersionEPj";
+    let find = |name: &str| same.iter().find(|(p, _)| p.file_name().is_some_and(|n| n == name)).map(|(p, _)| (*p).clone());
+    let player = find("UnityPlayer.so")?;
+    let studio = find("libfmodstudio.so")?;
+    let core = find("libfmod.so")?;
+    let full = |p: &PathBuf| game.root.join(p);
+    (binary::contains(&full(&player), PROBE) && binary::contains(&full(&studio), PROBE)).then(|| vec![core, studio])
 }
 
 fn list(out: &mut String, paths: &[PathBuf]) {
@@ -186,6 +205,12 @@ impl Report {
                     let _ = writeln!(out, "  screen; whatever uses it (often the sound) just doesn't work:");
                     list(&mut out, paths);
                     let _ = writeln!(out, "    Fix (at launch): GLIBC_TUNABLES=glibc.rtld.execstack=2");
+                }
+                Problem::FmodClash(libs) => {
+                    let _ = writeln!(out, "✗ The game's sound (FMOD) can't start: Unity's player has its own, older FMOD built in,");
+                    let _ = writeln!(out, "  and the game's FMOD library ends up talking to that copy and refuses the version.");
+                    let preload: Vec<String> = libs.iter().map(|p| game.root.join(p).display().to_string()).collect();
+                    let _ = writeln!(out, "    Fix (at launch): LD_PRELOAD={}", preload.join(":"));
                 }
                 Problem::UnitySingleInstance => {
                     let _ = writeln!(out, "✗ Unity before 5.4 may quit at once with \"Player is already running\" while Steam or");
