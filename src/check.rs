@@ -1,12 +1,13 @@
 //! Turns what the scan found into problems, each with what it means and how to fix it.
 
-use crate::binary::{self, Binary, Elf, EM_386, EM_X86_64};
+use crate::binary::{self, Binary, Elf, Symbols, EM_386, EM_X86_64};
 use crate::scan::{self, Game};
 use crate::system::System;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::ffi::OsStr;
 use std::fmt::Write;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub enum Problem {
     NoLinuxBuild,
@@ -15,11 +16,36 @@ pub enum Problem {
     /// Library name → the game's files that need it.
     MissingLibs { bits: u8, libs: BTreeMap<String, Vec<PathBuf>> },
     ExecStack(Vec<PathBuf>),
-    /// Unity's player carries its own FMOD and exports it, so the game's FMOD Studio library
-    /// binds to that one and refuses the version: no sound. Holds the libraries to preload.
-    FmodClash(Vec<PathBuf>),
+    /// Libraries that get another library's functions of the same name instead of the ones
+    /// they were built against (Final Shot: Unity's built-in FMOD answering for the game's).
+    SymbolClash(Vec<Clash>),
     /// Unity before 5.4: its single-instance check mistakes other programs for the game.
     UnitySingleInstance,
+}
+
+pub struct Clash {
+    /// The library that ends up calling the wrong functions.
+    pub victim: PathBuf,
+    /// The library it was built against.
+    pub provider: PathBuf,
+    /// The library loaded first whose same-named functions win.
+    pub shadow: PathBuf,
+    pub count: usize,
+    pub example: String,
+}
+
+impl Problem {
+    /// Libraries to put in LD_PRELOAD so the intended ones are found first: providers, then
+    /// the victims themselves (the combination tested on Final Shot).
+    pub fn preload(clashes: &[Clash]) -> Vec<PathBuf> {
+        let mut out: Vec<PathBuf> = Vec::new();
+        for p in clashes.iter().map(|c| &c.provider).chain(clashes.iter().map(|c| &c.victim)) {
+            if !out.contains(p) {
+                out.push(p.clone());
+            }
+        }
+        out
+    }
 }
 
 pub struct Report {
@@ -107,8 +133,9 @@ pub fn check(game: &Game, system: &System) -> Report {
         problems.push(Problem::ExecStack(exec_stack));
     }
 
-    if let Some(libs) = fmod_clash(game, &same) {
-        problems.push(Problem::FmodClash(libs));
+    let clashes = symbol_clashes(game, &main.path, &same);
+    if !clashes.is_empty() {
+        problems.push(Problem::SymbolClash(clashes));
     }
 
     let old_unity = game.engine.as_ref().filter(|e| e.name == "Unity").and_then(|e| e.version.as_deref()).and_then(|v| {
@@ -123,16 +150,74 @@ pub fn check(game: &Game, system: &System) -> Report {
     report
 }
 
-/// FMOD Studio resolves its core calls (FMOD::System::getVersion first) through the global
-/// symbol scope, where UnityPlayer.so, loaded before any plugin, already exports Unity's own FMOD.
-fn fmod_clash(game: &Game, same: &[(&PathBuf, &Elf)]) -> Option<Vec<PathBuf>> {
-    const PROBE: &[u8] = b"_ZN4FMOD6System10getVersionEPj";
-    let find = |name: &str| same.iter().find(|(p, _)| p.file_name().is_some_and(|n| n == name)).map(|(p, _)| (*p).clone());
-    let player = find("UnityPlayer.so")?;
-    let studio = find("libfmodstudio.so")?;
-    let core = find("libfmod.so")?;
-    let full = |p: &PathBuf| game.root.join(p);
-    (binary::contains(&full(&player), PROBE) && binary::contains(&full(&studio), PROBE)).then(|| vec![core, studio])
+/// glibc resolves a library's calls through the global scope first (the program and everything
+/// loaded with it at start), and only then through the library's own dependencies. So when a
+/// plugin loaded later expects functions from a bundled library, but a library loaded at start
+/// defines functions with the same names, the plugin silently gets those instead.
+fn symbol_clashes(game: &Game, main: &Path, same: &[(&PathBuf, &Elf)]) -> Vec<Clash> {
+    let mut by_name: HashMap<&OsStr, (&PathBuf, &Elf)> = HashMap::new();
+    for &(p, e) in same {
+        if let Some(n) = p.file_name() {
+            by_name.entry(n).or_insert((p, e));
+        }
+    }
+    let Some(&(_, main_elf)) = same.iter().find(|(p, _)| p.as_path() == main) else { return Vec::new() };
+
+    // The libraries loaded at start, in load order (breadth first, like ld.so).
+    let mut startup: Vec<&PathBuf> = Vec::new();
+    let mut queue: VecDeque<&Elf> = VecDeque::from([main_elf]);
+    while let Some(e) = queue.pop_front() {
+        for n in &e.needed {
+            if let Some(&(p, dep)) = by_name.get(OsStr::new(n)) {
+                if !startup.contains(&p) {
+                    startup.push(p);
+                    queue.push_back(dep);
+                }
+            }
+        }
+    }
+
+    let mut cache: HashMap<&PathBuf, Option<Symbols>> = HashMap::new();
+    let mut clashes = Vec::new();
+    for &(victim, e) in same {
+        if e.program || startup.contains(&victim) || optional_plugin(victim).is_some() {
+            continue;
+        }
+        for n in &e.needed {
+            let Some(&(provider, _)) = by_name.get(OsStr::new(n)) else { continue };
+            if startup.contains(&provider) {
+                continue;
+            }
+            for p in [victim, provider].into_iter().chain(startup.iter().copied()) {
+                cache.entry(p).or_insert_with(|| binary::symbols(&game.root.join(p)));
+            }
+            let (Some(Some(v)), Some(Some(pr))) = (cache.get(victim), cache.get(provider)) else { continue };
+            let mut per_shadow: BTreeMap<&PathBuf, Vec<&String>> = BTreeMap::new();
+            for sym in v.undefined.iter().filter(|s| pr.defined.contains(*s)) {
+                if let Some(shadow) = startup.iter().find(|g| cache.get(*g).and_then(|s| s.as_ref()).is_some_and(|s| s.defined.contains(sym))) {
+                    per_shadow.entry(shadow).or_default().push(sym);
+                }
+            }
+            for (shadow, mut syms) in per_shadow {
+                syms.sort();
+                clashes.push(Clash { victim: victim.clone(), provider: provider.clone(), shadow: shadow.clone(), count: syms.len(), example: readable(syms[0]) });
+            }
+        }
+    }
+    clashes
+}
+
+/// "_ZN4FMOD6System10getVersionEPj" → "FMOD::System::getVersion"; C names stay as they are.
+fn readable(sym: &str) -> String {
+    let Some(mut rest) = sym.strip_prefix("_ZN") else { return sym.to_string() };
+    let mut parts = Vec::new();
+    while let Some(len_end) = rest.find(|c: char| !c.is_ascii_digit()).filter(|&i| i > 0) {
+        let Ok(len) = rest[..len_end].parse::<usize>() else { break };
+        let Some(part) = rest.get(len_end..len_end + len) else { break };
+        parts.push(part);
+        rest = &rest[len_end + len..];
+    }
+    if parts.is_empty() { sym.to_string() } else { parts.join("::") }
 }
 
 fn list(out: &mut String, paths: &[PathBuf]) {
@@ -206,10 +291,15 @@ impl Report {
                     list(&mut out, paths);
                     let _ = writeln!(out, "    Fix (at launch): GLIBC_TUNABLES=glibc.rtld.execstack=2");
                 }
-                Problem::FmodClash(libs) => {
-                    let _ = writeln!(out, "✗ The game's sound (FMOD) can't start: Unity's player has its own, older FMOD built in,");
-                    let _ = writeln!(out, "  and the game's FMOD library ends up talking to that copy and refuses the version.");
-                    let preload: Vec<String> = libs.iter().map(|p| game.root.join(p).display().to_string()).collect();
+                Problem::SymbolClash(clashes) => {
+                    let _ = writeln!(out, "✗ Libraries that get the wrong functions: another library, loaded first, has functions");
+                    let _ = writeln!(out, "  with the same names, and Linux hands out those instead of the ones they were built for.");
+                    let _ = writeln!(out, "  Usually a feature (often the sound) quietly fails to start:");
+                    for c in clashes {
+                        let file = |p: &PathBuf| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                        let _ = writeln!(out, "      {} expects {} function{} from {} but gets {}'s (e.g. {})", file(&c.victim), c.count, if c.count == 1 { "" } else { "s" }, file(&c.provider), file(&c.shadow), c.example);
+                    }
+                    let preload: Vec<String> = Problem::preload(clashes).iter().map(|p| game.root.join(p).display().to_string()).collect();
                     let _ = writeln!(out, "    Fix (at launch): LD_PRELOAD={}", preload.join(":"));
                 }
                 Problem::UnitySingleInstance => {

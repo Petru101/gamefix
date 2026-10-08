@@ -93,14 +93,14 @@ pub fn setup(game: &Game, report: &Report) -> Result<Outcome, String> {
                 env.push("GLIBC_TUNABLES=glibc.rtld.execstack=2".to_string());
                 done.push("Lets its libraries that ask for an executable stack load (in the entry's command).".into());
             }
-            Problem::FmodClash(libs) => {
-                let paths: Vec<String> = libs.iter().map(|p| game.root.join(p).display().to_string()).collect();
+            Problem::SymbolClash(clashes) => {
+                let paths: Vec<String> = Problem::preload(clashes).iter().map(|p| game.root.join(p).display().to_string()).collect();
                 // LD_PRELOAD splits on spaces and colons, so such paths can't be listed in it.
                 if paths.iter().any(|p| p.contains([' ', ':'])) {
-                    not_fixed.push("Sound (FMOD clash): the game's path has a space or colon, which the fix can't handle; move the game to a folder without them.".into());
+                    not_fixed.push("Libraries getting the wrong functions: the game's path has a space or colon, which the fix can't handle; move the game to a folder without them.".into());
                 } else {
                     env.push(format!("LD_PRELOAD={}", paths.join(":")));
-                    done.push("Makes the game's sound library use its own FMOD instead of Unity's built-in one (in the entry's command).".into());
+                    done.push("Makes its libraries load first so they get their own functions (in the entry's command).".into());
                 }
             }
             Problem::MissingLibs { .. } => not_fixed.push("Missing libraries: needs the Steam Linux Runtime, which setup doesn't do yet.".into()),

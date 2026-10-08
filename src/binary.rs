@@ -1,5 +1,6 @@
 //! Reads just enough of ELF and PE files to tell what they are and what they need.
 
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
@@ -45,23 +46,67 @@ pub fn identify(path: &Path) -> Option<Binary> {
     }
 }
 
-/// Whether the file holds these bytes anywhere (symbol names in a library, for instance).
-pub fn contains(path: &Path, needle: &[u8]) -> bool {
-    let Ok(mut f) = File::open(path) else { return false };
-    let mut buf = vec![0u8; 1 << 20];
-    let mut carry = 0;
-    loop {
-        let Ok(n) = f.read(&mut buf[carry..]) else { return false };
-        if n == 0 {
-            return false;
-        }
-        let end = carry + n;
-        if buf[..end].windows(needle.len()).any(|w| w == needle) {
-            return true;
-        }
-        carry = (needle.len() - 1).min(end);
-        buf.copy_within(end - carry..end, 0);
+/// A library's dynamic symbols: what it offers to others and what it expects from them.
+pub struct Symbols {
+    /// Global (not weak) functions and variables it defines.
+    pub defined: HashSet<String>,
+    pub undefined: HashSet<String>,
+}
+
+/// Reads `.dynsym` through the section headers (shipped libraries keep them even when stripped).
+pub fn symbols(path: &Path) -> Option<Symbols> {
+    let mut f = File::open(path).ok()?;
+    let h = read_at(&mut f, 0, 64)?;
+    if !h.starts_with(b"\x7fELF") || h[5] != 1 {
+        return None;
     }
+    let wide = h[4] == 2;
+    let (shoff, shentsize, shnum) = if wide {
+        (u64le(&h, 40), u16le(&h, 58) as usize, u16le(&h, 60) as usize)
+    } else {
+        (u32le(&h, 32) as u64, u16le(&h, 46) as usize, u16le(&h, 48) as usize)
+    };
+    if shoff == 0 || shnum == 0 || shentsize < if wide { 64 } else { 40 } {
+        return None;
+    }
+    let sh = read_at(&mut f, shoff, shentsize * shnum)?;
+    // (type, offset, size, link)
+    let section = |i: usize| {
+        let s = &sh[i * shentsize..];
+        if wide {
+            (u32le(s, 4), u64le(s, 24), u64le(s, 32), u32le(s, 40) as usize)
+        } else {
+            (u32le(s, 4), u32le(s, 16) as u64, u32le(s, 20) as u64, u32le(s, 24) as usize)
+        }
+    };
+    let (_, symoff, symsize, link) = (0..shnum).map(section).find(|s| s.0 == 11)?;
+    if link >= shnum {
+        return None;
+    }
+    let (_, stroff, strsize, _) = section(link);
+    let syms = read_at(&mut f, symoff, symsize.min(256 << 20) as usize)?;
+    let strs = read_at(&mut f, stroff, strsize.min(256 << 20) as usize)?;
+
+    let mut out = Symbols { defined: HashSet::new(), undefined: HashSet::new() };
+    for s in syms.chunks_exact(if wide { 24 } else { 16 }).skip(1) {
+        let (name, info, shndx) = if wide { (u32le(s, 0), s[4], u16le(s, 6)) } else { (u32le(s, 0), s[12], u16le(s, 14)) };
+        let (bind, kind) = (info >> 4, info & 0xf);
+        let start = name as usize;
+        if start == 0 || start >= strs.len() {
+            continue;
+        }
+        let end = strs[start..].iter().position(|&c| c == 0).map_or(strs.len(), |e| start + e);
+        let name = String::from_utf8_lossy(&strs[start..end]).into_owned();
+        if shndx == 0 {
+            if bind == 1 || bind == 2 {
+                out.undefined.insert(name);
+            }
+        } else if bind == 1 && matches!(kind, 1 | 2 | 10) {
+            // Weak definitions (C++ templates and inline functions) are duplicated on purpose.
+            out.defined.insert(name);
+        }
+    }
+    Some(out)
 }
 
 fn read_at(f: &mut File, off: u64, len: usize) -> Option<Vec<u8>> {
