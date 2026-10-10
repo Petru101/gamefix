@@ -5,18 +5,28 @@
     tar xzf reports_*.tar.gz
     tools/protondb-proton.py reports_piiremoved.json <since year> > data/protondb-proton.tsv
 
-Per Steam game, from reports since the given year (Proton changes fast), native builds left out:
-- a Proton that works where Steam's default (current official or Experimental) fails: GE-Proton,
-  or an older official one; at least 2 working reports, twice as many as failing ones on it,
-  and the default failing for at least 2 and at least as often as it works;
-- otherwise "anticheat" when most reports fail and at least 3, and 30% of the failing ones,
-  blame anti-cheat.
+Per Steam game, from reports since the given year (Proton changes fast), native builds left out.
+A Proton (GE-Proton, or an older official one) is named only where it was the fix itself:
+- at least 2 "clean" reports that tried Steam's default first, saw it fail, and then had the
+  game working on that Proton with nothing else changed (no launch options beyond overlays and
+  gamemode, no protontricks/winetricks, no patches, mods or file changes in the notes), and
+  twice as many as reports failing on it;
+- Steam's default failing at least as often as it works without changes, and no report in the
+  export's last 12 months saying it works that way (games get fixed: From Dust needed a patch
+  plus GE-Proton in 2025 and runs on the default since).
+Otherwise "anticheat" when most reports fail and at least 3, and 30% of the failing ones,
+blame anti-cheat.
 """
 import collections, json, re, sys, time
 
 reports = json.load(open(sys.argv[1]))
 since = time.mktime((int(sys.argv[2]), 1, 1, 0, 0, 0, 0, 0, 0))
+recent = max(r["timestamp"] for r in reports) - 365 * 86400
 anticheat = re.compile(r"anti.?cheat|\beac\b|easy ?anti|battl[e]?.?eye|vanguard|ricochet|nprotect|gameguard|xigncode|ateam|kernel.level", re.I)
+# Signs in the notes that something besides the Proton was changed.
+other_fix = re.compile(r"patch|\bmods?\b|\.dll|dll override|winetricks|protontricks|launch option|github|nexus|\.ini\b|config|replace|copy|renam|delet|symlink|\blink\b|install(ed|ing)? (the|a|this)|workaround|tweak", re.I)
+# Launch options that change nothing about whether a game runs.
+harmless = re.compile(r"^(%command%|gamemoderun|mangohud|gamescope\b.*--|MANGOHUD=\S+|MANGOHUD_CONFIG=\S+|DXVK_HUD=\S+|PROTON_LOG=1|ENABLE_VKBASALT=1|--|\s)*$")
 
 games = collections.defaultdict(collections.Counter)
 titles = {}
@@ -36,42 +46,42 @@ for r in reports:
     notes = " ".join(str(v) for v in (a.get("notes") or {}).values()) + " " + str(a.get("concludingNotes") or "")
     if not ok and (a.get("isImpactedByAntiCheat") or anticheat.search(notes)):
         g["anticheat"] += 1
+    customized = {k for k, v in (a.get("customizationsUsed") or {}).items() if v} - {"customProton"}
+    clean = harmless.match(a.get("launchOptions") or "") and not customized and not any((a.get("launchFlagsUsed") or {}).values()) and not other_fix.search(notes)
     if variant in ("official", "experimental"):
-        tinkered = a.get("launchOptions") or a.get("customizationsUsed") or a.get("launchFlagsUsed")
-        # Made to work on it with launch options or the like: says nothing about the Proton.
-        if ok and not tinkered and not oob_failed:
+        if ok and clean and not oob_failed:
             g["default_ok"] += 1
+            if r["timestamp"] >= recent:
+                g["default_ok_recently"] += 1
         elif not ok:
             g["default_failed"] += 1
         continue
-    # Tried Steam's default first, then another Proton.
-    if oob_failed:
-        g["default_failed"] += 1
     if variant == "ge":
-        g["ge_ok" if ok else "ge_failed"] += 1
-    elif variant == "older":
-        m = re.match(r"(\d+)\.(\d+)", a.get("protonVersion") or "")
-        if m:
-            g[("ok" if ok else "failed", f"{m[1]}.{m[2]}")] += 1
+        tool = "ge"
+    elif variant == "older" and re.match(r"\d+\.\d+", a.get("protonVersion") or ""):
+        tool = re.match(r"\d+\.\d+", a["protonVersion"])[0]
+    else:
+        continue
+    if not ok:
+        g[("failed", tool)] += 1
+    elif oob_failed and clean:
+        g[("fixed", tool)] += 1
+        g["default_failed"] += 1
 
 rows = []
 for app, g in games.items():
-    if g["default_failed"] >= 2 and g["default_failed"] >= g["default_ok"]:
-        tools = [("ge", g["ge_ok"], g["ge_failed"])]
-        tools += [(k[1], n, g[("failed", k[1])]) for k, n in g.items() if isinstance(k, tuple) and k[0] == "ok"]
-        tools = [t for t in tools if t[1] >= 2 and t[1] >= 2 * t[2]]
-        if tools:
-            tool, worked, _ = max(tools, key=lambda t: (t[1], t[0] == "ge"))
-            rows.append((app, tool, worked, g["default_failed"]))
-            continue
-    if g["no"] > g["yes"] and g["anticheat"] >= 3 and g["anticheat"] >= 0.3 * g["no"]:
+    fixes = [(k[1], n) for k, n in g.items() if isinstance(k, tuple) and k[0] == "fixed" and n >= 2 and n >= 2 * g[("failed", k[1])]]
+    if fixes and g["default_failed"] >= g["default_ok"] and not g["default_ok_recently"]:
+        tool, fixed = max(fixes, key=lambda t: (t[1], t[0] == "ge"))
+        rows.append((app, tool, fixed, g["default_failed"]))
+    elif g["no"] > g["yes"] and g["anticheat"] >= 3 and g["anticheat"] >= 0.3 * g["no"]:
         rows.append((app, "anticheat", g["anticheat"], g["no"]))
 
 month = time.strftime("%B %Y", time.gmtime(latest))
-print(f"# Steam games whose ProtonDB reports (since {sys.argv[2]}, export of {month}) show a Proton that works")
-print("# where Steam's default fails (ge = GE-Proton, X.Y = that official Proton; then reports it worked")
-print("# in, reports Steam's default failed in), or anti-cheat stopping it (then failing reports blaming")
-print("# anti-cheat, all failing reports). Made by tools/protondb-proton.py.")
+print(f"# Steam games whose ProtonDB reports (since {sys.argv[2]}, export of {month}) show a Proton fixing them")
+print("# where Steam's default fails (ge = GE-Proton, X.Y = that official Proton; then reports where")
+print("# switching to it alone fixed the game, reports Steam's default failed in), or anti-cheat stopping")
+print("# it (then failing reports blaming anti-cheat, all failing reports). Made by tools/protondb-proton.py.")
 print("# Derived from the ProtonDB reports export (github.com/bdefore/protondb-data), Open Database")
 print("# License 1.0 (opendatacommons.org/licenses/odbl/1-0/); this table is under the same licence.")
 print("# appid\ttool\tn1\tn2\ttitle")

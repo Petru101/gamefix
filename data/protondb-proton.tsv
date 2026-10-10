@@ -1,726 +1,154 @@
-# Steam games whose ProtonDB reports (since 2024, export of October 2026) show a Proton that works
-# where Steam's default fails (ge = GE-Proton, X.Y = that official Proton; then reports it worked
-# in, reports Steam's default failed in), or anti-cheat stopping it (then failing reports blaming
-# anti-cheat, all failing reports). Made by tools/protondb-proton.py.
+# Steam games whose ProtonDB reports (since 2024, export of October 2026) show a Proton fixing them
+# where Steam's default fails (ge = GE-Proton, X.Y = that official Proton; then reports where
+# switching to it alone fixed the game, reports Steam's default failed in), or anti-cheat stopping
+# it (then failing reports blaming anti-cheat, all failing reports). Made by tools/protondb-proton.py.
 # Derived from the ProtonDB reports export (github.com/bdefore/protondb-data), Open Database
 # License 1.0 (opendatacommons.org/licenses/odbl/1-0/); this table is under the same licence.
 # appid	tool	n1	n2	title
-1840	4.11	2	4	Source Filmmaker
-1930	ge	2	2	Two Worlds Epic Edition
-2210	ge	2	2	Quake 4
-2600	ge	9	15	Vampire: The Masquerade - Bloodlines
-2620	5.13	9	11	Call of Duty
-3920	5.13	3	8	Sid Meier's Pirates!
-4000	ge	41	45	Garry's Mod
-4470	ge	2	2	Silverfall: Earth Awakening
-6310	ge	2	4	The Longest Journey
-6830	ge	2	3	Commandos 2: Men of Courage
-6900	5.13	4	3	Hitman: Codename 47
-6920	ge	2	4	Deus Ex: Invisible War
-7010	4.11	2	2	Project: Snowblind
-7510	ge	3	4	X-Blades
-7670	ge	5	10	BioShock™
-8080	ge	4	3	Kane and Lynch: Dead Men
-8340	6.3	2	2	Strong Bad's Cool Game for Attractive People: Season 1
-8500	ge	28	35	EVE Online
-8790	ge	2	3	GTR 2 FIA GT Racing Game
-9350	ge	3	6	Supreme Commander
-9420	ge	4	7	Supreme Commander: Forged Alliance
-9450	3.7	3	3	Warhammer 40,000: Dawn of War - Soulstorm
-10180	ge	8	11	Call of Duty: Modern Warfare 2
-11450	8.0	3	4	Overlord™
-11480	ge	3	4	Soldiers: Heroes of World War II
-12120	ge	11	19	Grand Theft Auto: San Andreas
-12130	ge	5	3	Manhunt
-12140	ge	4	10	Max Payne
-12200	ge	9	7	Bully: Scholarship Edition
-12364	ge	2	3	Big Mutha Truckers
-12500	7.0	2	2	PuzzleQuest: Challenge of the Warlords
-12900	7.0	3	8	AudioSurf
-13230	8.0	3	4	Unreal Tournament 2004: Editor's Choice Edition
-15620	ge	4	7	Warhammer 40,000: Dawn of War II
-17300	6.3	6	12	Crysis
-18500	4.2	3	5	Defense Grid: The Awakening
-19900	9.0	4	12	Far Cry 2
-19980	ge	9	9	Prince of Persia
-21670	9.0	2	2	Bionic Commando
-21680	ge	2	2	Bionic Commando: Rearmed
-21970	ge	2	7	R.U.S.E
-21980	ge	4	4	Call of Juarez: Bound in Blood
-22610	8.0	2	2	Alien Breed: Impact
-24780	ge	2	8	SimCity 4 Deluxe Edition
+11450	8.0	2	4	Overlord™
 25010	ge	2	3	Lugaru HD
-29900	7.0	6	6	Dark Sector
-32350	ge	4	2	STAR WARS™ Starfighter™
-32380	ge	2	3	STAR WARS™ Jedi Knight: Dark Forces II
-33220	ge	3	6	Tom Clancy's Splinter Cell Conviction
-33230	ge	9	7	Assassin's Creed 2
-33460	ge	4	6	From Dust
-34330	ge	4	13	Total War: SHOGUN 2
-35000	6.3	3	9	Mini Ninjas
-35140	ge	73	48	Batman: Arkham Asylum Game of the Year Edition
-35450	9.0	2	5	Red Orchestra 2: Heroes of Stalingrad with Rising Storm
-37010	ge	2	2	Ninja Blade
-39500	ge	4	4	Gothic 3
-39510	ge	9	15	Gothic II: Gold Edition
-39540	ge	9	4	SpellForce - Platinum Edition
-40100	ge	2	4	Supreme Commander 2
-40390	ge	2	4	Risen 2: Dark Waters
+32380	5.0	2	2	STAR WARS™ Jedi Knight: Dark Forces II
 40930	3.7	3	3	The Misadventures of P.B. Winterbottom
-42700	ge	31	33	Call of Duty: Black Ops
-42910	ge	6	14	Magicka
-44340	ge	3	2	Operation Flashpoint: Red River
-46500	ge	2	6	Syberia
-47890	ge	7	13	The Sims 3
-50620	ge	8	10	Darksiders
-56400	ge	4	4	Warhammer 40,000: Dawn of War II: Retribution
-57650	ge	2	3	Dungeons
-57680	ge	2	2	The First Templar - Steam Special Edition
-57690	4.2	2	9	Tropico 4
-63380	ge	4	9	Sniper Elite V2
-65540	ge	12	20	Gothic 1
-65780	ge	2	2	ARMA: Gold Edition
-70400	ge	9	4	Recettear: An Item Shop's Tale
-113400	ge	5	9	APB Reloaded
-115320	ge	5	6	Prototype 2
-200170	5.13	2	2	Worms Revolution
-200510	ge	9	14	XCOM: Enemy Unknown
-200900	ge	2	2	Cave Story+
-201870	ge	8	10	Assassin's Creed® Revelations
+113400	anticheat	8	13	APB Reloaded
 202200	5.0	3	3	Galactic Civilizations® II: Ultimate Edition
-204240	ge	3	2	The Bridge
-205230	ge	2	5	Hell Yeah! Wrath of the Dead Rabbit
-207350	ge	7	3	Ys Origin
-208200	ge	2	20	DOOM 3
-209160	ge	7	7	Call of Duty®: Ghosts
-212500	ge	21	20	The Lord of the Rings Online
-214510	ge	13	13	LEGO The Lord of the Rings
-214950	5.0	3	11	Total War: ROME II - Emperor Edition
-215100	ge	2	5	Ragnarok Online
-215280	ge	8	10	Secret World Legends
-215830	ge	2	4	Closers
-216150	ge	13	18	MapleStory
-219780	9.0	3	6	Divinity II: Developer's Cut
-219890	ge	3	2	Antichamber
-220240	ge	16	28	Far Cry 3
-221680	ge	4	13	Rocksmith 2014 Edition REMASTERED LEARN & PLAY
+216150	ge	4	13	MapleStory
+219890	ge	2	2	Antichamber
 222660	7.0	2	2	Retro/Grade
-222880	ge	2	4	Insurgency
-223100	ge	2	3	Homefront®: The Revolution
-223710	5.13	10	16	Cry of Fear
-223750	ge	24	33	DCS World Steam Edition
-223810	ge	5	3	Ys I & II Chronicles+
-224260	ge	7	11	No More Room in Hell
-225640	ge	4	7	Sacred 2 Gold
-230230	5.13	2	4	Divinity: Original Sin (Classic)
-230350	ge	4	3	FINAL FANTASY® XI: Ultimate Collection Seekers Edition
-231430	ge	7	10	Company of Heroes 2
-233270	ge	6	6	Far Cry 3 - Blood Dragon
-235600	ge	4	7	Tom Clancy’s Splinter Cell Blacklist
-237890	ge	6	8	Agarest: Generations of War
-240760	ge	4	4	Wasteland 2: Director's Cut
-241560	ge	4	2	The Crew™
-241620	ge	2	3	Inquisitor
-244210	ge	167	133	Assetto Corsa
-244850	ge	98	88	Space Engineers
-245450	5.13	3	7	Wizardry 8
-247430	4.2	2	8	Hitman: Contracts
-247660	3.16	5	9	Deadly Premonition: The Director's Cut
-248170	5.13	4	4	Clickteam Fusion 2.5
-250400	ge	2	2	How to Survive
-250900	9.0	41	67	The Binding of Isaac: Rebirth
-251060	ge	6	6	Wargame: Red Dragon
-252490	9.0	2	57	Rust
-253430	7.0	5	7	CastleMiner Z
-255960	ge	2	6	Bad Mojo Redux
-256290	ge	2	3	Child of Light
-256330	ge	2	4	WRC 4 FIA World Rally Championship
-256390	ge	2	2	MotoGP14
-258010	ge	2	3	Ring Runner: Flight of the Sages
-259190	ge	3	3	Alone in the Dark: The New Nightmare
-265550	ge	2	4	Dead Rising 3 Apocalypse Edition
+224260	ge	2	6	No More Room in Hell
+230350	ge	2	2	FINAL FANTASY® XI: Ultimate Collection Seekers Edition
+237890	ge	4	7	Agarest: Generations of War
+240760	ge	3	4	Wasteland 2: Director's Cut
+241620	ge	2	2	Inquisitor
+252490	anticheat	49	58	Rust
+253430	7.0	2	4	CastleMiner Z
 266410	anticheat	6	12	iRacing
-267920	ge	2	2	Gun Metal
-267980	7.0	4	5	Hostile Waters: Antaeus Rising
-268400	9.0	2	2	Panzer Corps Gold
-269210	ge	4	7	Hero Siege
-269330	ge	2	2	Chronology
-269770	ge	2	5	Secrets of Grindea
-271360	ge	2	2	Industry Giant 2
+267980	7.0	3	5	Hostile Waters: Antaeus Rising
 273110	anticheat	8	8	Counter-Strike Nexon: Studio
-273350	8.0	2	2	Evolve Stage 2
-275670	ge	2	2	Space Run
-280740	ge	2	3	Aperture Tag: The Paint Gun Testing Initiative
-282140	ge	6	12	SOMA
-283310	ge	2	2	Soulbringer
-285190	7.0	2	2	Warhammer 40,000: Dawn of War III
-286360	ge	2	2	Shadows on the Vatican Act I: Greed
-292000	ge	12	11	No More Room in Hell 2
 292820	ge	2	3	Pajama Sam 4: Life Is Rough When You Lose Your Stuff!
 294700	ge	3	3	Putt-Putt: Pep's Birthday Surprise
 298030	7.0	2	3	Total Annihilation
-298110	ge	20	28	Far Cry 4
-298630	ge	2	3	The Escapists
-304050	ge	4	8	Trove
-304240	ge	39	15	Resident Evil
-304390	ge	26	36	FOR HONOR
-304530	ge	2	2	Agents of Mayhem
-306760	ge	2	4	Obduction
-307950	ge	6	4	Caliber
-311240	4.11	3	4	Zero Escape: Zero Time Dilemma
-311310	ge	2	2	Naval Action
-312780	ge	2	3	Way of the Samurai 4
-314650	9.0	7	13	SpaceEngine
-317400	ge	4	4	Portal Stories: Mel
-322520	ge	2	2	DYNASTY WARRIORS 8 Empires
-326480	ge	4	3	If My Heart Had Wings
-327030	ge	10	12	Worms W.M.D
-328440	ge	2	2	Deadlock: Planetary Conquest
-331600	ge	3	3	One Piece Pirate Warriors 3
-333980	ge	13	11	AKIBA'S TRIP: Undead ＆ Undressed
-338800	7.0	3	3	Seven Kingdoms 2 HD
-339340	ge	27	20	Resident Evil 0
-345240	6.3	2	3	SHOGUN: Total War - Collection
-345610	ge	6	3	The Fruit of Grisaia
-346110	ge	18	24	ARK: Survival Evolved
-346900	9.0	3	8	AdVenture Capitalist
+311240	4.11	3	3	Zero Escape: Zero Time Dilemma
+333980	ge	9	11	AKIBA'S TRIP: Undead ＆ Undressed
+345240	6.3	2	2	SHOGUN: Total War - Collection
+346900	9.0	2	7	AdVenture Capitalist
 352220	6.3	2	3	King of Dragon Pass
-354140	ge	2	3	Five Nights at Freddy's 3
 359550	anticheat	42	103	Tom Clancy's Rainbow Six Siege
-361320	9.0	4	6	Casino Inc.
-362890	ge	16	59	Black Mesa
-368230	9.0	2	6	Kingdom: Classic
-368500	ge	9	17	Assassin's Creed® Syndicate
-372000	ge	4	5	Tree of Savior (English Ver.)
-372480	ge	2	2	Spaceforce Rogue Universe HD
+368230	9.0	2	3	Kingdom: Classic
+372000	ge	2	5	Tree of Savior (English Ver.)
 375600	9.0	2	3	Air Brawl
-382260	3.16	2	3	8Bit Fiesta - Party Game
-386070	8.0	2	10	Planetary Annihilation: TITANS
-386180	7.0	5	26	Crossout
-386360	ge	8	15	SMITE
-392110	ge	13	11	ENDLESS Space 2
-393380	ge	42	71	Squad
-397550	6.3	2	4	Deus Ex: Revision
-404540	ge	3	4	Nex Machina
-404680	ge	3	5	Hob
 407810	ge	3	4	Hard Reset Redux
-410850	ge	3	2	DRAGON QUEST HEROES™ Slime Edition
-411370	ge	3	4	Melty Blood Actress Again Current Code
+410850	ge	2	2	DRAGON QUEST HEROES™ Slime Edition
 413420	ge	2	3	Danganronpa 2: Goodbye Despair
-415300	ge	3	3	Monster Monpiece
+415300	ge	2	2	Monster Monpiece
 417110	ge	2	2	Mayjasmine Episode01 - What is God?
-420000	5.13	3	7	Home Design 3D
-427250	8.0	3	3	8-Bit Armies
-430210	ge	2	4	Megaton Rainfall
-432350	ge	2	2	Epic Battle Fantasy 5
-434170	ge	2	4	The Jackbox Party Pack 3
-434570	ge	4	10	Blood and Bacon
-438100	ge	80	69	VRChat
-438490	ge	7	7	GOD EATER 2 Rage Burst
+420000	5.13	2	4	Home Design 3D
 440880	ge	2	3	The Count Lucanor
-440900	9.0	3	32	Conan Exiles
-441280	6.3	2	2	Pharaoh Rebirth+
-443110	9.0	2	4	Armored Warfare
-444090	ge	14	29	Paladins
-451780	ge	4	2	Trillion: God of Destruction
-454650	ge	13	16	DRAGON BALL XENOVERSE 2
-460120	ge	9	8	Megadimension Neptunia VII
-462780	8.0	16	26	Darksiders Warmastered Edition
-471710	ge	15	32	Rec Room
-477160	ge	6	20	Human Fall Flat
-477740	ge	9	12	Zero Escape: The Nonary Games
-485510	ge	21	11	Nioh: Complete Edition
-492230	ge	3	2	Space Hulk: Tactics
-493490	8.0	15	11	City Car Driving
-493520	ge	15	28	GTFO
-495290	ge	2	3	AccuRC 2
-495910	ge	2	4	Dungeon Fighter Online
-496810	ge	4	2	MegaTagmension Blanc + Neptune VS Zombies (Neptunia)
-497360	ge	3	3	Gabriel Knight 3: Blood of the Sacred, Blood of the Damned
-500810	7.0	8	5	Arcanum: Of Steamworks and Magick Obscura
-502280	ge	3	3	BERSERK and the Band of the Hawk
-505170	ge	6	5	Carmageddon: Max Damage
-505230	ge	3	4	Pathologic 2
-513710	ge	9	9	SCUM
-517630	ge	4	8	Just Cause 4 Reloaded
-517710	ge	2	4	Redout: Enhanced Edition
-517810	4.11	3	3	Caesar IV
-521720	7.0	2	2	Uncharted Waters
-524580	ge	4	4	Fairy Fencer F Advent Dark Force
-539470	7.0	2	3	Police Stories
-543900	ge	4	2	METAL GEAR SURVIVE
-544810	9.0	2	4	KARDS - The WW2 Card Game
-546230	8.0	2	2	Xenus 2. White gold.
-546560	ge	20	27	Half-Life: Alyx
-552500	ge	50	82	Warhammer: Vermintide 2
-552590	ge	2	5	The Sexy Brutale
-554600	ge	2	4	Learn Japanese To Survive! Katakana War
-555160	ge	7	9	Pavlov
+460120	ge	2	3	Megadimension Neptunia VII
+493490	8.0	3	7	City Car Driving
+554600	8.0	2	3	Learn Japanese To Survive! Katakana War
 555570	anticheat	3	3	Infestation: The New Z
-564530	5.0	2	3	Pharaoh + Cleopatra
-567640	ge	26	24	Danganronpa V3: Killing Harmony
-573060	ge	2	3	LOGistICAL
-573100	7.0	4	5	Battlefleet Gothic: Armada 2
+567640	ge	9	18	Danganronpa V3: Killing Harmony
 573490	ge	2	2	Interstellar Transport Company
-590830	ge	9	21	s&box
-594570	ge	2	6	Total War: WARHAMMER II
-594650	ge	61	142	Hunt: Showdown 1896
-607880	ge	2	2	Accel World VS. Sword Art Online Deluxe Edition
-607890	6.3	2	3	Sword Art Online: Hollow Realization Deluxe Edition
-610190	ge	3	3	WARRIORS ALL-STARS
-613830	ge	5	14	CHRONO TRIGGER
-626600	ge	3	2	Lost Dimension
-631510	ge	22	17	Devil May Cry HD Collection
-632300	8.0	2	3	Hobo: Tough Life
-633230	ge	8	7	NARUTO TO BORUTO: SHINOBI STRIKER
-635850	7.0	2	6	Sentience: The Android's Tale
-637650	ge	9	15	FINAL FANTASY XV WINDOWS EDITION
-638160	ge	2	3	Moero Chronicle
-641780	9.0	2	6	The Drone Racing League Simulator
+610190	ge	2	3	WARRIORS ALL-STARS
+633230	ge	2	6	NARUTO TO BORUTO: SHINOBI STRIKER
 646910	anticheat	15	29	The Crew 2
-658920	ge	4	9	Half-Life 2: VR Mod
-677120	ge	2	3	Heroes of Hammerwatch
-678950	ge	40	31	DRAGON BALL FighterZ
-687260	5.13	2	3	Tokyo Dark
-688140	ge	2	2	Tempest 4000
-690290	ge	2	5	Territory Control 2
-699130	ge	14	16	World War Z
+677120	7.0	2	3	Heroes of Hammerwatch
 700030	anticheat	6	6	Life is Feudal: MMO
-702150	ge	2	3	Project Mercury
-715580	ge	2	5	Hoshizora no Memoria -Wish upon a Shooting Star- HD
 719890	anticheat	6	6	Beasts of Bermuda
-721030	ge	2	4	La Tale
-730310	ge	2	2	DYNASTY WARRIORS 9
-736220	8.0	2	9	Squad 44
-738060	ge	2	4	Freddy Fazbear's Pizzeria Simulator
-741140	ge	6	3	Baldr Sky
 745960	ge	2	2	A Sky Full of Stars 仰望夜空的星辰
 752580	7.0	4	8	Imperivm RTC - HD Edition "Great Battles of Rome"
-757310	ge	8	10	Sable
 760160	anticheat	8	10	Vampire: The Masquerade - Bloodhunt
-761600	ge	7	4	Onimusha: Warlords
-774511	ge	2	5	Megadimension Neptunia VIIR
-787810	ge	2	4	Rogue Heroes: Ruins of Tasos
-801550	ge	3	2	VAIL
-809230	7.0	3	4	Unity of Command II
-809440	5.13	2	5	Protolife
-811320	9.0	3	4	Jupiter Hell
-824600	ge	6	19	HROT
-831560	ge	4	3	WARRIORS OROCHI 4
-835570	ge	8	12	Conqueror's Blade
-837610	ge	4	3	Mary Skelter: Nightmares
-860020	ge	3	2	EXFIL
-865680	ge	2	3	The Eternal Cylinder
-866020	ge	3	11	Growtopia
-871540	ge	2	2	BMX Streets
-884660	ge	2	5	CRSED: Cuisine Royale
+831560	ge	2	3	WARRIORS OROCHI 4
 886250	anticheat	3	6	Vegas Infinite by PokerStars
-893180	ge	31	44	Catherine Classic
 895400	anticheat	9	10	Deadside
-897220	5.13	2	2	Summer Pockets
-906510	ge	3	2	Conception PLUS: Maidens of the Twelve Stars
-910830	ge	3	3	Rebel Galaxy Outlaw
-922500	ge	10	8	KILL la KILL -IF
-939960	ge	5	2	Far Cry New Dawn
-942970	9.0	2	3	Unheard
-954850	ge	5	11	Kerbal Space Program 2
 955050	5.13	2	2	Bright Memory
-963930	ge	5	4	Contractors
 964440	anticheat	3	3	Hell is Others
-970500	ge	4	6	秦殇 (Prince of Qin)
-973230	ge	2	3	We Who Are About To Die
-973760	ge	6	3	Thronebreaker: The Witcher Tales
-976620	ge	5	4	Enderal: Forgotten Stories (Special Edition)
-978520	9.0	2	4	Legend of Keepers: Career of a Dungeon Manager
-987840	7.0	2	3	Expeditions: Rome
-999020	ge	5	5	Mega Man Zero/ZX Legacy Collection
-1000010	ge	4	5	Crown Trick
-1002300	ge	3	7	Fear & Hunger
-1002560	ge	2	2	Tiny Snow
-1025600	ge	2	4	Battle Realms: Zen Edition
-1029210	ge	2	2	30XX
-1034140	ge	4	2	Subverse
-1034860	ge	6	10	GRANDIA HD Remaster
-1040730	ge	3	9	ZUSI 3 - Aerosoft Edition
-1045620	ge	2	2	Atelier Lulua ~The Scion of Arland~ / ルルアのアトリエ ～アーランドの錬金術士４～
-1049320	ge	4	3	River City Girls
-1053710	ge	2	7	The Red Lantern
-1056640	ge	29	19	Phantasy Star Online 2 New Genesis
-1066890	ge	6	14	Automobilista 2
-1070580	8.0	3	3	Drift86
-1084160	ge	4	12	Jagged Alliance 3
-1105510	ge	22	8	Yakuza 5 Remastered
-1111930	ge	2	7	Underspace
-1114150	9.0	2	19	CarX Street
-1118240	ge	2	2	Lake
-1133760	ge	2	6	CHRONO CROSS: THE RADICAL DREAMERS EDITION
-1133870	ge	40	43	Space Engineers 2
-1142710	ge	43	52	Total War: WARHAMMER III
-1144400	ge	13	5	Senren＊Banka
-1147550	ge	13	12	Not For Broadcast
-1149460	ge	25	34	ICARUS
-1152300	ge	4	2	Atelier Ayesha: The Alchemist of Dusk DX
-1170950	ge	5	6	Mortal Online 2
+973760	ge	2	3	Thronebreaker: The Witcher Tales
+999020	ge	2	3	Mega Man Zero/ZX Legacy Collection
+1034860	ge	2	4	GRANDIA HD Remaster
+1105510	ge	7	8	Yakuza 5 Remastered
 1172470	anticheat	236	486	Apex Legends
-1175830	ge	3	8	Legend of Mana
-1184140	7.0	2	4	KartRider: Drift
-1202540	ge	4	7	Marco & The Galaxy Dragon
-1206430	9.0	2	6	The Unfinished Swan
-1219240	ge	2	2	BioGun
-1222670	ge	31	62	The Sims 4
-1222690	ge	14	15	Dragon Age Inquisition
-1233260	ge	2	2	FAIRY TAIL
-1233570	8.0	25	34	Mirror's Edge Catalyst
-1233880	ge	3	5	Disgaea 4 Complete+
-1237950	ge	46	99	STAR WARS Battlefront II
-1237970	ge	80	87	Titanfall 2
-1238060	ge	4	5	Dead Space 3
+1206430	9.0	2	4	The Unfinished Swan
+1233880	ge	2	4	Disgaea 4 Complete+
 1238810	anticheat	68	108	Battlefield V
-1238820	ge	5	8	Battlefield 3
-1238840	8.0	4	152	Battlefield 1
-1245480	ge	2	7	SYNDUALITY Echo of Ada
-1248080	ge	5	5	CYGNI: All Guns Blazing
-1255980	ge	4	7	Portal Reloaded
+1238840	anticheat	125	183	Battlefield 1
+1245480	anticheat	6	9	SYNDUALITY Echo of Ada
+1255980	ge	2	6	Portal Reloaded
 1262240	anticheat	5	8	Plants vs. Zombies: Battle for Neighborville
-1262540	ge	13	15	Need for Speed
-1272580	ge	2	3	Nine Witches: Family Disruption
-1282270	ge	52	80	Strinova
-1283410	ge	7	7	Tails of Iron
-1286710	6.3	2	2	Hylics 2
-1293820	ge	7	2	YOU and ME and HER: A Love Story
-1336980	ge	2	2	NOBUNAGA'S AMBITION: Awakening
-1340140	ge	11	6	DRACU-RIOT!
-1340990	ge	5	4	Rise of the Ronin
-1347780	8.0	2	4	Freedom Fighters
-1358700	ge	8	7	STRANGER OF PARADISE FINAL FANTASY ORIGIN
-1361210	ge	86	102	Warhammer 40,000: Darktide
-1365750	7.0	2	2	东方栖霞园 ~ Blue devil in the Belvedere.
-1368820	ge	4	6	RollerCoaster Tycoon® 3: Complete Edition
-1371580	ge	2	3	Myth of Empires
+1283410	ge	5	6	Tails of Iron
 1373440	ge	2	5	Picross for a Cause
-1377580	ge	6	6	Soulworker
-1378990	ge	2	6	Crash Bandicoot™ 4: It’s About Time
-1382330	ge	56	50	Persona 5 Strikers
-1392960	ge	6	4	STORY OF SEASONS: Pioneers of Olive Town
-1402020	ge	3	2	SCP: Labrat
-1407200	ge	18	25	World of Tanks
-1411910	ge	4	14	Fallen Aces
-1426450	ge	3	5	Age of Darkness: Final Stand
-1431300	ge	4	23	Sand
-1434950	ge	10	28	HighFleet
-1454370	ge	2	2	STARSEEKER: Astroneer Expeditions
-1465470	ge	4	9	The Crust
-1473480	ge	3	5	A.V.A Global
-1477940	ge	3	2	Unknown 9: Awakening
-1501750	ge	14	19	Lords of the Fallen
-1510440	ge	2	2	Honeycomb: The World Beyond
 1517290	anticheat	8	14	Battlefield 2042
-1521580	ge	3	5	Perfect Heist 2
-1566690	ge	8	4	Outpost: Infinity Siege
-1568400	ge	3	23	Sheepy: A Short Adventure
-1569440	7.0	2	2	OneShot: Fading Memory
-1589120	7.0	2	2	Above Snakes
-1598230	ge	2	2	KILLER INN
-1599660	ge	5	7	Sackboy™: A Big Adventure
-1602010	ge	13	9	Persona 4 Arena Ultimax
-1607200	ge	2	2	Cyanotype Daydream -The Girl Who Dreamed the World-
+1521580	ge	2	3	Perfect Heist 2
+1566690	ge	3	3	Outpost: Infinity Siege
 1607250	anticheat	16	20	MY HERO ULTRA RUMBLE
-1614550	ge	2	6	Astro Colony
-1621310	ge	5	5	Atelier Sophie 2: The Alchemist of the Mysterious Dream
 1635450	anticheat	5	5	Longvinter
-1641960	ge	9	12	Forever Skies
-1642890	ge	2	2	Disc Golf Valley
-1649240	ge	7	11	Returnal™
-1662210	ge	2	2	Arms Trade Tycoon: Tanks
-1665460	ge	7	23	eFootball
-1671200	ge	4	15	Honkai Impact 3rd
-1677280	ge	8	14	Company of Heroes 3
-1680880	ge	2	4	Forspoken
-1684350	ge	8	5	The Thaumaturge
-1693980	ge	24	39	Dead Space
-1702330	8.0	4	2	Rune Factory 5
-1708850	ge	2	2	Drug Dealer Simulator 2
-1729740	ge	3	2	Luto
-1732190	ge	3	2	FATAL FRAME / PROJECT ZERO: Maiden of Black Water
-1744330	ge	2	2	No More Heroes 3
+1702330	8.0	2	2	Rune Factory 5
 1752080	anticheat	5	7	HUNGER
-1766060	8.0	2	8	HumanitZ
-1775490	ge	2	2	Slice & Dice
 1777750	ge	2	3	Ninki Seiyuu: How to Make a Pop Voice Actress
-1778820	ge	48	61	TEKKEN 8
-1783560	ge	18	27	The Last Caretaker
 1797880	anticheat	3	8	Lost Light
-1799930	ge	8	3	Redout 2
-1812560	ge	2	2	SUPER CRAZY RHYTHM CASTLE
-1820000	ge	6	8	Homura Hime
-1839950	9.0	5	6	Terminator: Dark Fate - Defiance
-1843310	ge	2	3	Funko Fusion
+1839950	9.0	4	5	Terminator: Dark Fate - Defiance
 1849250	anticheat	26	44	EA SPORTS WRC
-1849900	7.0	2	2	Among Us VR
 1851350	anticheat	4	7	Stampede: Racing Royale
-1856480	ge	3	2	太依賴咒術的我未來堪憂。
+1856480	ge	2	2	太依賴咒術的我未來堪憂。
 1867240	anticheat	294	374	WARDOGS
-1868180	7.0	2	2	Etrian Odyssey HD
-1869290	ge	2	4	Supraworld
-1895900	ge	2	2	1348 Ex Voto
-1902690	8.0	3	3	Fate/Samurai Remnant
-1905530	ge	2	2	Hammerwatch Anniversary Edition
-1913370	ge	4	3	OPERATOR
-1915550	ge	3	3	Nemesis: Lockdown
-1920960	ge	2	10	VPet-Simulator
+1915550	ge	2	3	Nemesis: Lockdown
 1922560	anticheat	30	47	Plants vs. Zombies™ Garden Warfare 2: Deluxe Edition
-1928420	ge	41	44	Farlight 84
-1928980	ge	22	43	Nightingale
 1938090	anticheat	11	30	Call of Duty®
-1939890	ge	2	2	Simon the Sorcerer Origins
-1943730	ge	3	3	Wicked Island
 1957780	anticheat	4	6	Ghosts of Tabor
-1973530	ge	53	19	Limbus Company
-1973710	ge	11	18	ヘブンバーンズレッド
-1985810	ge	19	17	Call of Duty®: Black Ops Cold War
-1989070	ge	3	3	Synergy
-1999770	ge	4	2	Atelier Ryza 3: Alchemist of the End & the Secret Key
-2008100	ge	2	4	Rule the Waves 3
-2016590	8.0	12	68	Dark and Darker
-2019760	ge	2	2	Necrophosis
-2058180	ge	7	19	Judgment
-2064650	ge	9	12	Tower of Fantasy
 2073620	anticheat	32	70	Arena Breakout: Infinite
-2073850	ge	176	428	THE FINALS
-2079120	ge	8	16	Warudo
-2084970	ge	2	3	Etheria: Restart
 2087030	anticheat	3	10	Shatterline
 2094070	ge	2	2	Quest Master
-2095340	7.0	5	8	Road 96: Mile 0
-2104890	ge	19	62	RoadCraft
-2107090	ge	4	2	KitHack Model Club
+2095340	7.0	4	7	Road 96: Mile 0
 2125090	ge	2	3	Tintin Reporter - Cigars of the Pharaoh
-2131640	ge	9	16	METAL GEAR SOLID 2: Sons of Liberty - Master Collection Version
-2138090	ge	3	2	Atelier Marie Remake: The Alchemist of Salburg
-2139460	7.0	54	186	Once Human
-2162020	ge	2	2	Strayed Lights
+2138090	ge	2	2	Atelier Marie Remake: The Alchemist of Salburg
 2169930	ge	3	3	R-Type Tactics I • II Cosmos
-2172260	ge	2	3	The Complex: Expedition
 2176900	ge	2	2	Tales of Fablecraft
-2177750	ge	2	3	Half-Life 2: VR Mod - Episode One
-2177760	ge	2	2	Half-Life 2: VR Mod - Episode Two
-2178070	ge	3	5	Towers of Aghasba
-2182690	ge	2	4	Gore Screaming Show
-2183900	ge	150	283	Warhammer 40,000: Space Marine 2
 2195250	anticheat	4	7	EA SPORTS FC 24
-2213700	ge	2	8	Sintopia
-2221490	ge	50	47	Tom Clancy’s The Division 2
-2223840	ge	11	11	The Casting of Frank Stone
-2228280	ge	2	5	MEMORIAPOLIS
-2229830	ge	2	5	Command & Conquer™ and The Covert Operations™
-2229840	ge	3	6	Command & Conquer: Red Alert™, Counterstrike™ and The Aftermath™
-2229850	ge	13	38	Command & Conquer: Red Alert™ 2 and Yuri’s Revenge™
-2229870	ge	3	9	Command & Conquer™ Generals
-2229880	ge	2	8	Command & Conquer™ Tiberian Sun™ and Firestorm™
-2229940	ge	8	5	[REDACTED]
-2231380	ge	21	23	Tom Clancy's Ghost Recon® Breakpoint
-2239550	ge	4	6	Watch Dogs®: Legion
-2240620	ge	20	22	UNBEATABLE
-2279730	ge	2	2	King Arthur: Legends Rise
-2281860	ge	2	2	Duelyst GG
-2287920	ge	2	4	BATTLE CRUSH
-2291020	ge	2	10	ANONYMOUS;CODE
-2300840	ge	5	6	Subliminal
-2302530	ge	3	2	MementoMori
-2302660	9.0	2	2	Homicipher
-2307350	ge	11	7	Into the Radius 2
 2309440	anticheat	7	7	Combat Champions
-2313020	ge	2	4	Umamusume: Pretty Derby – Party Dash
-2314160	ge	2	2	Tactical Assault VR
-2315050	9.0	3	4	We Were Here Tomorrow
-2322010	ge	28	31	God of War Ragnarök
-2336720	ge	2	2	Greed of Man
-2352620	ge	10	22	Fellowship
-2357570	ge	323	261	Overwatch 2
-2371890	ge	2	2	Chronicles of the Wolf
-2379390	ge	2	6	Tom Clancy’s Rainbow Six® Extraction
-2379740	ge	3	10	Wizardry Variants Daphne
-2399220	ge	3	2	NUKITASHI
-2406770	ge	18	40	Bodycam
-2413950	ge	5	4	Final Sentence
 2421370	ge	2	2	Cryptis
-2426960	9.0	4	9	Summoners War
-2427410	ge	13	18	S.T.A.L.K.E.R.: Shadow of Chornobyl - Enhanced Edition
-2427420	ge	3	8	S.T.A.L.K.E.R.: Clear Sky - Enhanced Edition
-2427430	ge	3	11	S.T.A.L.K.E.R.: Call of Prypiat - Enhanced Edition
-2427520	ge	2	5	ARC Raiders Playtest
 2429270	5.13	3	5	The RPG
 2438680	9.0	2	4	Airborne Empire
-2439100	ge	2	2	ABEL
-2439770	ge	2	3	PROJECT MIX
 2452280	anticheat	56	103	Mecha BREAK
-2456740	ge	40	51	inZOI
-2464280	ge	4	2	Tormented Souls 2
-2479810	9.0	3	101	Gray Zone Warfare
-2483190	11.0	2	454	Forza Horizon 6
-2487190	ge	3	2	Main Sequence
 2488620	anticheat	6	16	F1 24
-2492660	ge	3	11	METAL GEAR SOLID: Peace Walker - Master Collection Version
-2503080	ge	3	4	Byte Breakers
-2504480	6.3	8	35	Indigo Park
-2507980	ge	2	4	Meta Ghost: Breaking Show
-2512840	ge	4	6	DoronkoWanko
-2515020	9.0	2	48	FINAL FANTASY XVI
-2537590	ge	18	42	Microsoft Flight Simulator 2024
-2541530	ge	3	4	AETHUS
-2552440	ge	2	6	KINGDOM HEARTS HD 2.8 Final Chapter Prologue
-2561580	ge	18	23	Horizon Zero Dawn Remastered
+2503080	ge	2	3	Byte Breakers
 2582560	anticheat	3	4	EA SPORTS Madden NFL 25
 2582960	anticheat	4	5	NAKWON: LAST PARADISE
 2591410	9.0	2	2	Moose Miners
-2615540	ge	4	3	VOID/BREAKER
-2625420	ge	11	11	Drive Beyond Horizons
-2633500	6.3	2	2	Dragon Throne: Battle of Red Cliffs
-2655590	ge	3	3	Kingdom's Deck
+2655590	ge	2	2	Kingdom's Deck
 2657030	ge	2	2	Sex & Blood: Vampires
-2666510	ge	5	20	Rusty's Retirement
 2667430	8.0	2	4	Grimhook
-2668080	ge	31	23	Snowbreak: Containment Zone
 2669320	anticheat	5	9	EA SPORTS FC 25
-2677660	ge	30	38	Indiana Jones and the Great Circle
-2678080	ge	2	2	Tides of Tomorrow 🌊
+2674810	ge	4	10	Dragon's Dogma 2 Character Creator & Storage
 2682580	anticheat	11	13	DUCKSIDE
-2695430	ge	2	2	A.I.L.A
 2696320	ge	2	2	Thought Experiment Simulator
 2705130	anticheat	8	18	Exoborne
-2707070	ge	3	3	SubwaySim 2
-2707940	ge	3	4	FPV Kamikaze Drone
-2708280	ge	2	2	ESCAPE FROM BOYKISSER
-2719160	ge	2	7	Contractors Showdown : ExfilZone
-2719200	ge	5	3	SAMURAI WARRIORS 4 DX
-2731330	ge	2	2	TROLEU
-2741560	ge	2	10	SimCity™ 3000 Unlimited
-2750000	ge	6	6	Microtopia
-2753000	10.0	6	26	GOALS
-2764370	ge	3	2	Starward
-2766060	9.0	2	2	Zapper: One Wicked Cricket
-2785740	ge	2	4	Diesel Knights
-2786680	ge	4	8	Knowledge, or know Lady
-2795270	ge	2	4	Everlasting Flowers - Where there is a will, there is a way
+2719200	ge	3	3	SAMURAI WARRIORS 4 DX
 2795540	anticheat	4	8	The Midnight Walkers
 2807960	anticheat	51	102	Battlefield™ 6
-2814990	ge	10	10	Screamer
-2820110	ge	4	2	Anno 1503 - History Edition
-2821610	ge	4	5	Echoes of the End: Enhanced Edition
-2825300	ge	6	2	AMANATSU ~Perfect Edition~
-2828500	ge	2	3	The Jackbox Megapicker
-2828860	ge	15	31	The Forever Winter
-2831340	ge	2	3	Rabbit Hole
-2834910	ge	2	6	Rocksmith+
-2835590	ge	4	3	8AM
-2843540	ge	3	2	Midnight Monitor: Aldercourt
-2849960	ge	3	2	Revue Starlight El Dorado
-2859390	ge	2	4	Drive Beyond Horizons Demo
+2843540	ge	2	2	Midnight Monitor: Aldercourt
 2870990	anticheat	3	5	Mecha BREAK Demo
-2878450	ge	2	4	Master of Command
-2909400	ge	43	97	FINAL FANTASY VII REBIRTH
-2919650	8.0	3	2	Cookard
-2921380	ge	2	2	Caribbean Crashers
-2943650	6.3	2	61	FragPunk
-2951630	7.0	2	13	Total War: PHARAOH DYNASTIES
-2963800	ge	3	6	DrainSim
-2963870	ge	3	12	Metal Slug: Awakening
+2919650	8.0	2	2	Cookard
 2987800	anticheat	8	19	Madoka Magica Magia Exedra
-3018410	ge	3	3	VTOL VR Mod Loader
 3035140	9.0	2	2	WonderLang French
-3050900	ge	11	10	ROMEO IS A DEAD MAN
-3052450	ge	9	9	Morimens
-3054820	ge	3	3	でびるコネクショん
-3056840	ge	3	4	A Bumpy Ride
-3058630	ge	25	44	Assetto Corsa EVO
 3065800	anticheat	27	84	Marathon
-3067930	ge	2	3	Labyrinth of Touhou Tri -The Dreaming Girls & The Mysterious Orbs-
-3077390	ge	2	2	MotoGP™25
-3092450	ge	2	3	inZOI: Creative Studio
-3092660	ge	15	20	Reverse: 1999
 3104410	anticheat	10	25	Terminull Brigade
-3105890	ge	2	4	PIONER
-3119540	8.0	3	2	Scriptorium: Master of Manuscripts
-3131680	8.0	4	4	Stardust Skate
-3139440	8.0	2	18	GunZ: The Duel
-3142050	ge	4	6	Warborne Above Ashes
-3155290	ge	3	4	Hold Me Tight All Night, Onii-chan!
-3164330	ge	35	62	Infinity Nikki
-3168600	ge	2	9	Among Us 3D
-3196500	ge	3	2	Wayblazer Dämmerung
-3215050	ge	4	13	Surviving Mars: Relaunched
-3224770	ge	157	108	Umamusume: Pretty Derby
-3257000	ge	2	5	SCP: CB Multiplayer Reborn
-3274580	ge	28	33	Anno 117: Pax Romana
-3280350	ge	55	105	DEATH STRANDING 2: ON THE BEACH
-3298520	9.0	2	3	Idle Iktah
-3308670	ge	18	30	GIRLS' FRONTLINE 2: EXILIUM
-3321460	ge	170	191	Crimson Desert
-3330250	ge	2	2	Ithya: Magic Studies
-3347400	ge	23	27	GIRLS' FRONTLINE 2: EXILIUM
+3131680	8.0	3	3	Stardust Skate
+3139440	anticheat	8	12	GunZ: The Duel
+3142050	ge	2	6	Warborne Above Ashes
 3354750	anticheat	47	123	skate.
-3363680	8.0	2	4	EverSiege: Untold Ages
-3378960	ge	4	3	Lost Soul Aside™
-3405690	ge	2	8	EA SPORTS FC™ 26
-3430470	ge	3	4	PLATiNA :: LAB
-3451680	ge	2	3	The House of Hikmah
-3454590	9.0	2	8	Cornerpond
-3465000	ge	2	2	Modulus: Factory Automation Demo
-3476880	ge	3	3	Brno Transit
-3478050	ge	7	11	Road to Empress I
-3484680	ge	2	2	LES MILLS BODYCOMBAT
-3498270	ge	2	2	Better Mart Simulator
-3506110	ge	4	4	Lunacid - Tears of the Moon
-3511030	9.0	2	4	Mini Cozy Room : Lofi
-3513350	ge	217	195	Wuthering Waves
 3521410	ge	2	2	Cats & Cups
-3533100	ge	2	2	Wrap House Simulator🌯
-3545060	ge	2	3	Team Fortress 2 Classified
 3576070	anticheat	3	3	Sudden Attack Zero Point
-3581230	ge	2	3	Cozy Game Restoration
 3595230	anticheat	3	7	Call of Duty®: Modern Warfare® II
 3595270	anticheat	3	7	Call of Duty®: Modern Warfare® III
 3596040	anticheat	4	5	Time Takers
-3597580	9.0	2	2	Earthion
-3601800	ge	2	7	Meltopia
-3619040	9.0	5	6	Half-Life Legacy
-3678970	ge	19	24	TBH: Task Bar Hero
-3681810	ge	44	55	Blue Protocol: Star Resonance
-3699650	ge	2	3	Infected Mushroom Pinball
-3712080	ge	6	5	Funnel Runners
 3727950	anticheat	5	9	Wildgate - Open Beta
-3749720	ge	5	13	The Division Resurgence
 3787240	anticheat	47	48	MARVEL Tōkon: Fighting Souls
-3863620	4.11	2	3	No Man's Land
-3869850	ge	3	3	Welcome to the Game III
-3887700	7.0	8	24	Girls' Frontline
-3902430	ge	4	15	War of Dots
-3919760	ge	4	4	Anno 117: Pax Romana Demo
-3920610	9.0	6	13	FATAL FRAME II: Crimson Butterfly REMAKE
-3930190	ge	2	3	Wavekin
 3932890	anticheat	15	37	Escape from Tarkov
-3983000	ge	2	2	Parasite Mutant
 4012310	ge	2	2	Aether & Iron Demo
-4012810	ge	10	11	STEINS;GATE RE:BOOT
-4021750	ge	2	2	Spellcasters Chronicles Playtest
-4045150	8.0	3	3	FEEDING YUYUKO
-4124950	ge	11	14	Ashes of Creation
-4125930	ge	15	10	Punishing: Gray Raven
-4126040	ge	38	74	Aniimo
 4128260	anticheat	115	126	Highguard
-4148240	ge	4	4	Road to Empress Ⅱ
-4212480	ge	3	4	Ragnarok: The New World
-4249130	ge	5	14	Dino Crisis
-4249150	ge	2	5	Breath of Fire IV
-4252960	ge	2	2	HoloTrials: Case Covered
 4282500	anticheat	26	40	hololive Dreams
-4307740	ge	2	3	Car Mechanic Simulator 2026 - Single Player Demo
-4435340	ge	3	5	Anymaker
-4465080	ge	2	2	Rivage Demo
-4508340	ge	6	33	NTE: Neverness to Everness
-4585340	5.13	8	12	Horse Magnifier
-4623570	ge	2	3	Deskrawl: Idle ARPG
-4643090	ge	4	8	The NOexistenceN of Lilith
+4307740	ge	2	2	Car Mechanic Simulator 2026 - Single Player Demo
+4585340	5.13	6	10	Horse Magnifier
 4783780	anticheat	6	11	Call of Duty®: Modern Warfare® 4 - Beta
 4809930	anticheat	18	19	WARDOGS Playtest
 4835540	anticheat	5	5	MARVEL Tōkon: Fighting Souls OPEN BETA
