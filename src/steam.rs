@@ -102,6 +102,29 @@ impl Steam {
             .cloned()
     }
 
+    /// Where a compatibility tool (by Steam's internal name) is installed.
+    pub fn tool_dir(&self, name: &str) -> Option<PathBuf> {
+        if !name.starts_with("proton_") {
+            return fs::read_dir(self.root.join("compatibilitytools.d")).ok()?.flatten().map(|d| d.path()).find(|d| custom_tool(d).as_deref() == Some(name));
+        }
+        self.libraries().into_iter().find_map(|library| {
+            fs::read_dir(library.join("steamapps")).ok()?.flatten().find_map(|entry| {
+                let doc = vdf::parse(&fs::read_to_string(entry.path()).ok()?).ok()?;
+                let field = |key| match vdf::get(&doc, &["AppState", key]) {
+                    Some(vdf::Node::Str(v)) => Some(vdf::unescape(v)),
+                    _ => None,
+                };
+                let tool = match field("name")?.as_str() {
+                    "Proton Experimental" => "proton_experimental".to_string(),
+                    "Proton Hotfix" => "proton_hotfix".to_string(),
+                    n => official_name(n.strip_prefix("Proton ")?),
+                };
+                let dir = library.join("steamapps/common").join(field("installdir")?);
+                (tool == name && dir.join("proton").is_file()).then_some(dir)
+            })
+        })
+    }
+
     /// The newest GE-Proton installed, by Steam's internal name.
     pub fn newest_ge(&self) -> Option<String> {
         self.tools().into_iter().filter(|t| t.starts_with("GE-Proton")).max_by_key(|t| version_key(t))

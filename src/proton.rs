@@ -164,6 +164,61 @@ pub fn anticheat(root: &Path) -> Vec<(&'static str, bool)> {
     found
 }
 
+/// DLLs Proton already sends to its own native copies (DXVK, vkd3d-proton, NVAPI), so a game's
+/// own copy next to it loads anyway.
+const PROTON_NATIVE: [&str; 9] = ["d3d8", "d3d9", "d3d10core", "d3d11", "d3d12", "d3d12core", "dxgi", "nvapi", "nvapi64"];
+/// Windows' KnownDLLs: Windows loads its own even when a game brings a copy.
+const KNOWN_DLLS: [&str; 30] = [
+    "advapi32", "clbcatq", "combase", "comdlg32", "coml2", "difxapi", "gdi32", "gdiplus", "imagehlp", "imm32", "kernel32", "kernelbase", "msctf", "msvcrt", "normaliz",
+    "nsi", "ntdll", "ole32", "oleaut32", "psapi", "rpcrt4", "sechost", "setupapi", "shcore", "shell32", "shlwapi", "user32", "wldap32", "ws2_32", "wow64",
+];
+/// Used without an installed Proton to read the list from: Windows parts that wrappers replace.
+const WRAPPED: [&str; 10] = ["ddraw", "d3dimm", "dinput", "dinput8", "dsound", "winmm", "version", "opengl32", "d3d10", "d3d10_1"];
+
+/// The DLLs Proton's Wine has built in, from the Proton Steam uses by default.
+fn wine_builtins() -> Option<Vec<String>> {
+    let steam = Steam::find()?;
+    let lib = steam.tool_dir(&steam.proton()?)?.join("files/lib/wine");
+    let mut names: Vec<String> = ["i386-windows", "x86_64-windows"]
+        .iter()
+        .flat_map(|d| fs::read_dir(lib.join(d)).into_iter().flatten().flatten())
+        .filter_map(|e| e.file_name().to_string_lossy().to_lowercase().strip_suffix(".dll").map(String::from))
+        .collect();
+    names.sort();
+    names.dedup();
+    (!names.is_empty()).then_some(names)
+}
+
+/// DLLs next to a Windows program that Windows would load from there but Wine ignores: it uses
+/// its own copy of any DLL it has built in unless told otherwise. Games bring such a copy when
+/// it's a replacement (Empire Earth's GOG release: a ddraw.dll drawing its DirectDraw/Direct3D 7
+/// through Direct3D 9; with Wine's own the picture flickers whenever the mouse moves). Copies
+/// from Microsoft (redistributable leftovers) are left to Wine's own. Names without ".dll".
+pub fn ignored_dlls(program: &Path) -> Vec<String> {
+    let builtins = wine_builtins();
+    let built_in = |name: &str| match &builtins {
+        Some(list) => list.binary_search(&name.to_string()).is_ok(),
+        None => WRAPPED.contains(&name),
+    };
+    let mut out: Vec<String> = fs::read_dir(program.parent().unwrap_or(Path::new(".")))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_lowercase().strip_suffix(".dll")?.to_string();
+            let wanted = built_in(&name) && !PROTON_NATIVE.contains(&name.as_str()) && !KNOWN_DLLS.contains(&name.as_str());
+            (wanted && !crate::binary::company(&e.path()).is_some_and(|c| c.to_lowercase().contains("microsoft"))).then_some(name)
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// A WINEDLLOVERRIDES value making Wine use the game's own copies first.
+pub fn overrides(dlls: &[String]) -> String {
+    dlls.iter().map(|d| format!("{d}=n,b")).collect::<Vec<_>>().join(";")
+}
+
 const GE_RELEASES: &str = "https://api.github.com/repos/GloriousEggroll/proton-ge-custom/releases/latest";
 
 /// Downloads the latest GE-Proton (about 560 MB) from its GitHub releases into Steam's

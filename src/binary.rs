@@ -372,6 +372,18 @@ fn elf(f: &mut File, h: &[u8]) -> Option<Elf> {
     Some(Elf { bits, machine, program, needed, rpath, runpath, packed, pyinstaller, exec_stack })
 }
 
+/// The maker a Windows file names in its version information ("CompanyName"), if any.
+pub fn company(path: &Path) -> Option<String> {
+    let data = std::fs::read(path).ok()?;
+    let key: Vec<u8> = "CompanyName\0".encode_utf16().flat_map(|c| c.to_le_bytes()).collect();
+    let at = data.windows(key.len()).position(|w| w == key)? + key.len();
+    // The value starts at the next 4-byte boundary and ends at a UTF-16 NUL.
+    let start = (at + 3) & !3;
+    let units: Vec<u16> = data.get(start..)?.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).take_while(|&u| u != 0).take(128).collect();
+    let name = String::from_utf16_lossy(&units).trim().to_string();
+    (!name.is_empty()).then_some(name)
+}
+
 fn pe(f: &mut File, h: &[u8]) -> Option<Pe> {
     let lfanew = u32le(h, 0x3c) as u64;
     let nt = read_at(f, lfanew, 24 + 240)?;

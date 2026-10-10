@@ -11,6 +11,9 @@ use std::path::{Path, PathBuf};
 
 pub enum Problem {
     NoLinuxBuild,
+    /// A Windows game's own copies of DLLs Wine has built in (names without ".dll"), next to
+    /// its program: Windows would load them, Wine uses its own unless told otherwise.
+    OwnWindowsDlls(Vec<String>),
     /// Nothing built, but a project's source files (the marker file and what it's for):
     /// A-Maze-Batz's download is its CMake project, dodge_the_creeps a Godot project.
     Source(PathBuf, &'static str),
@@ -256,6 +259,12 @@ pub fn check(game: &Game, system: &System) -> Report {
                     (None, None, Some((path, kind))) => Problem::Package(path, kind),
                     (None, None, None) => Problem::NoLinuxBuild,
                 });
+            }
+        }
+        if let Some(i) = game.windows {
+            let dlls = crate::proton::ignored_dlls(&game.full(&game.files[i]));
+            if !dlls.is_empty() {
+                problems.push(Problem::OwnWindowsDlls(dlls));
             }
         }
         report.problems = problems;
@@ -873,6 +882,13 @@ impl Report {
                     let _ = writeln!(out, "✗ This is the game's source code ({kind}: {}), not a built game.", file.display());
                     let _ = writeln!(out, "    It has to be built first (its README usually says how), or use a download with a");
                     let _ = writeln!(out, "    ready-made program if there is one.");
+                }
+                Problem::OwnWindowsDlls(dlls) => {
+                    let files: Vec<String> = dlls.iter().map(|d| format!("{d}.dll")).collect();
+                    let _ = writeln!(out, "✗ It brings its own {}, replacing a part of Windows. Windows would use the", files.join(", "));
+                    let _ = writeln!(out, "  game's copy, but Wine uses its own unless told otherwise, so the game may not look or");
+                    let _ = writeln!(out, "  sound as it should (Empire Earth flickers without its own ddraw.dll).");
+                    let _ = writeln!(out, "    Fix (at launch): WINEDLLOVERRIDES={}; gamefix setup --steam adds it.", crate::proton::overrides(dlls));
                 }
                 Problem::NoLinuxBuild => {
                     let _ = writeln!(out, "✗ There is no Linux version of this game.");

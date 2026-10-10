@@ -149,6 +149,11 @@ fn walk(root: &Path, rel: &Path, depth: usize, out: &mut Vec<Found>) {
             continue;
         }
         if kind.is_dir() {
+            // A Wine prefix (Lutris installs games into one): its Windows folder holds Wine's
+            // own programs, never the game.
+            if path.ends_with("drive_c/windows") {
+                continue;
+            }
             if depth < MAX_DEPTH {
                 walk(root, &path, depth + 1, out);
             }
@@ -242,7 +247,9 @@ fn pick_windows(root: &Path, files: &[Found]) -> Option<usize> {
             }
             Some((score, i))
         })
-        .max_by_key(|&(score, i)| (score, std::cmp::Reverse(i)))
+        // On a tie the biggest: the game is, next to its helpers and tools (EE2.exe, not
+        // EE2.EE2X-Windows8-FIX-by.DrMonaLisa.exe; Empire Earth.exe, not GOG's dxcfg.exe).
+        .max_by_key(|&(score, i)| (score, fs::metadata(root.join(&files[i].path)).map_or(0, |m| m.len()), std::cmp::Reverse(i)))
         .map(|(_, i)| i)
 }
 

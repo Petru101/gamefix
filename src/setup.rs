@@ -111,7 +111,7 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
             _ => None,
         });
         return match game.windows {
-            Some(i) => setup_windows(game, &game.files[i], targets),
+            Some(i) => setup_windows(game, report, &game.files[i], targets),
             None if runner.is_some() => {
                 let (command, file, name) = runner.unwrap();
                 setup_runner(game, command, file, name, targets)
@@ -296,7 +296,7 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
             Problem::Alsa32(None) => not_fixed.push("Its 32-bit ALSA sound: needs Steam's runtime (install Steam), which has a plugin that works.".into()),
             Problem::KickFiles(files) => not_fixed.push(format!("Its missing Mono files ({}): only the developer can add them; the .exe with Proton works.", files.join(", "))),
             Problem::FnaLibs(libs) => not_fixed.push(format!("Its missing native libraries ({}): get FNA's fnalibs, or use the Windows download with Proton.", libs.join(", "))),
-            Problem::NoLinuxBuild | Problem::Source(..) | Problem::Damaged(_) | Problem::Package(..) | Problem::Flash { .. } | Problem::Archive(_) | Problem::WrongMachine(_) | Problem::Love { .. } | Problem::Python { .. } | Problem::Java { .. } => {}
+            Problem::NoLinuxBuild | Problem::OwnWindowsDlls(_) | Problem::Source(..) | Problem::Damaged(_) | Problem::Package(..) | Problem::Flash { .. } | Problem::Archive(_) | Problem::WrongMachine(_) | Problem::Love { .. } | Problem::Python { .. } | Problem::Java { .. } => {}
         }
     }
     if !preload.is_empty() {
@@ -497,7 +497,7 @@ fn setup_runner(game: &Game, command: Vec<String>, file: &Path, name: &str, targ
 /// Steam Play compatibility tool" in its properties. A Steam game gets the Proton ProtonDB's
 /// reports say runs it (Steam's own choice stays when there's none); a download becomes a
 /// non-Steam shortcut with Experimental. Games whose anti-cheat stops them are left alone.
-fn setup_windows(game: &Game, exe: &crate::scan::Found, targets: &Targets) -> Result<Outcome, String> {
+fn setup_windows(game: &Game, report: &Report, exe: &crate::scan::Found, targets: &Targets) -> Result<Outcome, String> {
     if !targets.steam {
         return Err("Windows games can only be set up in Steam for now: add --steam.".into());
     }
@@ -506,6 +506,7 @@ fn setup_windows(game: &Game, exe: &crate::scan::Found, targets: &Targets) -> Re
         return Err(STEAM_OPEN.into());
     }
     let appid = steam::installed_app(&game.root);
+    let own: Vec<String> = report.problems.iter().find_map(|p| if let Problem::OwnWindowsDlls(d) = p { Some(d.clone()) } else { None }).unwrap_or_default();
     let hint = appid.and_then(proton::hint);
     let mut done = Vec::new();
     let mut not_fixed = Vec::new();
@@ -557,16 +558,24 @@ fn setup_windows(game: &Game, exe: &crate::scan::Found, targets: &Targets) -> Re
                 }
             }
         }
-        if let Some(o) = &options {
-            let file = steam.localconfig();
-            let previous = steam::launch_options(&file, appid)?;
-            let env: Vec<(&str, String)> = o.env.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
-            let line = launch_options(&env, &o.args, false, previous.as_deref().unwrap_or(""));
-            if line != previous.clone().unwrap_or_default() {
-                steam::set_launch_options(&file, appid, Some(&line))?;
-                record.push(format!("steam-launch\t{appid}\t{}\t{}", file.display(), previous.map_or("-".to_string(), |p| format!("={p}"))));
-                let why = format!("on ProtonDB they fixed it for {} players, where Steam's default Proton failed for {}", o.reports, o.of);
-                done.push(if line == o.text() { format!("Set its launch options in Steam to {line}: {why}.") } else { format!("Added {} to its launch options in Steam (now {line}): {why}.", o.text()) });
+        let mut env: Vec<(&str, String)> = options.iter().flat_map(|o| o.env.iter().map(|(k, v)| (k.as_str(), v.clone()))).collect();
+        add_overrides(&mut env, &own);
+        let args = options.as_ref().map(|o| o.args.clone()).unwrap_or_default();
+        let file = steam.localconfig();
+        let previous = steam::launch_options(&file, appid)?;
+        let line = launch_options(&env, &args, false, previous.as_deref().unwrap_or(""));
+        if line != previous.clone().unwrap_or_default() {
+            steam::set_launch_options(&file, appid, Some(&line))?;
+            done.push(match &previous {
+                Some(p) if !p.trim().is_empty() => format!("Changed its launch options in Steam to {line} (they were {p})."),
+                _ => format!("Set its launch options in Steam to {line}."),
+            });
+            record.push(format!("steam-launch\t{appid}\t{}\t{}", file.display(), previous.map_or("-".to_string(), |p| format!("={p}"))));
+            if let Some(o) = &options {
+                done.push(format!("  {}: on ProtonDB these fixed it for {} players, where Steam's default Proton failed for {}.", o.text(), o.reports, o.of));
+            }
+            if !own.is_empty() {
+                done.push(format!("  WINEDLLOVERRIDES={}: Wine uses the game's own {} instead of its built-in copy, as Windows would.", proton::overrides(&own), dll_files(&own)));
             }
         }
         if record.is_empty() {
@@ -584,7 +593,10 @@ fn setup_windows(game: &Game, exe: &crate::scan::Found, targets: &Targets) -> Re
     let program = game.full(exe);
     let workdir = program.parent().unwrap_or(&game.root);
     let file = steam.shortcuts();
-    let shortcut = steam::Shortcut { name: &game.name, exe: &program, start_dir: workdir, icon: "", launch_options: "" };
+    let mut env = Vec::new();
+    add_overrides(&mut env, &own);
+    let line = launch_options(&env, &[], false, "");
+    let shortcut = steam::Shortcut { name: &game.name, exe: &program, start_dir: workdir, icon: "", launch_options: &line };
     let appid = steam::add_shortcut(&file, &shortcut)?;
     let mut record = vec![format!("steam-shortcut\t{appid}\t{}", file.display())];
     let config = steam.config();
@@ -599,7 +611,26 @@ fn setup_windows(game: &Game, exe: &crate::scan::Found, targets: &Targets) -> Re
         not_fixed.push("App-menu entries for Windows games aren't supported yet; start it from Steam.".into());
     }
     done.extend([format!("Added \"{}\" to Steam as a non-Steam game.", game.name), format!("Set it to run with Proton ({proton}).")]);
+    if !own.is_empty() {
+        done.push(format!("Set its launch options to {line}: Wine uses the game's own {} instead of its built-in copy, as Windows would.", dll_files(&own)));
+    }
     Ok(Outcome { done, not_fixed })
+}
+
+/// Adds WINEDLLOVERRIDES making Wine use the game's own copies of these DLLs to the settings.
+fn add_overrides(env: &mut Vec<(&str, String)>, dlls: &[String]) {
+    if dlls.is_empty() {
+        return;
+    }
+    let value = proton::overrides(dlls);
+    match env.iter_mut().find(|(k, _)| *k == "WINEDLLOVERRIDES") {
+        Some((_, v)) => *v = format!("{v};{value}"),
+        None => env.push(("WINEDLLOVERRIDES", value)),
+    }
+}
+
+fn dll_files(dlls: &[String]) -> String {
+    dlls.iter().map(|d| format!("{d}.dll")).collect::<Vec<_>>().join(", ")
 }
 
 /// Steam runs launch options with `sh -c`, `%command%` standing for its launch helpers and the
