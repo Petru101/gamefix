@@ -51,9 +51,11 @@ pub enum Problem {
     /// The system's libstdc++ to preload, if found.
     OwnLibstdcxx(Option<String>),
     /// A start-up file exporting its own HarfBuzz: the system's pango (through GTK) then gets
-    /// those old functions and crashes (JK Assassins, NW.js with Chromium 48). The system's
-    /// libharfbuzz.so.0 to preload.
-    OwnHarfbuzz(PathBuf, Option<String>),
+    /// those old functions and crashes (JK Assassins, NW.js with Chromium 48). What to preload
+    /// (LD_PRELOAD's value), and whether the program itself exports it: then preloading the
+    /// system's HarfBuzz can't help (ld.so looks in the program first), so it's Steam's old
+    /// runtime's pango, from before pango used HarfBuzz (Rough & Tumble, 32-bit NW.js).
+    OwnHarfbuzz(PathBuf, Option<String>, bool),
     /// NW.js on Chromium 56-77 quits at start with "Could not find the default font" under
     /// current fontconfig rules (lilac & her light, 65; 38-55 are fine). The Chromium version.
     NwjsFonts(String),
@@ -199,8 +201,9 @@ pub fn check(game: &Game, system: &System) -> Report {
         if let Binary::Pe(pe) = &f.binary {
             match pe.installer {
                 Some(kind) => installers.push((f.path.clone(), kind)),
-                // Ren'Py keeps its Windows Python and helpers in lib/windows-*: not a Windows build.
-                None if f.path.components().any(|c| c.as_os_str().to_string_lossy().starts_with("windows-")) && game.main.is_some() => {}
+                // Ren'Py keeps its Windows Python and helpers in lib/windows-* (8: lib/py3-windows-*):
+                // not a Windows build.
+                None if f.path.components().any(|c| c.as_os_str().to_string_lossy().trim_start_matches("py3-").trim_start_matches("py2-").starts_with("windows-")) && game.main.is_some() => {}
                 None if !scan::not_the_game(&f.path) && !(pe.dotnet && game.main.is_some()) => windows.push((f.path.clone(), pe.bits)),
                 None => {}
             }
@@ -270,9 +273,13 @@ pub fn check(game: &Game, system: &System) -> Report {
     }
     // The program's DT_RPATH also applies to everything it loads that has no DT_RUNPATH.
     let main_dir = game.root.join(main.path.parent().unwrap_or(Path::new("")));
-    let main_rpath = if elf.runpath.is_empty() { expand(&elf.rpath, &main_dir) } else { Vec::new() };
+    // ld.so takes the program's $ORIGIN from /proc/self/exe, where links are resolved (an
+    // AppImage's AppRun is often a link to usr/bin/<name>, whose RUNPATH is $ORIGIN/../lib);
+    // a library's comes from the path it was found by.
+    let main_origin = std::fs::canonicalize(game.full(main)).ok().and_then(|p| p.parent().map(Path::to_path_buf)).unwrap_or_else(|| main_dir.clone());
+    let main_rpath = if elf.runpath.is_empty() { expand(&elf.rpath, &main_origin) } else { Vec::new() };
     let search = |path: &Path, e: &Elf| -> Vec<PathBuf> {
-        let dir = game.root.join(path.parent().unwrap_or(Path::new("")));
+        let dir = if path == main.path { main_origin.clone() } else { game.root.join(path.parent().unwrap_or(Path::new(""))) };
         if e.runpath.is_empty() { expand(&e.rpath, &dir).into_iter().chain(main_rpath.iter().cloned()).collect() } else { expand(&e.runpath, &dir) }
     };
     // A launcher script next to the program or above it may point LD_LIBRARY_PATH anywhere in
@@ -454,8 +461,18 @@ pub fn check(game: &Game, system: &System) -> Report {
     }
     let mut startup_files: Vec<&PathBuf> = startup.iter().copied().filter(|p| !p.to_string_lossy().contains("libharfbuzz")).collect();
     startup_files.sort();
-    if let Some(file) = startup_files.into_iter().find(|p| binary::symbols(&game.root.join(p)).is_some_and(|s| s.defined.contains("hb_face_reference_table"))) {
-        problems.push(Problem::OwnHarfbuzz(file.clone(), system.path("libharfbuzz.so.0", elf.bits).map(String::from)));
+    // Only a problem when the system's HarfBuzz gets loaded too (JK Assassins: GTK 2 → pango);
+    // Ren'Py 8's librenpython.so exports its own but loads neither, and runs.
+    let system_text = same.iter().any(|(p, e)| startup.contains(p) && e.needed.iter().any(|l| ["libpango", "libgtk", "libharfbuzz"].iter().any(|s| l.starts_with(s))));
+    if let Some(file) = startup_files.into_iter().filter(|_| system_text).find(|p| binary::symbols(&game.root.join(p)).is_some_and(|s| s.defined.contains("hb_face_reference_table"))) {
+        let in_program = binary::symbols(&game.full(main)).is_some_and(|s| s.defined.contains("hb_face_create"));
+        let preload = if in_program {
+            let pango = ["libpango-1.0.so.0", "libpangoft2-1.0.so.0", "libpangocairo-1.0.so.0"].map(|l| system.old_runtime.as_ref().and_then(|r| r.path(l, elf.bits)));
+            pango.iter().all(Option::is_some).then(|| pango.iter().flatten().map(|p| p.display().to_string()).collect::<Vec<_>>().join(":"))
+        } else {
+            system.path("libharfbuzz.so.0", elf.bits).map(String::from)
+        };
+        problems.push(Problem::OwnHarfbuzz(file.clone(), preload, in_program));
     }
     if let Some(version) = old_dotnet(&main_dir, &main.path) {
         problems.push(Problem::DotnetIcu(version));
@@ -965,13 +982,20 @@ impl Report {
                         let _ = writeln!(out, "  (Rainbeats couldn't); a 64-bit or Windows download works then.");
                     }
                 }
-                Problem::OwnHarfbuzz(file, preload) => {
+                Problem::OwnHarfbuzz(file, preload, in_program) => {
                     let _ = writeln!(out, "✗ {} has its own old copy of HarfBuzz (text shaping) built in and", file.display());
                     let _ = writeln!(out, "  shared. When the system's text libraries load theirs, they get its old functions and the");
                     let _ = writeln!(out, "  game crashes at start (JK Assassins: in hb_face_reference_table).");
+                    if *in_program {
+                        let _ = writeln!(out, "  The program itself has it, so it comes first whatever is preloaded; an older pango");
+                        let _ = writeln!(out, "  that doesn't use HarfBuzz avoids it (Steam's runtime for older games has one).");
+                    }
                     match preload {
                         Some(p) => {
                             let _ = writeln!(out, "    Fix (at launch): LD_PRELOAD={p}");
+                        }
+                        None if *in_program => {
+                            let _ = writeln!(out, "    Fix (at launch): preload Steam's runtime's pango (Steam's runtime wasn't found).");
                         }
                         None => {
                             let _ = writeln!(out, "    Fix (at launch): preload the system's libharfbuzz.so.0 (not found here).");
