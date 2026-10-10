@@ -72,6 +72,10 @@ pub enum Problem {
     /// A bundled libpulse older than 1.0, which can't find the sound server by itself; the
     /// server's address for PULSE_SERVER.
     OldPulse(String),
+    /// The game's own copy of a library the system also has, loaded first, older than what a
+    /// system library loaded with it expects: (the copy, the system library, a function the
+    /// copy lacks, the system's copy to preload).
+    Shadowed(PathBuf, String, String, Option<String>),
     /// The game's own .NET libraries built for .NET Standard, which the Mono it brings
     /// (MonoKickstart) can't load: no System.Runtime / netstandard in its folder.
     NetStandard(Vec<String>),
@@ -124,6 +128,12 @@ pub struct Report {
     pub old_runtime: Option<PathBuf>,
     /// Missing libraries only optional plugins need: what is lost, and the libraries.
     pub harmless: Vec<(&'static str, Vec<String>)>,
+    /// What's inside an AppImage, checked like a folder: its report text and the problems
+    /// found there (the ones fixable at launch are applied to the AppImage).
+    pub appimage: Option<(String, Vec<Problem>)>,
+    /// This report is about an AppImage's insides: its library path is the AppImage's own
+    /// business, so setup can't add libraries there.
+    pub inside_appimage: bool,
 }
 
 /// Plugins the game starts without when they can't load, and what is lost then.
@@ -135,6 +145,33 @@ const OPTIONAL_PLUGINS: &[(&str, &str)] = &[
 
 /// Whether two library files are the same library: their names up to ".so", without the
 /// "-<8 hex>" that auditwheel and PyInstaller add to bundled copies.
+/// Unpacks an AppImage's squashfs into the cache, checks it, and removes it again.
+fn appimage_inside(file: &Path, offset: u64, system: &System) -> Option<(String, Vec<Problem>)> {
+    let cache = std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
+    let dir = cache.join(format!("gamefix/appimage-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.parent()?).ok()?;
+    // It may report errors it can't help as a normal user (ownership, attributes) and still
+    // unpack everything, so what counts is what's there.
+    let _ = std::process::Command::new("unsquashfs")
+        .args(["-n", "-q", "-no-xattrs", "-o", &offset.to_string(), "-d"])
+        .arg(&dir)
+        .arg(file)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    let unpacked = std::fs::read_dir(&dir).is_ok_and(|mut d| d.next().is_some());
+    let inside = unpacked.then(|| scan::scan(&dir)).flatten().map(|inner| {
+        let mut report = check(&inner, system);
+        report.inside_appimage = true;
+        // Its own first line names the unpacked folder: leave that out.
+        let text = report.render(&inner).lines().skip(1).collect::<Vec<_>>().join("\n");
+        (text, report.problems)
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+    inside
+}
+
 fn same_library(a: &Path, b: &Path) -> bool {
     let base = |p: &Path| {
         let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -167,7 +204,7 @@ pub fn check(game: &Game, system: &System) -> Report {
         }
     }
     let mut problems = Vec::new();
-    let mut report = Report { problems: Vec::new(), libs_checked: 0, windows, installers, glibc: system.glibc, packed: false, pyinstaller: false, launcher_libs: Vec::new(), old_runtime: system.old_runtime.as_ref().map(|r| r.run.clone()), harmless: Vec::new() };
+    let mut report = Report { problems: Vec::new(), libs_checked: 0, windows, installers, glibc: system.glibc, packed: false, pyinstaller: false, launcher_libs: Vec::new(), appimage: None, inside_appimage: false, old_runtime: system.old_runtime.as_ref().map(|r| r.run.clone()), harmless: Vec::new() };
 
     let Some((main, elf)) = game.main() else {
         match game.portable.map(|i| &game.files[i]) {
@@ -352,6 +389,49 @@ pub fn check(game: &Game, system: &System) -> Report {
     let exec_stack: Vec<PathBuf> = same.iter().filter(|(p, e)| !e.program && e.exec_stack && !startup.contains(p)).map(|(p, _)| (*p).clone()).collect();
     if !exec_stack.is_empty() && !elf.exec_stack && system.refuses_exec_stack() {
         problems.push(Problem::ExecStack(exec_stack));
+    }
+
+    // A bundled library loaded first (the launcher's LD_LIBRARY_PATH, or the RPATH of what
+    // needs it) is also what the system's libraries loaded alongside get. If one of those needs
+    // a function only the system's newer copy has, it fails to load (Darkness Looming's old
+    // libgmodule vs the system's libgio: g_module_open_full).
+    let glibc_part = |n: &str| ["libc.so", "libm.so", "libdl.so", "libpthread.so", "librt.so", "ld-linux"].iter().any(|g| n.starts_with(g));
+    let first: Vec<(&String, &PathBuf)> = by_name
+        .iter()
+        .filter_map(|(n, (p, _))| {
+            let name = n.to_str()?;
+            let needed_from = same.iter().any(|(q, e)| e.needed.iter().any(|l| l == name) && (launcher_path || search(q, e).iter().any(|d| d.join(name).is_file())));
+            (system.has(name, elf.bits) && !glibc_part(name) && needed_from).then(|| (same.iter().find_map(|(_, e)| e.needed.iter().find(|l| *l == name)), *p))
+        })
+        .filter_map(|(n, p)| n.map(|n| (n, p)))
+        .collect();
+    if !first.is_empty() {
+        let mut users: BTreeSet<&String> = BTreeSet::new();
+        for (_, e) in &same {
+            users.extend(e.needed.iter().filter(|l| !by_name.contains_key(OsStr::new(l.as_str())) && system.has(l, elf.bits) && !glibc_part(l)));
+        }
+        let mut seen: BTreeSet<&String> = BTreeSet::new();
+        for user in users {
+            let Some(user_path) = system.path(user, elf.bits) else { continue };
+            let Some(Binary::Elf(user_elf)) = binary::identify(Path::new(user_path)) else { continue };
+            let Some(user_syms) = binary::symbols(Path::new(user_path)) else { continue };
+            for (name, copy) in first.iter().filter(|(n, _)| user_elf.needed.contains(n)) {
+                let (Some(sys), Some(own)) = (system.path(name, elf.bits).and_then(|p| binary::symbols(Path::new(p))), binary::symbols(&game.root.join(copy))) else { continue };
+                let mut lacking: Vec<&String> = user_syms.undefined.iter().filter(|s| sys.defined.contains(*s) && !own.defined.contains(*s)).collect();
+                lacking.sort();
+                if let Some(example) = lacking.first() {
+                    if seen.insert(name) {
+                        problems.push(Problem::Shadowed((*copy).clone(), user.clone(), (*example).clone(), system.path(name, elf.bits).map(String::from)));
+                    }
+                }
+            }
+        }
+    }
+
+    // An AppImage: unpack its squashfs (with the system's unsquashfs, never running it) and
+    // check what's inside like a folder.
+    if let Some(offset) = binary::appimage_offset(&game.full(main)) {
+        report.appimage = appimage_inside(&game.full(main), offset, system);
     }
 
     let clashes = symbol_clashes(game, &main.path, &same);
@@ -671,6 +751,17 @@ impl Report {
             }
             let _ = writeln!(out);
         }
+        if let Some((text, _)) = &self.appimage {
+            let _ = writeln!(out, "Inside the AppImage (unpacked to look, not run):");
+            for line in text.lines() {
+                let _ = writeln!(out, "{}{line}", if line.is_empty() { "" } else { "  " });
+            }
+            let _ = writeln!(out);
+        }
+        // The AppImage file itself has nothing to say beyond what's inside.
+        if self.problems.is_empty() && self.appimage.is_some() {
+            return out;
+        }
         if self.problems.is_empty() {
             let _ = writeln!(out, "No {}problems found in its files ({} libraries checked).", if self.packed || self.pyinstaller { "other " } else { "" }, self.libs_checked);
             let _ = writeln!(out, "If it still doesn't start, the next step is running it and reading what it prints.");
@@ -801,6 +892,10 @@ impl Report {
                         }
                     }
                     match &self.old_runtime {
+                        Some(_) if !in_old_runtime.is_empty() && self.inside_appimage => {
+                            let _ = writeln!(out, "  Steam's runtime for older games keeps libraries newer systems dropped{}, but the", if in_old_runtime.len() < libs.len() + later.len() { " (marked)" } else { ", all of these" });
+                            let _ = writeln!(out, "  AppImage sets where it looks for libraries itself, so gamefix can't add them.");
+                        }
                         Some(run) if !in_old_runtime.is_empty() => {
                             let _ = writeln!(out, "  Steam's runtime for older games keeps libraries newer systems dropped{}.", if in_old_runtime.len() < libs.len() + later.len() { " (marked)" } else { ", all of these" });
                             let _ = writeln!(out, "    Fix (at launch): start it through {}", run.display());
@@ -890,6 +985,19 @@ impl Report {
                     let _ = writeln!(out, "  (its folder has no System.Runtime or netstandard), so it quits at start: {}.", libs.join(", "));
                     let _ = writeln!(out, "  That's how the developer packaged it; nothing on this system can fill it in.");
                     let _ = writeln!(out, "    Fix: the game's .exe with Proton (Proton's Mono has those), or a Windows download.");
+                }
+                Problem::Shadowed(copy, user, example, preload) => {
+                    let _ = writeln!(out, "✗ The game's own {} is older than the system's {user} expects", copy.display());
+                    let _ = writeln!(out, "  ({example} is missing from it). Loaded first, it makes {user} fail to load, and the game");
+                    let _ = writeln!(out, "  quits or loses that feature (Darkness Looming: libgio, g_module_open_full).");
+                    match preload {
+                        Some(p) => {
+                            let _ = writeln!(out, "    Fix (at launch): LD_PRELOAD={p}");
+                        }
+                        None => {
+                            let _ = writeln!(out, "    Fix (at launch): preload the system's copy (not found here).");
+                        }
+                    }
                 }
                 Problem::OldPulse(server) => {
                     let _ = writeln!(out, "✗ It brings its own PulseAudio library from before 2011, which doesn't know where today's");

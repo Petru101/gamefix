@@ -182,6 +182,18 @@ pub fn contains(path: &Path, needle: &[u8]) -> bool {
     contains_groups(path, &[&[needle]])
 }
 
+/// Where a type-2 AppImage's squashfs image starts: right after its ELF runtime, whose section
+/// headers come last. None for anything else (checked against the squashfs magic).
+pub fn appimage_offset(path: &Path) -> Option<u64> {
+    let mut f = File::open(path).ok()?;
+    let h = read_at(&mut f, 0, 64)?;
+    if !h.starts_with(b"\x7fELF") || &h[8..11] != b"AI\x02" {
+        return None;
+    }
+    let end = if h[4] == 2 { u64le(&h, 40) + u16le(&h, 58) as u64 * u16le(&h, 60) as u64 } else { u32le(&h, 32) as u64 + u16le(&h, 46) as u64 * u16le(&h, 48) as u64 };
+    (read_at(&mut f, end, 4)? == b"hsqs").then_some(end)
+}
+
 /// Whether a script sets LD_LIBRARY_PATH; macOS's DYLD_LIBRARY_PATH, which MonoKickstart's
 /// Kick script sets, doesn't count.
 pub fn sets_library_path(path: &Path) -> bool {

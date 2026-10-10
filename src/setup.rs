@@ -151,7 +151,14 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
     let mut done = Vec::new();
     let mut not_fixed = Vec::new();
     let mut record = Vec::new();
-    for problem in &report.problems {
+    // Inside an AppImage only what's fixed at launch applies: the files there can't be changed.
+    let inside = report.appimage.iter().flat_map(|(_, problems)| problems).filter(|p| {
+        matches!(
+            p,
+            Problem::OwnLibstdcxx(Some(_)) | Problem::OwnHarfbuzz(_, Some(_)) | Problem::Shadowed(.., Some(_)) | Problem::ExecStack(_) | Problem::DotnetIcu(_) | Problem::NwjsFonts(_) | Problem::OldPulse(_) | Problem::Alsa32(Some(_))
+        )
+    });
+    for problem in report.problems.iter().chain(inside) {
         match problem {
             Problem::NotExecutable(_) => {
                 let mode = fs::metadata(&program).map_err(|e| e.to_string())?.permissions().mode();
@@ -181,6 +188,11 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
                 preload.push(path.clone());
                 done.push("Loads the system's HarfBuzz first, so its text libraries don't get the game's old copy (at launch).".into());
             }
+            Problem::Shadowed(_, user, _, Some(path)) => {
+                preload.push(path.clone());
+                done.push(format!("Loads the system's newer copy of a library the game brings an old one of, so the system's {user} gets what it needs (at launch)."));
+            }
+            Problem::Shadowed(_, _, _, None) => not_fixed.push("An old library the game brings: the system's copy to preload wasn't found.".into()),
             Problem::OwnHarfbuzz(_, None) => not_fixed.push("Its built-in HarfBuzz: the system's libharfbuzz.so.0 to preload wasn't found.".into()),
             Problem::OwnLibstdcxx(None) => not_fixed.push("Its built-in C++ library: the system's libstdc++.so.6 to preload wasn't found.".into()),
             Problem::Sdl2Mix(path) => {

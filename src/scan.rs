@@ -134,6 +134,10 @@ fn walk(root: &Path, rel: &Path, depth: usize, out: &mut Vec<Found>) {
         }
         let path = rel.join(entry.file_name());
         let Ok(kind) = entry.file_type() else { continue };
+        // A link out of the folder (an unpacked AppImage has some) would read the system's files.
+        if kind.is_symlink() && fs::read_link(entry.path()).is_ok_and(|t| t.is_absolute()) {
+            continue;
+        }
         if kind.is_dir() {
             if depth < MAX_DEPTH {
                 walk(root, &path, depth + 1, out);
