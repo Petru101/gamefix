@@ -84,6 +84,8 @@ pub fn identify(path: &Path) -> Option<Binary> {
         Some(Binary::Jar)
     } else if ext == "swf" && [&b"FWS"[..], b"CWS", b"ZWS"].iter().any(|m| head.starts_with(m)) {
         Some(Binary::Flash)
+    } else if ext == "apk" && head.starts_with(b"PK\x03\x04") {
+        Some(Binary::Package("apk"))
     } else if ext == "deb" && head.starts_with(b"!<arch>\ndebian") {
         Some(Binary::Package("deb"))
     } else if ext == "rpm" && head.starts_with(b"\xed\xab\xee\xdb") {

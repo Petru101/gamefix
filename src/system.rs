@@ -111,6 +111,24 @@ impl System {
         std::env::split_paths(&path).chain([PathBuf::from("/home/linuxbrew/.linuxbrew/bin")]).map(|d| d.join("java")).find(|j| j.is_file())
     }
 
+    /// Homebrew's newest openjdk@N up to 25: version strings with dots and applets still in,
+    /// which old Processing games need (Java 26 removed applets; "27" has no dot).
+    pub fn java_lts(&self) -> Option<PathBuf> {
+        let opt = Path::new("/home/linuxbrew/.linuxbrew/opt");
+        let mut found: Vec<(u32, PathBuf)> = std::fs::read_dir(opt)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| {
+                let n: u32 = e.file_name().to_string_lossy().strip_prefix("openjdk@")?.parse().ok()?;
+                let java = e.path().join("bin/java");
+                (n <= 25 && java.is_file()).then_some((n, java))
+            })
+            .collect();
+        found.sort();
+        found.pop().map(|(_, j)| j)
+    }
+
     /// How to start LÖVE: Flathub's (Bazzite's way to install it; its sandbox can read the whole
     /// system) or one on the PATH.
     pub fn love(&self) -> Option<Vec<String>> {

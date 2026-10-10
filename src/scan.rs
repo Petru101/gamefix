@@ -238,6 +238,17 @@ pub fn processing_java(root: &Path, path: &Path) -> Option<PathBuf> {
     java.is_file().then_some(java)
 }
 
+/// What a Processing export needs to know about its Java: built on Processing 2 or older
+/// (PApplet is a java.applet.Applet, which Java 26 removed), and only 32-bit native parts.
+pub fn processing_notes(root: &Path, path: &Path) -> (bool, bool) {
+    let lib = root.join(path.parent().unwrap_or(Path::new(""))).join("lib");
+    let class = std::process::Command::new("unzip").arg("-p").arg(lib.join("core.jar")).arg("processing/core/PApplet.class").output().map(|o| o.stdout).unwrap_or_default();
+    let applet = class.windows(16).any(|w| w == b"java/applet/Appl");
+    let names: Vec<String> = fs::read_dir(&lib).into_iter().flatten().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    let only32 = names.iter().any(|n| n.contains("natives-linux-i586")) && !names.iter().any(|n| n.contains("natives-linux-amd64"));
+    (applet, only32)
+}
+
 /// A .love file, else a .jar, else the Python file that looks like the game's start: named like
 /// the folder or main/game/run, preferring ones that use pygame. Nearest the top first.
 fn pick_portable(root: &Path, files: &[Found]) -> Option<usize> {

@@ -170,7 +170,7 @@ pub fn check(game: &Game, system: &System) -> Report {
             Some(f) if matches!(f.binary, Binary::Love) => problems.push(Problem::Love { file: f.path.clone(), version: game.engine.as_ref().and_then(|e| e.version.clone()), love: system.love() }),
             Some(f) if matches!(f.binary, Binary::Jar) => problems.push(Problem::Java { file: f.path.clone(), java: system.java() }),
             Some(f) if matches!(f.binary, Binary::Script) => {
-                let java = scan::processing_java(&game.root, &f.path).or_else(|| system.java());
+                let java = scan::processing_java(&game.root, &f.path).or_else(|| system.java_lts()).or_else(|| system.java());
                 problems.push(Problem::Java { file: f.path.clone(), java });
             }
             Some(f) if matches!(f.binary, Binary::Flash) => problems.push(Problem::Flash { file: f.path.clone(), ruffle: system.ruffle() }),
@@ -348,7 +348,10 @@ pub fn check(game: &Game, system: &System) -> Report {
     if !clashes.is_empty() {
         problems.push(Problem::SymbolClash(clashes));
     }
-    if !elf.needed.iter().any(|l| l == "libstdc++.so.6") && binary::symbols(&game.full(main)).is_some_and(|s| s.defined.iter().any(|d| d.starts_with("_ZNSt8ios_base4Init"))) {
+    // Unity 4 players have it too, but run fine (Succulent, Forever, Hurt Me Plenty); Unity 5.0
+    // crashes (2:22AM, Flail Rider).
+    let unity4 = game.engine.as_ref().is_some_and(|e| e.name == "Unity" && e.version.as_deref().is_some_and(|v| v.starts_with("4.")));
+    if !unity4 && !elf.needed.iter().any(|l| l == "libstdc++.so.6") && binary::symbols(&game.full(main)).is_some_and(|s| s.defined.iter().any(|d| d.starts_with("_ZNSt8ios_base4Init"))) {
         problems.push(Problem::OwnLibstdcxx(system.path("libstdc++.so.6", elf.bits).map(String::from)));
     }
     let mut startup_files: Vec<&PathBuf> = startup.iter().copied().filter(|p| !p.to_string_lossy().contains("libharfbuzz")).collect();
@@ -699,6 +702,10 @@ impl Report {
                     let _ = writeln!(out, "    Fix: install Ruffle from Flathub (rs.ruffle.Ruffle), which plays most Flash games; then");
                     let _ = writeln!(out, "    gamefix setup adds it to the app menu.");
                 }
+                Problem::Package(file, "apk") => {
+                    let _ = writeln!(out, "✗ This download is an Android app ({}), not a game for PCs.", file.display());
+                    let _ = writeln!(out, "    Fix: get the Linux or Windows download from the game's page instead.");
+                }
                 Problem::Package(file, "deb") => {
                     let _ = writeln!(out, "✗ This download is a Debian/Ubuntu package ({}). Bazzite can't install those,", file.display());
                     let _ = writeln!(out, "  and the game inside expects to be installed into the system's folders.");
@@ -814,9 +821,21 @@ impl Report {
                 }
                 Problem::Java { file, java: Some(java) } => {
                     let _ = writeln!(out, "• This is a Processing game; its script {} starts it with Java ({}).", file.display(), java.display());
-                    let _ = writeln!(out, "  gamefix setup adds that to the app menu. Processing from before 2018 can't start on a Java");
-                    let _ = writeln!(out, "  whose version is a single number (\"27\", until its first update): Dial didn't; with Java 21");
-                    let _ = writeln!(out, "  (\"brew install openjdk@21\") it did.");
+                    let _ = writeln!(out, "  gamefix setup adds that to the app menu.");
+                    let (applet, only32) = scan::processing_notes(&game.root, file);
+                    let lts = java.to_string_lossy().contains("/openjdk@");
+                    if applet && !lts {
+                        let _ = writeln!(out, "  It's built on Processing 2 or older, a Java applet, and Java 26 removed those: it needs");
+                        let _ = writeln!(out, "  Java 25 or older (\"brew install openjdk@21\"; gamefix uses that one when it's there).");
+                    } else if !lts {
+                        let _ = writeln!(out, "  Processing from before 2018 can't start on a Java whose version is a single number (\"27\",");
+                        let _ = writeln!(out, "  until its first update): Dial didn't. Java 21 (\"brew install openjdk@21\") works, and");
+                        let _ = writeln!(out, "  gamefix uses it when it's there.");
+                    }
+                    if only32 {
+                        let _ = writeln!(out, "  It's a 32-bit export: if it draws with OpenGL, 64-bit Java can't load its 32-bit parts");
+                        let _ = writeln!(out, "  (Rainbeats couldn't); a 64-bit or Windows download works then.");
+                    }
                 }
                 Problem::OwnHarfbuzz(file, preload) => {
                     let _ = writeln!(out, "✗ {} has its own old copy of HarfBuzz (text shaping) built in and", file.display());
