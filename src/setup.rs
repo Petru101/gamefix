@@ -117,6 +117,7 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
                 setup_runner(game, command, file, name, targets)
             }
             None if report.problems.iter().any(|p| matches!(p, Problem::Archive(_))) => Err("The game is still packed in an archive: unpack it, then set up the folder it makes.".into()),
+            None if report.problems.iter().any(|p| matches!(p, Problem::Source(..))) => Err("This is the game's source code: it has to be built first.".into()),
             None if report.problems.iter().any(|p| matches!(p, Problem::Package(_, "apk"))) => Err("It's an Android app; get the game's Linux or Windows download instead.".into()),
             None if report.problems.iter().any(|p| matches!(p, Problem::Package(..))) => Err("It's a package to install into the system; get the game's .tar.gz, .zip or AppImage download instead.".into()),
             None if report.problems.iter().any(|p| matches!(p, Problem::Love { .. } | Problem::Python { .. } | Problem::Java { .. } | Problem::Flash { .. })) => {
@@ -157,7 +158,7 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
     let inside = report.appimage.iter().flat_map(|(_, problems)| problems).filter(|p| {
         matches!(
             p,
-            Problem::OwnLibstdcxx(Some(_)) | Problem::OwnHarfbuzz(_, Some(_)) | Problem::Shadowed(.., Some(_)) | Problem::ExecStack(_) | Problem::DotnetIcu(_) | Problem::NwjsFonts(_) | Problem::OldPulse(_) | Problem::Alsa32(Some(_))
+            Problem::OwnLibstdcxx(Some(_)) | Problem::OwnHarfbuzz(_, Some(_), _) | Problem::Shadowed(.., Some(_)) | Problem::ExecStack(_) | Problem::DotnetIcu(_) | Problem::NwjsFonts(_) | Problem::OldPulse(_) | Problem::Alsa32(Some(_))
         )
     });
     for problem in report.problems.iter().chain(inside) {
@@ -186,16 +187,21 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
                 preload.push(path.clone());
                 done.push("Loads the system's C++ library first, so the graphics driver doesn't crash the game (at launch).".into());
             }
-            Problem::OwnHarfbuzz(_, Some(path)) => {
+            Problem::OwnHarfbuzz(_, Some(path), false) => {
                 preload.push(path.clone());
                 done.push("Loads the system's HarfBuzz first, so its text libraries don't get the game's old copy (at launch).".into());
+            }
+            Problem::OwnHarfbuzz(_, Some(path), true) => {
+                preload.push(path.clone());
+                done.push("Loads the old pango from Steam's runtime, which doesn't use the game's old HarfBuzz (at launch).".into());
             }
             Problem::Shadowed(_, user, _, Some(path)) => {
                 preload.push(path.clone());
                 done.push(format!("Loads the system's newer copy of a library the game brings an old one of, so the system's {user} gets what it needs (at launch)."));
             }
             Problem::Shadowed(_, _, _, None) => not_fixed.push("An old library the game brings: the system's copy to preload wasn't found.".into()),
-            Problem::OwnHarfbuzz(_, None) => not_fixed.push("Its built-in HarfBuzz: the system's libharfbuzz.so.0 to preload wasn't found.".into()),
+            Problem::OwnHarfbuzz(_, None, false) => not_fixed.push("Its built-in HarfBuzz: the system's libharfbuzz.so.0 to preload wasn't found.".into()),
+            Problem::OwnHarfbuzz(_, None, true) => not_fixed.push("Its built-in HarfBuzz: Steam's runtime, whose old pango avoids it, wasn't found.".into()),
             Problem::OwnLibstdcxx(None) => not_fixed.push("Its built-in C++ library: the system's libstdc++.so.6 to preload wasn't found.".into()),
             Problem::Sdl2Mix(path) => {
                 preload.push(path.clone());
@@ -290,7 +296,7 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
             Problem::Alsa32(None) => not_fixed.push("Its 32-bit ALSA sound: needs Steam's runtime (install Steam), which has a plugin that works.".into()),
             Problem::KickFiles(files) => not_fixed.push(format!("Its missing Mono files ({}): only the developer can add them; the .exe with Proton works.", files.join(", "))),
             Problem::FnaLibs(libs) => not_fixed.push(format!("Its missing native libraries ({}): get FNA's fnalibs, or use the Windows download with Proton.", libs.join(", "))),
-            Problem::NoLinuxBuild | Problem::Damaged(_) | Problem::Package(..) | Problem::Flash { .. } | Problem::Archive(_) | Problem::WrongMachine(_) | Problem::Love { .. } | Problem::Python { .. } | Problem::Java { .. } => {}
+            Problem::NoLinuxBuild | Problem::Source(..) | Problem::Damaged(_) | Problem::Package(..) | Problem::Flash { .. } | Problem::Archive(_) | Problem::WrongMachine(_) | Problem::Love { .. } | Problem::Python { .. } | Problem::Java { .. } => {}
         }
     }
     if !preload.is_empty() {
@@ -307,13 +313,13 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
             done.push("Starts it with Steam's runtime for older games, in case it needs libraries this system dropped (it's packed, so they can't be read).".into());
         }
     }
-    // The developer's launcher script, when it sets up where the libraries are; else the program.
+    // The developer's launcher script (see Game::launcher); else the program.
     let mut start = game.launcher().map(|l| game.full(l)).unwrap_or_else(|| program.clone());
     // A launcher that replaces LD_LIBRARY_PATH would drop the folder set here: start the
     // program itself then, with the game's libraries the launcher pointed it to linked into that
     // folder, only those the system lacks; its whole folder first would hide newer system ones
     // (Because's old libogg broke the system's libsndfile).
-    if start != program && !crate::binary::keeps_library_path(&start) && env.iter().any(|(k, _)| *k == "LD_LIBRARY_PATH") {
+    if start != program && crate::binary::sets_library_path(&start) && !crate::binary::keeps_library_path(&start) && env.iter().any(|(k, _)| *k == "LD_LIBRARY_PATH") {
         let links = data_home().join("gamefix/libs").join(slug(&game.name));
         for (lib, dir) in &report.launcher_libs {
             let link = links.join(lib);

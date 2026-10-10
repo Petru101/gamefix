@@ -40,16 +40,26 @@ pub struct Game {
 }
 
 impl Game {
-    /// A script next to the program or in a folder above it that starts it and sets
-    /// LD_LIBRARY_PATH, the way the developer meant it to be started (Gravitus Minus).
+    /// A script next to the program or in a folder above it that starts it the way the
+    /// developer meant: setting LD_LIBRARY_PATH (Gravitus Minus), handing it one of the game's
+    /// files (Quick Space Dungeon), or, from a folder above, starting it by its path there
+    /// (Dungeon in my Pocket: `./bin/<name>` from the folder holding data.pck; AGS ports:
+    /// `$scriptdir/data/ags64 ... $scriptdir/data/` with ALLEGRO_MODULES). Not just any script
+    /// naming it: MonoKickstart's `Kick` scripts next to it break on spaces (Mario is Doomed).
     pub fn launcher(&self) -> Option<&Found> {
         let (main, _) = self.main()?;
         let name = main.path.file_name()?.to_string_lossy().into_owned();
+        let main_dir = main.path.parent().unwrap_or(Path::new(""));
         self.files.iter().find(|f| {
+            let Some(dir) = f.path.parent() else { return false };
             matches!(f.binary, Binary::Script)
-                && f.path.parent().is_some_and(|d| main.path.starts_with(d))
-                && binary::sets_library_path(&self.full(f))
-                && binary::contains(&self.full(f), name.as_bytes())
+                && main.path.starts_with(dir)
+                && ((binary::sets_library_path(&self.full(f)) && binary::contains(&self.full(f), name.as_bytes()))
+                    || binary::passes_file(&self.full(f), &name)
+                    || (dir != main_dir && binary::contains(&self.full(f), format!("/{name}").as_bytes())))
+                // Not one starting it through a bundled ld.so (Exodus: Liberation Circuit), which
+                // setup bypasses on purpose.
+                && !binary::contains(&self.full(f), b"--library-path")
         })
     }
 
@@ -193,6 +203,11 @@ fn pick_main(root: &Path, files: &[Found]) -> Option<usize> {
             } else if elf.machine == EM_386 {
                 score += 1;
             }
+            // A dedicated server next to the game (TACS: server.exe and tacs.exe, both Linux).
+            let lower = s.to_lowercase();
+            if lower == "server" || lower.ends_with("_server") || lower.ends_with("-server") || lower.contains("dedicated") {
+                score -= 5;
+            }
             Some((score, i))
         })
         .max_by_key(|&(score, i)| (score, std::cmp::Reverse(i)))
@@ -243,14 +258,18 @@ pub fn processing_java(root: &Path, path: &Path) -> Option<PathBuf> {
 }
 
 /// What a Processing export needs to know about its Java: built on Processing 2 or older
-/// (PApplet is a java.applet.Applet, which Java 26 removed), and only 32-bit native parts.
-pub fn processing_notes(root: &Path, path: &Path) -> (bool, bool) {
+/// (PApplet is a java.applet.Applet, which Java 26 removed), only 32-bit native parts, and
+/// only ARM ones (application.linux-armv6hf, for the Raspberry Pi: Fairy Piano's sound library
+/// fails with "can't load ARM .so on a AMD 64 platform").
+pub fn processing_notes(root: &Path, path: &Path) -> (bool, bool, bool) {
     let lib = root.join(path.parent().unwrap_or(Path::new(""))).join("lib");
     let class = std::process::Command::new("unzip").arg("-p").arg(lib.join("core.jar")).arg("processing/core/PApplet.class").output().map(|o| o.stdout).unwrap_or_default();
     let applet = class.windows(16).any(|w| w == b"java/applet/Appl");
     let names: Vec<String> = fs::read_dir(&lib).into_iter().flatten().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
     let only32 = names.iter().any(|n| n.contains("natives-linux-i586")) && !names.iter().any(|n| n.contains("natives-linux-amd64"));
-    (applet, only32)
+    let x86 = names.iter().any(|n| n.contains("natives-linux-amd64") || n.contains("natives-linux-i586"));
+    let arm = !x86 && (path.to_string_lossy().contains("linux-arm") || path.to_string_lossy().contains("linux-aarch64") || names.iter().any(|n| n.contains("natives-linux-arm") || n.contains("natives-linux-aarch64")));
+    (applet, only32, arm)
 }
 
 /// A .love file, else a .jar, else the Python file that looks like the game's start: named like
@@ -262,7 +281,7 @@ fn pick_portable(root: &Path, files: &[Found]) -> Option<usize> {
         .iter()
         .enumerate()
         .filter(|(_, f)| matches!(f.binary, Binary::Script) && processing_script(root, &f.path))
-        .min_by_key(|(_, f)| (!f.path.to_string_lossy().contains("linux64"), f.path.components().count()));
+        .min_by_key(|(_, f)| (!f.path.to_string_lossy().contains("linux64"), f.path.to_string_lossy().contains("linux-a"), f.path.components().count()));
     if let Some((i, _)) = processing {
         return Some(i);
     }
@@ -331,7 +350,7 @@ fn engine(root: &Path, main: &Path, files: &[Found]) -> Option<Engine> {
         return Some(Engine { name: "Unity", version: None });
     }
     let here = |n: &str| dir.join(n).exists();
-    let (name, found) = [("Defold", here("game.projectc")), ("MonoGame", here("MonoGame.Framework.dll")), ("FNA", here("FNA.dll")), ("NW.js", here("nw.pak") || here("lib/libnw.so")), ("Java", here("jre") && std::fs::read_dir(&dir).into_iter().flatten().flatten().any(|e| e.path().extension().is_some_and(|x| x == "jar")))]
+    let (name, found) = [("Adventure Game Studio", here("acsetup.cfg") && main.file_name().is_some_and(|n| n.to_string_lossy().starts_with("ags"))), ("Defold", here("game.projectc")), ("MonoGame", here("MonoGame.Framework.dll")), ("FNA", here("FNA.dll")), ("NW.js", here("nw.pak") || here("lib/libnw.so")), ("Java", here("jre") && std::fs::read_dir(&dir).into_iter().flatten().flatten().any(|e| e.path().extension().is_some_and(|x| x == "jar")))]
         .into_iter()
         .find(|(_, found)| *found)?;
     found.then_some(Engine { name, version: None })

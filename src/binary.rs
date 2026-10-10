@@ -76,10 +76,11 @@ pub fn identify(path: &Path) -> Option<Binary> {
         }
     } else if head.starts_with(b"MZ") && n == 64 {
         pe(&mut f, head).map(Binary::Pe)
+    } else if ext == "love" && (head.starts_with(b"PK\x03\x04") || (head.starts_with(b"#!") && head.windows(4).any(|w| w == b"PK\x03\x04"))) {
+        // Some start with "#!/usr/bin/env love" so they run when double-clicked (NEON PHASE).
+        Some(Binary::Love)
     } else if head.starts_with(b"#!") && ext != "py" {
         Some(Binary::Script)
-    } else if ext == "love" && head.starts_with(b"PK\x03\x04") {
-        Some(Binary::Love)
     } else if ext == "jar" && head.starts_with(b"PK\x03\x04") {
         Some(Binary::Jar)
     } else if ext == "swf" && [&b"FWS"[..], b"CWS", b"ZWS"].iter().any(|m| head.starts_with(m)) {
@@ -200,6 +201,25 @@ pub fn sets_library_path(path: &Path) -> bool {
     let Ok(text) = std::fs::read(path) else { return false };
     let needle = b"LD_LIBRARY_PATH";
     text.windows(needle.len()).enumerate().any(|(i, w)| w == needle && (i == 0 || text[i - 1] != b'Y'))
+}
+
+/// Whether a script starts `program` with one of the game's files after it (Quick Space
+/// Dungeon's run_game.sh: `./love quick_space_dungeon.love`, a bundled LÖVE that shows its
+/// no-game screen when started alone). Files are looked for next to the script.
+pub fn passes_file(script: &Path, program: &str) -> bool {
+    let Ok(text) = std::fs::read(script) else { return false };
+    let text = String::from_utf8_lossy(&text);
+    let dir = script.parent().unwrap_or(Path::new(""));
+    text.match_indices(program).any(|(i, _)| {
+        let rest = &text[i + program.len()..];
+        // The name itself, not part of a longer word ("love" in "lovely").
+        if !rest.starts_with([' ', '\t']) {
+            return false;
+        }
+        let arg = rest.split_whitespace().next().unwrap_or("").trim_matches(['"', '\'']);
+        let arg = if arg.starts_with('$') { arg.rsplit('/').next().unwrap_or("") } else { arg };
+        !arg.is_empty() && !arg.starts_with(['-', '$']) && dir.join(arg).is_file()
+    })
 }
 
 /// Whether a script that sets LD_LIBRARY_PATH keeps what was there ("$LD_LIBRARY_PATH"),
@@ -336,8 +356,9 @@ fn elf(f: &mut File, h: &[u8]) -> Option<Elf> {
         }
     }
 
-    // A static program has no interpreter and no dynamic section (UPX-packed ones look like that).
-    let program = program || (kind == 2 && dynamic.is_none());
+    // A static program has no interpreter and no dynamic section (UPX-packed ones look like that;
+    // a packed PIE is ET_DYN, but a library always has a dynamic section: ExpelledRL).
+    let program = program || ((kind == 2 || kind == 3) && dynamic.is_none());
     let mut start = Vec::new();
     f.seek(SeekFrom::Start(0)).ok()?;
     f.take(4096).read_to_end(&mut start).ok()?;

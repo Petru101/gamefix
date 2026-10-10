@@ -11,6 +11,9 @@ use std::path::{Path, PathBuf};
 
 pub enum Problem {
     NoLinuxBuild,
+    /// Nothing built, but a project's source files (the marker file and what it's for):
+    /// A-Maze-Batz's download is its CMake project, dodge_the_creeps a Godot project.
+    Source(PathBuf, &'static str),
     /// Nothing to run, but an archive the game may still be packed in (C-Dogs SDL: a .tar.gz
     /// inside the .zip).
     Archive(PathBuf),
@@ -51,11 +54,13 @@ pub enum Problem {
     /// The system's libstdc++ to preload, if found.
     OwnLibstdcxx(Option<String>),
     /// A start-up file exporting its own HarfBuzz: the system's pango (through GTK) then gets
-    /// those old functions and crashes (JK Assassins, NW.js with Chromium 48). The system's
-    /// libharfbuzz.so.0 to preload.
-    OwnHarfbuzz(PathBuf, Option<String>),
-    /// NW.js on Chromium 56-77 quits at start with "Could not find the default font" under
-    /// current fontconfig rules (lilac & her light, 65; 38-55 are fine). The Chromium version.
+    /// those old functions and crashes (JK Assassins, NW.js with Chromium 48). What to preload
+    /// (LD_PRELOAD's value), and whether the program itself exports it: then preloading the
+    /// system's HarfBuzz can't help (ld.so looks in the program first), so it's Steam's old
+    /// runtime's pango, from before pango used HarfBuzz (Rough & Tumble, 32-bit NW.js).
+    OwnHarfbuzz(PathBuf, Option<String>, bool),
+    /// NW.js on Chromium 59-73 quits at start with "Could not find the default font" under
+    /// current fontconfig rules (lilac & her light and others, 65; 38-58 and 74-78 are fine). The Chromium version.
     NwjsFonts(String),
     /// Native libraries FNA.dll.config maps to that are neither shipped nor installed
     /// (Shipwreck's download has empty lib/ and lib64/).
@@ -187,6 +192,13 @@ fn same_library(a: &Path, b: &Path) -> bool {
     base(a) == base(b)
 }
 
+/// A project's build file at the top or one folder down, when there's nothing to run.
+fn source_project(root: &Path) -> Option<(PathBuf, &'static str)> {
+    const MARKERS: [(&str, &str); 6] = [("project.godot", "a Godot project"), ("CMakeLists.txt", "a CMake project"), ("Cargo.toml", "a Rust project"), ("meson.build", "a Meson project"), ("configure.ac", "an Autotools project"), ("Makefile", "a Makefile project")];
+    let dirs = std::iter::once(root.to_path_buf()).chain(std::fs::read_dir(root).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.is_dir()));
+    dirs.flat_map(|d| MARKERS.iter().map(move |(m, kind)| (d.join(m), *kind))).find(|(p, _)| p.is_file()).map(|(p, kind)| (p.strip_prefix(root).unwrap_or(&p).to_path_buf(), kind))
+}
+
 fn optional_plugin(path: &std::path::Path) -> Option<&'static str> {
     let name = path.file_name()?;
     OPTIONAL_PLUGINS.iter().find(|(n, _)| name == *n).map(|(_, what)| *what)
@@ -199,8 +211,9 @@ pub fn check(game: &Game, system: &System) -> Report {
         if let Binary::Pe(pe) = &f.binary {
             match pe.installer {
                 Some(kind) => installers.push((f.path.clone(), kind)),
-                // Ren'Py keeps its Windows Python and helpers in lib/windows-*: not a Windows build.
-                None if f.path.components().any(|c| c.as_os_str().to_string_lossy().starts_with("windows-")) && game.main.is_some() => {}
+                // Ren'Py keeps its Windows Python and helpers in lib/windows-* (8: lib/py3-windows-*):
+                // not a Windows build.
+                None if f.path.components().any(|c| c.as_os_str().to_string_lossy().trim_start_matches("py3-").trim_start_matches("py2-").starts_with("windows-")) && game.main.is_some() => {}
                 None if !scan::not_the_game(&f.path) && !(pe.dotnet && game.main.is_some()) => windows.push((f.path.clone(), pe.bits)),
                 None => {}
             }
@@ -232,8 +245,13 @@ pub fn check(game: &Game, system: &System) -> Report {
                     Binary::Package(kind) => Some((f.path.clone(), kind)),
                     _ => None,
                 });
+                let source = if game.windows.is_none() { source_project(&game.root) } else { None };
                 problems.push(match (damaged, game.archive, package) {
                     (Some(f), _, _) => Problem::Damaged(f.path.clone()),
+                    _ if source.is_some() => {
+                        let (file, kind) = source.unwrap();
+                        Problem::Source(file, kind)
+                    }
                     (None, Some(i), _) => Problem::Archive(game.files[i].path.clone()),
                     (None, None, Some((path, kind))) => Problem::Package(path, kind),
                     (None, None, None) => Problem::NoLinuxBuild,
@@ -270,10 +288,14 @@ pub fn check(game: &Game, system: &System) -> Report {
     }
     // The program's DT_RPATH also applies to everything it loads that has no DT_RUNPATH.
     let main_dir = game.root.join(main.path.parent().unwrap_or(Path::new("")));
-    let main_rpath = if elf.runpath.is_empty() { expand(&elf.rpath, &main_dir) } else { Vec::new() };
+    // ld.so takes the program's $ORIGIN from /proc/self/exe, where links are resolved (an
+    // AppImage's AppRun is often a link to usr/bin/<name>, whose RUNPATH is $ORIGIN/../lib);
+    // a library's comes from the path it was found by.
+    let main_origin = std::fs::canonicalize(game.full(main)).ok().and_then(|p| p.parent().map(Path::to_path_buf)).unwrap_or_else(|| main_dir.clone());
+    let main_rpath = if elf.runpath.is_empty() { expand(&elf.rpath, &main_origin, &main_dir) } else { Vec::new() };
     let search = |path: &Path, e: &Elf| -> Vec<PathBuf> {
-        let dir = game.root.join(path.parent().unwrap_or(Path::new("")));
-        if e.runpath.is_empty() { expand(&e.rpath, &dir).into_iter().chain(main_rpath.iter().cloned()).collect() } else { expand(&e.runpath, &dir) }
+        let dir = if path == main.path { main_origin.clone() } else { game.root.join(path.parent().unwrap_or(Path::new(""))) };
+        if e.runpath.is_empty() { expand(&e.rpath, &dir, &main_dir).into_iter().chain(main_rpath.iter().cloned()).collect() } else { expand(&e.runpath, &dir, &main_dir) }
     };
     // A launcher script next to the program or above it may point LD_LIBRARY_PATH anywhere in
     // the folder; it isn't evaluated.
@@ -330,6 +352,15 @@ pub fn check(game: &Game, system: &System) -> Report {
                 misplaced.insert(lib.clone(), copy.parent().unwrap_or(Path::new("")).to_path_buf());
             }
             (if at_start { &mut missing } else { &mut later }).entry(lib.clone()).or_default().push(path.clone());
+        }
+    }
+    // .NET Core before 5 loads OpenSSL itself (dlopen, no DT_NEEDED) through its shim, and only
+    // knows 1.0 and 1.1; without one it aborts at the first HTTPS request ("No usable version
+    // of libssl was found": KlSS, .NET Core 2.2, fetching a level). 1.1 is what can be fetched.
+    let shim = main.path.parent().unwrap_or(Path::new("")).join("System.Security.Cryptography.Native.OpenSsl.so");
+    if game.root.join(&shim).is_file() && dotnet_core(&main_dir, &main.path).is_some_and(|v| v < 5) && !["libssl.so.1.1", "libssl.so.1.0.2", "libssl.so.1.0.0", "libssl.so.10"].iter().any(|l| system.has(l, elf.bits)) {
+        for lib in ["libssl.so.1.1", "libcrypto.so.1.1"] {
+            later.entry(lib.to_string()).or_default().push(shim.clone());
         }
     }
     // A library missing at start and later is a start problem.
@@ -454,15 +485,25 @@ pub fn check(game: &Game, system: &System) -> Report {
     }
     let mut startup_files: Vec<&PathBuf> = startup.iter().copied().filter(|p| !p.to_string_lossy().contains("libharfbuzz")).collect();
     startup_files.sort();
-    if let Some(file) = startup_files.into_iter().find(|p| binary::symbols(&game.root.join(p)).is_some_and(|s| s.defined.contains("hb_face_reference_table"))) {
-        problems.push(Problem::OwnHarfbuzz(file.clone(), system.path("libharfbuzz.so.0", elf.bits).map(String::from)));
+    // Only a problem when the system's HarfBuzz gets loaded too (JK Assassins: GTK 2 → pango);
+    // Ren'Py 8's librenpython.so exports its own but loads neither, and runs.
+    let system_text = same.iter().any(|(p, e)| startup.contains(p) && e.needed.iter().any(|l| ["libpango", "libgtk", "libharfbuzz"].iter().any(|s| l.starts_with(s))));
+    if let Some(file) = startup_files.into_iter().filter(|_| system_text).find(|p| binary::symbols(&game.root.join(p)).is_some_and(|s| s.defined.contains("hb_face_reference_table"))) {
+        let in_program = binary::symbols(&game.full(main)).is_some_and(|s| s.defined.contains("hb_face_create"));
+        let preload = if in_program {
+            let pango = ["libpango-1.0.so.0", "libpangoft2-1.0.so.0", "libpangocairo-1.0.so.0"].map(|l| system.old_runtime.as_ref().and_then(|r| r.path(l, elf.bits)));
+            pango.iter().all(Option::is_some).then(|| pango.iter().flatten().map(|p| p.display().to_string()).collect::<Vec<_>>().join(":"))
+        } else {
+            system.path("libharfbuzz.so.0", elf.bits).map(String::from)
+        };
+        problems.push(Problem::OwnHarfbuzz(file.clone(), preload, in_program));
     }
     if let Some(version) = old_dotnet(&main_dir, &main.path) {
         problems.push(Problem::DotnetIcu(version));
     }
     if game.engine.as_ref().is_some_and(|e| e.name == "NW.js") {
         let lib = [main_dir.join("lib/libnw.so"), game.full(main)].into_iter().find(|p| p.is_file());
-        if let Some(version) = lib.and_then(|l| chromium_version(&l)).filter(|v| v.split('.').next().and_then(|m| m.parse::<u32>().ok()).is_some_and(|m| (56..78).contains(&m))) {
+        if let Some(version) = lib.and_then(|l| chromium_version(&l)).filter(|v| v.split('.').next().and_then(|m| m.parse::<u32>().ok()).is_some_and(|m| (59..74).contains(&m))) {
             problems.push(Problem::NwjsFonts(version));
         }
     }
@@ -582,12 +623,26 @@ fn old_dotnet(dir: &Path, main: &Path) -> Option<String> {
     if config.contains("System.Globalization.Invariant\":true") || config.contains("System.Globalization.Invariant\": true") {
         return None;
     }
-    // "runtimeTarget": {"name": ".NETCoreApp,Version=v2.1/linux-x64", ...}
-    let deps = std::fs::read_to_string(dir.join(format!("{stem}.deps.json"))).ok()?;
-    let at = deps.find(".NETCoreApp,Version=v")? + ".NETCoreApp,Version=v".len();
-    let version: String = deps[at..].chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+    let version = dotnet_core_version(dir, main)?;
     let major: u32 = version.split('.').next()?.parse().ok()?;
     (major < 5).then_some(version)
+}
+
+/// A self-contained .NET Core program's framework version, from its deps.json:
+/// "runtimeTarget": {"name": ".NETCoreApp,Version=v2.1/linux-x64", ...}
+fn dotnet_core_version(dir: &Path, main: &Path) -> Option<String> {
+    if !dir.join("libhostfxr.so").is_file() {
+        return None;
+    }
+    let stem = main.file_name()?.to_string_lossy().into_owned();
+    let deps = std::fs::read_to_string(dir.join(format!("{stem}.deps.json"))).ok()?;
+    let at = deps.find(".NETCoreApp,Version=v")? + ".NETCoreApp,Version=v".len();
+    Some(deps[at..].chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect())
+}
+
+/// Its major version.
+fn dotnet_core(dir: &Path, main: &Path) -> Option<u32> {
+    dotnet_core_version(dir, main)?.split('.').next()?.parse().ok()
 }
 
 /// The start of an MP4 file: its "ftyp" box with a common brand.
@@ -627,10 +682,12 @@ fn java_window_part(path: &Path, lib: &str) -> Option<&'static str> {
 }
 
 /// A DT_RPATH or DT_RUNPATH list as folders, with $ORIGIN standing for the file's own folder.
-/// Relative entries would depend on where the game is started from, so they're left out.
-fn expand(dirs: &[String], origin: &Path) -> Vec<PathBuf> {
+/// Relative entries depend on where the game is started from: the program's folder (`workdir`)
+/// for gamefix's menu entries and Steam shortcuts, and for a double-click in a file manager
+/// (Shawy Adventures, Godot: RUNPATH `.:$ORIGIN/linux64`, libsteam_api.so next to it).
+fn expand(dirs: &[String], origin: &Path, workdir: &Path) -> Vec<PathBuf> {
     let origin = origin.to_string_lossy();
-    dirs.iter().map(|d| PathBuf::from(d.replace("${ORIGIN}", &origin).replace("$ORIGIN", &origin))).filter(|d| d.is_absolute()).collect()
+    dirs.iter().map(|d| PathBuf::from(d.replace("${ORIGIN}", &origin).replace("$ORIGIN", &origin))).map(|d| if d.is_absolute() { d } else { workdir.join(d) }).collect()
 }
 
 /// glibc resolves a library's calls through the global scope first (the program and everything
@@ -726,7 +783,14 @@ impl Report {
                 .unwrap_or_default();
             let _ = writeln!(out, "  Runs:  {} (Linux, {}-bit{engine})", main.path.display(), elf.bits);
             if let Some(l) = game.launcher() {
-                let _ = writeln!(out, "  Start: {} (the developer's launcher: it sets where the game's libraries are)", l.path.display());
+                let why = if binary::sets_library_path(&game.full(l)) {
+                    "it sets where the game's libraries are"
+                } else if l.path.parent() == main.path.parent() {
+                    "it tells the program which game file to run"
+                } else {
+                    "it starts the program from the game's folder, with its settings"
+                };
+                let _ = writeln!(out, "  Start: {} (the developer's launcher: {why})", l.path.display());
             }
         } else if let Some(Binary::Pe(pe)) = game.windows.map(|i| &game.files[i].binary) {
             let engine = game.engine.as_ref().map(|e| format!(", {}{}", e.name, e.version.as_ref().map(|v| format!(" {v}")).unwrap_or_default())).unwrap_or_default();
@@ -804,6 +868,11 @@ impl Report {
                     let _ = writeln!(out, "  It quits at start without them.");
                     let _ = writeln!(out, "    Fix: FNA's \"fnalibs\" archive (fna.flibitijibibo.com) has them; put its lib64 files in the");
                     let _ = writeln!(out, "    game's lib64 folder. Or use the Windows download with Proton, if there is one.");
+                }
+                Problem::Source(file, kind) => {
+                    let _ = writeln!(out, "✗ This is the game's source code ({kind}: {}), not a built game.", file.display());
+                    let _ = writeln!(out, "    It has to be built first (its README usually says how), or use a download with a");
+                    let _ = writeln!(out, "    ready-made program if there is one.");
                 }
                 Problem::NoLinuxBuild => {
                     let _ = writeln!(out, "✗ There is no Linux version of this game.");
@@ -984,7 +1053,7 @@ impl Report {
                     let _ = writeln!(out, "• This is a Processing game; its script {} starts it with Java ({}).", file.display(), java.display());
                     let _ = writeln!(out, "  gamefix setup adds that to the app menu, with Java's own sound sent to PipeWire (it would");
                     let _ = writeln!(out, "  open the sound card directly, which PipeWire already holds, and get none).");
-                    let (applet, only32) = scan::processing_notes(&game.root, file);
+                    let (applet, only32, arm) = scan::processing_notes(&game.root, file);
                     let lts = java.to_string_lossy().contains("/openjdk@");
                     if applet && !lts {
                         let _ = writeln!(out, "  It's built on Processing 2 or older, a Java applet, and Java 26 removed those: it needs");
@@ -998,14 +1067,26 @@ impl Report {
                         let _ = writeln!(out, "  It's a 32-bit export: if it draws with OpenGL, 64-bit Java can't load its 32-bit parts");
                         let _ = writeln!(out, "  (Rainbeats couldn't); a 64-bit or Windows download works then.");
                     }
+                    if arm {
+                        let _ = writeln!(out, "✗ But it's an export for ARM computers (Raspberry Pi): its OpenGL and sound parts can't");
+                        let _ = writeln!(out, "  load on this PC (Fairy Piano's sound library didn't).");
+                        let _ = writeln!(out, "    Fix: the game's Linux 64-bit or Windows download, if it has one.");
+                    }
                 }
-                Problem::OwnHarfbuzz(file, preload) => {
+                Problem::OwnHarfbuzz(file, preload, in_program) => {
                     let _ = writeln!(out, "✗ {} has its own old copy of HarfBuzz (text shaping) built in and", file.display());
                     let _ = writeln!(out, "  shared. When the system's text libraries load theirs, they get its old functions and the");
                     let _ = writeln!(out, "  game crashes at start (JK Assassins: in hb_face_reference_table).");
+                    if *in_program {
+                        let _ = writeln!(out, "  The program itself has it, so it comes first whatever is preloaded; an older pango");
+                        let _ = writeln!(out, "  that doesn't use HarfBuzz avoids it (Steam's runtime for older games has one).");
+                    }
                     match preload {
                         Some(p) => {
                             let _ = writeln!(out, "    Fix (at launch): LD_PRELOAD={p}");
+                        }
+                        None if *in_program => {
+                            let _ = writeln!(out, "    Fix (at launch): preload Steam's runtime's pango (Steam's runtime wasn't found).");
                         }
                         None => {
                             let _ = writeln!(out, "    Fix (at launch): preload the system's libharfbuzz.so.0 (not found here).");
@@ -1134,7 +1215,7 @@ mod tests {
     #[test]
     fn origin_means_the_files_folder() {
         let dirs = ["$ORIGIN/../lib".to_string(), "${ORIGIN}".to_string(), "lib".to_string(), "/opt/x".to_string()];
-        let out = expand(&dirs, Path::new("/g/bin"));
-        assert_eq!(out, [PathBuf::from("/g/bin/../lib"), PathBuf::from("/g/bin"), PathBuf::from("/opt/x")]);
+        let out = expand(&dirs, Path::new("/g/bin/x"), Path::new("/g/bin"));
+        assert_eq!(out, [PathBuf::from("/g/bin/x/../lib"), PathBuf::from("/g/bin/x"), PathBuf::from("/g/bin/lib"), PathBuf::from("/opt/x")]);
     }
 }

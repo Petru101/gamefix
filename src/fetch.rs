@@ -16,8 +16,9 @@ use std::process::{Command, Stdio};
 const DEBIAN_SUITES: [&str; 3] = ["bookworm", "trixie", "bullseye"];
 
 /// Ubuntu releases still in its archive, oldest first. packages.ubuntu.com no longer lists
-/// 18.04, so these are searched through each release's own index files (cached).
-const UBUNTU_SUITES: [&str; 3] = ["bionic", "focal", "jammy"];
+/// 18.04, so these are searched through each release's own index files (cached). 16.04 last,
+/// only for what the newer ones dropped (Allegro 5.0: Mediator); its indexes are 45 MB more.
+const UBUNTU_SUITES: [&str; 4] = ["bionic", "focal", "jammy", "xenial"];
 
 pub struct Fetched {
     /// Files written into the folder (libraries and their links), for undo.
@@ -54,6 +55,10 @@ pub fn fetch(libs: &[String], bits: u8, dest: &Path) -> Fetched {
         // Debian's copy when Fedora has none or it fails.
         for lib in std::mem::take(&mut want) {
             if let Some(pkg) = fedora_package(&lib, bits) {
+                // libssl and libcrypto come in one package.
+                if out.sources.contains(&format!("Fedora's {pkg}")) {
+                    continue;
+                }
                 let dir = tmp.join("rpms").join(&pkg);
                 if fedora_download(&pkg, bits, &dir) {
                     for rpm in fs::read_dir(&dir).into_iter().flatten().flatten() {
@@ -63,11 +68,12 @@ pub fn fetch(libs: &[String], bits: u8, dest: &Path) -> Fetched {
                     continue;
                 }
             }
-            let found = debian_package(&lib, bits).map(|(suite, pkg, url)| (format!("Debian {suite}'s {pkg}"), pkg, url)).or_else(|| ubuntu_package(&lib, bits).map(|(suite, pkg, url)| (format!("Ubuntu {suite}'s {pkg}"), pkg, url)));
+            let found = debian_package(&lib, bits).map(|(suite, pkg, urls)| (format!("Debian {suite}'s {pkg}"), pkg, urls)).or_else(|| ubuntu_package(&lib, bits).map(|(suite, pkg, url)| (format!("Ubuntu {suite}'s {pkg}"), pkg, vec![url])));
             match found {
-                Some((source, pkg, url)) => {
+                Some((source, _, _)) if out.sources.contains(&source) => {}
+                Some((source, pkg, urls)) => {
                     let deb = tmp.join(format!("{pkg}.deb"));
-                    if download(&url, &deb) && extract_deb(&deb, &root, &tmp.join(&pkg)) {
+                    if urls.iter().any(|u| download(u, &deb)) && extract_deb(&deb, &root, &tmp.join(&pkg)) {
                         out.sources.push(source);
                     }
                 }
@@ -114,8 +120,9 @@ fn fedora_download(pkg: &str, bits: u8, dir: &Path) -> bool {
 }
 
 /// The Debian package with a file of that name (packages.debian.org's contents search), and
-/// where to download it.
-fn debian_package(lib: &str, bits: u8) -> Option<(&'static str, String, String)> {
+/// where to download it: the mirror, then archive.debian.org, where a release goes once its
+/// support ends (bullseye's security updates already have).
+fn debian_package(lib: &str, bits: u8) -> Option<(&'static str, String, Vec<String>)> {
     let arch = if bits == 64 { "amd64" } else { "i386" };
     let keyword = lib.replace('+', "%2B");
     DEBIAN_SUITES.iter().find_map(|&suite| {
@@ -124,10 +131,17 @@ fn debian_package(lib: &str, bits: u8) -> Option<(&'static str, String, String)>
         let start = page.find(&marker)? + marker.len();
         let pkg = page[start..].split('"').next()?.to_string();
         let download = get(&format!("https://packages.debian.org/{suite}/{arch}/{pkg}/download"))?;
-        // Mirror links look like http://ftp.us.debian.org/debian/pool/main/l/lua5.2/x.deb.
-        let path = download.split('"').find(|s| s.contains("/debian/pool/") && s.ends_with(".deb"))?;
+        // Mirror links look like http://ftp.us.debian.org/debian/pool/main/l/lua5.2/x.deb; a
+        // package with security updates only has security.debian.org/debian-security/pool/updates/
+        // links (bullseye's libssl1.1).
+        let links: Vec<&str> = download.split('"').filter(|s| s.ends_with(".deb")).collect();
+        if let Some(path) = links.iter().find(|s| s.contains("/debian-security/pool/")) {
+            let pool = &path[path.find("/pool/")?..];
+            return Some((suite, pkg, vec![format!("https://security.debian.org/debian-security{pool}"), format!("https://archive.debian.org/debian-security{pool}")]));
+        }
+        let path = links.iter().find(|s| s.contains("/debian/pool/"))?;
         let pool = &path[path.find("/pool/")?..];
-        Some((suite, pkg, format!("https://deb.debian.org/debian{pool}")))
+        Some((suite, pkg, vec![format!("https://deb.debian.org/debian{pool}"), format!("https://archive.debian.org/debian{pool}")]))
     })
 }
 
