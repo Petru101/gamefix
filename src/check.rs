@@ -11,6 +11,9 @@ use std::path::{Path, PathBuf};
 
 pub enum Problem {
     NoLinuxBuild,
+    /// Nothing built, but a project's source files (the marker file and what it's for):
+    /// A-Maze-Batz's download is its CMake project, dodge_the_creeps a Godot project.
+    Source(PathBuf, &'static str),
     /// Nothing to run, but an archive the game may still be packed in (C-Dogs SDL: a .tar.gz
     /// inside the .zip).
     Archive(PathBuf),
@@ -56,8 +59,8 @@ pub enum Problem {
     /// system's HarfBuzz can't help (ld.so looks in the program first), so it's Steam's old
     /// runtime's pango, from before pango used HarfBuzz (Rough & Tumble, 32-bit NW.js).
     OwnHarfbuzz(PathBuf, Option<String>, bool),
-    /// NW.js on Chromium 56-77 quits at start with "Could not find the default font" under
-    /// current fontconfig rules (lilac & her light, 65; 38-55 are fine). The Chromium version.
+    /// NW.js on Chromium 59-73 quits at start with "Could not find the default font" under
+    /// current fontconfig rules (lilac & her light and others, 65; 38-58 and 74-78 are fine). The Chromium version.
     NwjsFonts(String),
     /// Native libraries FNA.dll.config maps to that are neither shipped nor installed
     /// (Shipwreck's download has empty lib/ and lib64/).
@@ -189,6 +192,13 @@ fn same_library(a: &Path, b: &Path) -> bool {
     base(a) == base(b)
 }
 
+/// A project's build file at the top or one folder down, when there's nothing to run.
+fn source_project(root: &Path) -> Option<(PathBuf, &'static str)> {
+    const MARKERS: [(&str, &str); 6] = [("project.godot", "a Godot project"), ("CMakeLists.txt", "a CMake project"), ("Cargo.toml", "a Rust project"), ("meson.build", "a Meson project"), ("configure.ac", "an Autotools project"), ("Makefile", "a Makefile project")];
+    let dirs = std::iter::once(root.to_path_buf()).chain(std::fs::read_dir(root).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.is_dir()));
+    dirs.flat_map(|d| MARKERS.iter().map(move |(m, kind)| (d.join(m), *kind))).find(|(p, _)| p.is_file()).map(|(p, kind)| (p.strip_prefix(root).unwrap_or(&p).to_path_buf(), kind))
+}
+
 fn optional_plugin(path: &std::path::Path) -> Option<&'static str> {
     let name = path.file_name()?;
     OPTIONAL_PLUGINS.iter().find(|(n, _)| name == *n).map(|(_, what)| *what)
@@ -235,8 +245,13 @@ pub fn check(game: &Game, system: &System) -> Report {
                     Binary::Package(kind) => Some((f.path.clone(), kind)),
                     _ => None,
                 });
+                let source = if game.windows.is_none() { source_project(&game.root) } else { None };
                 problems.push(match (damaged, game.archive, package) {
                     (Some(f), _, _) => Problem::Damaged(f.path.clone()),
+                    _ if source.is_some() => {
+                        let (file, kind) = source.unwrap();
+                        Problem::Source(file, kind)
+                    }
                     (None, Some(i), _) => Problem::Archive(game.files[i].path.clone()),
                     (None, None, Some((path, kind))) => Problem::Package(path, kind),
                     (None, None, None) => Problem::NoLinuxBuild,
@@ -277,10 +292,10 @@ pub fn check(game: &Game, system: &System) -> Report {
     // AppImage's AppRun is often a link to usr/bin/<name>, whose RUNPATH is $ORIGIN/../lib);
     // a library's comes from the path it was found by.
     let main_origin = std::fs::canonicalize(game.full(main)).ok().and_then(|p| p.parent().map(Path::to_path_buf)).unwrap_or_else(|| main_dir.clone());
-    let main_rpath = if elf.runpath.is_empty() { expand(&elf.rpath, &main_origin) } else { Vec::new() };
+    let main_rpath = if elf.runpath.is_empty() { expand(&elf.rpath, &main_origin, &main_dir) } else { Vec::new() };
     let search = |path: &Path, e: &Elf| -> Vec<PathBuf> {
         let dir = if path == main.path { main_origin.clone() } else { game.root.join(path.parent().unwrap_or(Path::new(""))) };
-        if e.runpath.is_empty() { expand(&e.rpath, &dir).into_iter().chain(main_rpath.iter().cloned()).collect() } else { expand(&e.runpath, &dir) }
+        if e.runpath.is_empty() { expand(&e.rpath, &dir, &main_dir).into_iter().chain(main_rpath.iter().cloned()).collect() } else { expand(&e.runpath, &dir, &main_dir) }
     };
     // A launcher script next to the program or above it may point LD_LIBRARY_PATH anywhere in
     // the folder; it isn't evaluated.
@@ -479,7 +494,7 @@ pub fn check(game: &Game, system: &System) -> Report {
     }
     if game.engine.as_ref().is_some_and(|e| e.name == "NW.js") {
         let lib = [main_dir.join("lib/libnw.so"), game.full(main)].into_iter().find(|p| p.is_file());
-        if let Some(version) = lib.and_then(|l| chromium_version(&l)).filter(|v| v.split('.').next().and_then(|m| m.parse::<u32>().ok()).is_some_and(|m| (56..78).contains(&m))) {
+        if let Some(version) = lib.and_then(|l| chromium_version(&l)).filter(|v| v.split('.').next().and_then(|m| m.parse::<u32>().ok()).is_some_and(|m| (59..74).contains(&m))) {
             problems.push(Problem::NwjsFonts(version));
         }
     }
@@ -644,10 +659,12 @@ fn java_window_part(path: &Path, lib: &str) -> Option<&'static str> {
 }
 
 /// A DT_RPATH or DT_RUNPATH list as folders, with $ORIGIN standing for the file's own folder.
-/// Relative entries would depend on where the game is started from, so they're left out.
-fn expand(dirs: &[String], origin: &Path) -> Vec<PathBuf> {
+/// Relative entries depend on where the game is started from: the program's folder (`workdir`)
+/// for gamefix's menu entries and Steam shortcuts, and for a double-click in a file manager
+/// (Shawy Adventures, Godot: RUNPATH `.:$ORIGIN/linux64`, libsteam_api.so next to it).
+fn expand(dirs: &[String], origin: &Path, workdir: &Path) -> Vec<PathBuf> {
     let origin = origin.to_string_lossy();
-    dirs.iter().map(|d| PathBuf::from(d.replace("${ORIGIN}", &origin).replace("$ORIGIN", &origin))).filter(|d| d.is_absolute()).collect()
+    dirs.iter().map(|d| PathBuf::from(d.replace("${ORIGIN}", &origin).replace("$ORIGIN", &origin))).map(|d| if d.is_absolute() { d } else { workdir.join(d) }).collect()
 }
 
 /// glibc resolves a library's calls through the global scope first (the program and everything
@@ -743,7 +760,8 @@ impl Report {
                 .unwrap_or_default();
             let _ = writeln!(out, "  Runs:  {} (Linux, {}-bit{engine})", main.path.display(), elf.bits);
             if let Some(l) = game.launcher() {
-                let _ = writeln!(out, "  Start: {} (the developer's launcher: it sets where the game's libraries are)", l.path.display());
+                let why = if binary::sets_library_path(&game.full(l)) { "it sets where the game's libraries are" } else { "it tells the program which game file to run" };
+                let _ = writeln!(out, "  Start: {} (the developer's launcher: {why})", l.path.display());
             }
         } else if let Some(Binary::Pe(pe)) = game.windows.map(|i| &game.files[i].binary) {
             let engine = game.engine.as_ref().map(|e| format!(", {}{}", e.name, e.version.as_ref().map(|v| format!(" {v}")).unwrap_or_default())).unwrap_or_default();
@@ -821,6 +839,11 @@ impl Report {
                     let _ = writeln!(out, "  It quits at start without them.");
                     let _ = writeln!(out, "    Fix: FNA's \"fnalibs\" archive (fna.flibitijibibo.com) has them; put its lib64 files in the");
                     let _ = writeln!(out, "    game's lib64 folder. Or use the Windows download with Proton, if there is one.");
+                }
+                Problem::Source(file, kind) => {
+                    let _ = writeln!(out, "✗ This is the game's source code ({kind}: {}), not a built game.", file.display());
+                    let _ = writeln!(out, "    It has to be built first (its README usually says how), or use a download with a");
+                    let _ = writeln!(out, "    ready-made program if there is one.");
                 }
                 Problem::NoLinuxBuild => {
                     let _ = writeln!(out, "✗ There is no Linux version of this game.");
@@ -1124,7 +1147,7 @@ mod tests {
     #[test]
     fn origin_means_the_files_folder() {
         let dirs = ["$ORIGIN/../lib".to_string(), "${ORIGIN}".to_string(), "lib".to_string(), "/opt/x".to_string()];
-        let out = expand(&dirs, Path::new("/g/bin"));
-        assert_eq!(out, [PathBuf::from("/g/bin/../lib"), PathBuf::from("/g/bin"), PathBuf::from("/opt/x")]);
+        let out = expand(&dirs, Path::new("/g/bin/x"), Path::new("/g/bin"));
+        assert_eq!(out, [PathBuf::from("/g/bin/x/../lib"), PathBuf::from("/g/bin/x"), PathBuf::from("/g/bin/lib"), PathBuf::from("/opt/x")]);
     }
 }

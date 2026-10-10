@@ -40,16 +40,17 @@ pub struct Game {
 }
 
 impl Game {
-    /// A script next to the program or in a folder above it that starts it and sets
-    /// LD_LIBRARY_PATH, the way the developer meant it to be started (Gravitus Minus).
+    /// A script next to the program or in a folder above it that starts it the way the
+    /// developer meant: setting LD_LIBRARY_PATH (Gravitus Minus), or handing it one of the
+    /// game's files (Quick Space Dungeon). Not just any script naming it: MonoKickstart's
+    /// `Kick`-style scripts break on spaces (Mario is Doomed).
     pub fn launcher(&self) -> Option<&Found> {
         let (main, _) = self.main()?;
         let name = main.path.file_name()?.to_string_lossy().into_owned();
         self.files.iter().find(|f| {
             matches!(f.binary, Binary::Script)
                 && f.path.parent().is_some_and(|d| main.path.starts_with(d))
-                && binary::sets_library_path(&self.full(f))
-                && binary::contains(&self.full(f), name.as_bytes())
+                && ((binary::sets_library_path(&self.full(f)) && binary::contains(&self.full(f), name.as_bytes())) || binary::passes_file(&self.full(f), &name))
         })
     }
 

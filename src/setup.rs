@@ -116,6 +116,7 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
                 setup_runner(game, command, file, name, targets)
             }
             None if report.problems.iter().any(|p| matches!(p, Problem::Archive(_))) => Err("The game is still packed in an archive: unpack it, then set up the folder it makes.".into()),
+            None if report.problems.iter().any(|p| matches!(p, Problem::Source(..))) => Err("This is the game's source code: it has to be built first.".into()),
             None if report.problems.iter().any(|p| matches!(p, Problem::Package(_, "apk"))) => Err("It's an Android app; get the game's Linux or Windows download instead.".into()),
             None if report.problems.iter().any(|p| matches!(p, Problem::Package(..))) => Err("It's a package to install into the system; get the game's .tar.gz, .zip or AppImage download instead.".into()),
             None if report.problems.iter().any(|p| matches!(p, Problem::Love { .. } | Problem::Python { .. } | Problem::Java { .. } | Problem::Flash { .. })) => {
@@ -294,7 +295,7 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
             Problem::Alsa32(None) => not_fixed.push("Its 32-bit ALSA sound: needs Steam's runtime (install Steam), which has a plugin that works.".into()),
             Problem::KickFiles(files) => not_fixed.push(format!("Its missing Mono files ({}): only the developer can add them; the .exe with Proton works.", files.join(", "))),
             Problem::FnaLibs(libs) => not_fixed.push(format!("Its missing native libraries ({}): get FNA's fnalibs, or use the Windows download with Proton.", libs.join(", "))),
-            Problem::NoLinuxBuild | Problem::Damaged(_) | Problem::Package(..) | Problem::Flash { .. } | Problem::Archive(_) | Problem::WrongMachine(_) | Problem::Love { .. } | Problem::Python { .. } | Problem::Java { .. } => {}
+            Problem::NoLinuxBuild | Problem::Source(..) | Problem::Damaged(_) | Problem::Package(..) | Problem::Flash { .. } | Problem::Archive(_) | Problem::WrongMachine(_) | Problem::Love { .. } | Problem::Python { .. } | Problem::Java { .. } => {}
         }
     }
     if !preload.is_empty() {
@@ -311,13 +312,13 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
             done.push("Starts it with Steam's runtime for older games, in case it needs libraries this system dropped (it's packed, so they can't be read).".into());
         }
     }
-    // The developer's launcher script, when it sets up where the libraries are; else the program.
+    // The developer's launcher script (see Game::launcher); else the program.
     let mut start = game.launcher().map(|l| game.full(l)).unwrap_or_else(|| program.clone());
     // A launcher that replaces LD_LIBRARY_PATH would drop the folder set here: start the
     // program itself then, with the game's libraries the launcher pointed it to linked into that
     // folder, only those the system lacks; its whole folder first would hide newer system ones
     // (Because's old libogg broke the system's libsndfile).
-    if start != program && !crate::binary::keeps_library_path(&start) && env.iter().any(|(k, _)| *k == "LD_LIBRARY_PATH") {
+    if start != program && crate::binary::sets_library_path(&start) && !crate::binary::keeps_library_path(&start) && env.iter().any(|(k, _)| *k == "LD_LIBRARY_PATH") {
         let links = data_home().join("gamefix/libs").join(slug(&game.name));
         for (lib, dir) in &report.launcher_libs {
             let link = links.join(lib);

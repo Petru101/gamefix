@@ -202,6 +202,25 @@ pub fn sets_library_path(path: &Path) -> bool {
     text.windows(needle.len()).enumerate().any(|(i, w)| w == needle && (i == 0 || text[i - 1] != b'Y'))
 }
 
+/// Whether a script starts `program` with one of the game's files after it (Quick Space
+/// Dungeon's run_game.sh: `./love quick_space_dungeon.love`, a bundled LÖVE that shows its
+/// no-game screen when started alone). Files are looked for next to the script.
+pub fn passes_file(script: &Path, program: &str) -> bool {
+    let Ok(text) = std::fs::read(script) else { return false };
+    let text = String::from_utf8_lossy(&text);
+    let dir = script.parent().unwrap_or(Path::new(""));
+    text.match_indices(program).any(|(i, _)| {
+        let rest = &text[i + program.len()..];
+        // The name itself, not part of a longer word ("love" in "lovely").
+        if !rest.starts_with([' ', '\t']) {
+            return false;
+        }
+        let arg = rest.split_whitespace().next().unwrap_or("").trim_matches(['"', '\'']);
+        let arg = if arg.starts_with('$') { arg.rsplit('/').next().unwrap_or("") } else { arg };
+        !arg.is_empty() && !arg.starts_with(['-', '$']) && dir.join(arg).is_file()
+    })
+}
+
 /// Whether a script that sets LD_LIBRARY_PATH keeps what was there ("$LD_LIBRARY_PATH"),
 /// rather than replacing it (labb.sh: `LD_LIBRARY_PATH=. ./labb`).
 pub fn keeps_library_path(path: &Path) -> bool {
@@ -336,8 +355,9 @@ fn elf(f: &mut File, h: &[u8]) -> Option<Elf> {
         }
     }
 
-    // A static program has no interpreter and no dynamic section (UPX-packed ones look like that).
-    let program = program || (kind == 2 && dynamic.is_none());
+    // A static program has no interpreter and no dynamic section (UPX-packed ones look like that;
+    // a packed PIE is ET_DYN, but a library always has a dynamic section: ExpelledRL).
+    let program = program || ((kind == 2 || kind == 3) && dynamic.is_none());
     let mut start = Vec::new();
     f.seek(SeekFrom::Start(0)).ok()?;
     f.take(4096).read_to_end(&mut start).ok()?;
