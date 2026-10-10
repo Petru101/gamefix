@@ -817,15 +817,23 @@ impl Report {
                         let _ = writeln!(out, "✗ Its anti-cheat stops it under Proton: {}.", hint.reason());
                         let _ = writeln!(out, "  Nothing on this side gets past that.");
                     } else if let Some(i) = game.windows {
-                        match (steam_app, &hint) {
-                            (Some(_), Some(hint)) => {
-                                let _ = writeln!(out, "    On ProtonDB it worked with {} for {} players, where Steam's default Proton", hint.tool(), hint.reports);
-                                let _ = writeln!(out, "    failed for {}.", hint.of);
-                                let _ = writeln!(out, "    Fix: gamefix setup --steam sets it to {}.", hint.tool());
+                        let options = steam_app.and_then(|id| crate::proton::options(id, &crate::proton::gpu_makers()));
+                        match (steam_app, &hint, &options) {
+                            (Some(_), None, None) => {
+                                let _ = writeln!(out, "    Steam runs it with Proton. ProtonDB's reports don't name a Proton or launch options");
+                                let _ = writeln!(out, "    that run it better than Steam's own setup.");
                             }
-                            (Some(_), None) => {
-                                let _ = writeln!(out, "    Steam runs it with Proton. ProtonDB's reports don't name a Proton that runs it");
-                                let _ = writeln!(out, "    better than Steam's own choice.");
+                            (Some(_), _, _) => {
+                                if let Some(hint) = &hint {
+                                    let _ = writeln!(out, "    On ProtonDB it worked with {} for {} players, where Steam's default Proton", hint.tool(), hint.reports);
+                                    let _ = writeln!(out, "    failed for {}.", hint.of);
+                                    let _ = writeln!(out, "    Fix: gamefix setup --steam sets it to {}.", hint.tool());
+                                }
+                                if let Some(o) = &options {
+                                    let _ = writeln!(out, "    On ProtonDB these launch options fixed it for {} players, where Steam's default", o.reports);
+                                    let _ = writeln!(out, "    Proton failed for {}: {}", o.of, o.text());
+                                    let _ = writeln!(out, "    Fix: gamefix setup --steam adds them to its launch options.");
+                                }
                             }
                             _ => {
                                 let _ = writeln!(out, "    Fix: run {} with Proton: gamefix setup --steam adds it to Steam that way.", game.files[i].path.display());

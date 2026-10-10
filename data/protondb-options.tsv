@@ -1,0 +1,22 @@
+# Steam games whose ProtonDB reports (since 2024, export of October 2026) show launch options fixing
+# them on Steam's default Proton: for any GPU, or only for one maker's (nvidia, amd); the options;
+# the fewest reports any of them fixed it in; reports Steam's default failed in. Made by
+# tools/protondb-tables.py.
+# Derived from the ProtonDB reports export (github.com/bdefore/protondb-data), Open Database
+# License 1.0 (opendatacommons.org/licenses/odbl/1-0/); this table is under the same licence.
+# appid	gpu	options	reports	failed	title
+9350	any	PROTON_NO_ESYNC=1 PROTON_NO_FSYNC=1 %command%	2	1	Supreme Commander
+19900	any	%command% -RenderProfile_Fullscreen 1	2	8	Far Cry 2
+252530	any	%command% -windowed	2	0	OMSI 2: Steam Edition
+738540	any	PROTON_USE_WINED3D=1 %command%	2	2	Tales of Vesperia: Definitive Edition
+1056720	any	PROTON_USE_WINED3D=1 %command%	2	0	Knight Club +
+1088850	nvidia	PROTON_HIDE_NVIDIA_GPU=1 %command%	3	7	Marvel's Guardians of the Galaxy
+1153720	any	%command% -force-d3d11	2	1	Fart Fiasco Premium
+1234940	any	PROTON_USE_WINED3D=1 %command% -vanillaGFX	2	0	Астронарх
+1960480	any	PROTON_USE_WINED3D=1 %command%	2	6	AutoForge
+2477290	any	WINE_DISABLE_HARDWARE_SCHEDULING=1 %command%	4	27	Half-Life 2 RTX
+3024540	any	PROTON_USE_WINED3D=1 %command%	2	1	ГОООООООЛ!
+3717070	nvidia	PROTON_HIDE_NVIDIA_GPU=1 %command%	2	2	WWE 2K26
+3919760	any	DXVK_CONFIG=dxgi.enableDummyCompositionSwapchain=True %command%	4	1	Anno 117: Pax Romana Demo
+4077800	any	PROTON_USE_WINED3D=1 %command%	3	1	Silly Survivors
+4585340	any	%command% --rendering-driver vulkan	2	10	Horse Magnifier

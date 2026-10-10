@@ -1,12 +1,13 @@
 # Steam games whose ProtonDB reports (since 2024, export of October 2026) show a Proton fixing them
 # where Steam's default fails (ge = GE-Proton, X.Y = that official Proton; then reports where
 # switching to it alone fixed the game, reports Steam's default failed in), or anti-cheat stopping
-# it (then failing reports blaming anti-cheat, all failing reports). Made by tools/protondb-proton.py.
+# it (then failing reports blaming anti-cheat, all failing reports). Made by tools/protondb-tables.py.
 # Derived from the ProtonDB reports export (github.com/bdefore/protondb-data), Open Database
 # License 1.0 (opendatacommons.org/licenses/odbl/1-0/); this table is under the same licence.
 # appid	tool	n1	n2	title
 11450	8.0	2	4	Overlord™
 25010	ge	2	3	Lugaru HD
+39510	7.0	2	6	Gothic II: Gold Edition
 40930	3.7	3	3	The Misadventures of P.B. Winterbottom
 113400	anticheat	8	13	APB Reloaded
 216150	ge	4	13	MapleStory
@@ -39,10 +40,10 @@
 417110	ge	2	2	Mayjasmine Episode01 - What is God?
 440880	ge	2	3	The Count Lucanor
 460120	ge	2	3	Megadimension Neptunia VII
-493490	8.0	3	7	City Car Driving
+493490	8.0	4	8	City Car Driving
 554600	8.0	2	3	Learn Japanese To Survive! Katakana War
 555570	anticheat	3	3	Infestation: The New Z
-567640	ge	9	18	Danganronpa V3: Killing Harmony
+567640	ge	9	19	Danganronpa V3: Killing Harmony
 573490	ge	2	2	Interstellar Transport Company
 610190	ge	2	3	WARRIORS ALL-STARS
 633230	ge	2	6	NARUTO TO BORUTO: SHINOBI STRIKER
@@ -52,6 +53,7 @@
 719890	anticheat	6	6	Beasts of Bermuda
 745960	ge	2	2	A Sky Full of Stars 仰望夜空的星辰
 760160	anticheat	8	10	Vampire: The Masquerade - Bloodhunt
+809440	5.13	2	4	Protolife
 831560	ge	2	3	WARRIORS OROCHI 4
 886250	anticheat	3	6	Vegas Infinite by PokerStars
 895400	anticheat	9	10	Deadside
@@ -76,6 +78,7 @@
 1752080	anticheat	5	7	HUNGER
 1777750	ge	2	3	Ninki Seiyuu: How to Make a Pop Voice Actress
 1797880	anticheat	3	8	Lost Light
+1816300	ge	3	4	HARVESTELLA
 1839950	9.0	4	5	Terminator: Dark Fate - Defiance
 1849250	anticheat	26	44	EA SPORTS WRC
 1851350	anticheat	4	7	Stampede: Racing Royale

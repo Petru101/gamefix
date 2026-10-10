@@ -1,9 +1,9 @@
-//! Which Proton a Windows game should run with, getting GE-Proton when that's the one, and the
-//! anti-cheat systems nothing on this side can get past.
+//! Which Proton and launch options a Windows game should run with, getting GE-Proton when
+//! that's the one, and the anti-cheat systems nothing on this side can get past.
 //!
-//! What works for Steam games comes from ProtonDB's reports (data/protondb-proton.tsv, made by
-//! tools/protondb-proton.py): for many games Steam's default Proton fails on, players found
-//! that GE-Proton or an older Proton runs them.
+//! What works for Steam games comes from ProtonDB's reports (data/protondb-proton.tsv and
+//! data/protondb-options.tsv, made by tools/protondb-tables.py): for some games Steam's default
+//! Proton fails on, players found that GE-Proton, an older Proton or launch options run them.
 
 use crate::steam::{self, Steam};
 use std::fs;
@@ -11,6 +11,75 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 const TABLE: &str = include_str!("../data/protondb-proton.tsv");
+const OPTIONS: &str = include_str!("../data/protondb-options.tsv");
+
+/// Launch options ProtonDB's reports say fix a Steam game on Steam's default Proton: settings
+/// to go before `%command%` and game arguments after it, the fewest reports any of them fixed
+/// it in, and the reports Steam's default failed in.
+#[derive(Debug, PartialEq)]
+pub struct Options {
+    pub env: Vec<(String, String)>,
+    pub args: Vec<String>,
+    pub reports: u32,
+    pub of: u32,
+}
+
+/// The launch options for a game: those for any GPU and those for the makers given (some
+/// settings only help on one maker's GPUs: PROTON_HIDE_NVIDIA_GPU).
+pub fn options(appid: u32, makers: &[&str]) -> Option<Options> {
+    let mut found: Option<Options> = None;
+    for line in OPTIONS.lines().filter(|l| !l.starts_with('#')) {
+        let f: Vec<&str> = line.split('\t').collect();
+        let [id, gpu, words, reports, of, ..] = f[..] else { continue };
+        if id.parse::<u32>().ok() != Some(appid) || !(gpu == "any" || makers.contains(&gpu)) {
+            continue;
+        }
+        let o = found.get_or_insert(Options { env: Vec::new(), args: Vec::new(), reports: u32::MAX, of: 0 });
+        let (before, after) = words.split_once("%command%").unwrap_or((words, ""));
+        for setting in before.split_whitespace() {
+            if let Some((k, v)) = setting.split_once('=') {
+                if !o.env.iter().any(|(e, _)| e == k) {
+                    o.env.push((k.to_string(), v.to_string()));
+                }
+            }
+        }
+        // Each argument with its value, if it has one: "--rendering-driver vulkan".
+        for word in after.split_whitespace() {
+            match o.args.last_mut() {
+                Some(last) if !word.starts_with('-') => *last = format!("{last} {word}"),
+                _ => o.args.push(word.to_string()),
+            }
+        }
+        o.reports = o.reports.min(reports.parse().unwrap_or(0));
+        o.of = o.of.max(of.parse().unwrap_or(0));
+    }
+    found
+}
+
+/// The makers of this computer's GPUs, as the options table names them.
+pub fn gpu_makers() -> Vec<&'static str> {
+    let mut out = Vec::new();
+    for card in fs::read_dir("/sys/class/drm").into_iter().flatten().flatten() {
+        let maker = match fs::read_to_string(card.path().join("device/vendor")).unwrap_or_default().trim() {
+            "0x10de" => "nvidia",
+            "0x1002" => "amd",
+            "0x8086" => "intel",
+            _ => continue,
+        };
+        if !out.contains(&maker) {
+            out.push(maker);
+        }
+    }
+    out
+}
+
+impl Options {
+    /// As the user would write them in Steam.
+    pub fn text(&self) -> String {
+        let env: Vec<String> = self.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        [env, vec!["%command%".to_string()], self.args.clone()].concat().join(" ")
+    }
+}
 
 #[derive(Debug, PartialEq)]
 pub enum Advice {
@@ -162,6 +231,24 @@ mod tests {
         let appid: u32 = first.split('\t').next().unwrap().parse().unwrap();
         assert!(hint(appid).is_some());
         assert_eq!(hint(0), None);
+    }
+
+    #[test]
+    fn options_table_reads() {
+        for line in OPTIONS.lines().filter(|l| !l.starts_with('#')) {
+            let f: Vec<&str> = line.split('\t').collect();
+            assert_eq!(f.len(), 6, "{line}");
+            assert!(f[2].contains("%command%"));
+            let appid: u32 = f[0].parse().unwrap();
+            let o = options(appid, &[f[1]]).unwrap();
+            assert!(o.reports >= 2 && !(o.env.is_empty() && o.args.is_empty()));
+        }
+        // Supreme Commander: two settings; Horse Magnifier: an argument with its value.
+        assert_eq!(options(9350, &[]).map(|o| o.text()).as_deref(), Some("PROTON_NO_ESYNC=1 PROTON_NO_FSYNC=1 %command%"));
+        assert_eq!(options(4585340, &[]).map(|o| o.args), Some(vec!["--rendering-driver vulkan".to_string()]));
+        // NVIDIA-only: nothing without an NVIDIA GPU.
+        assert!(options(1088850, &["amd"]).is_none());
+        assert!(options(1088850, &["nvidia"]).is_some());
     }
 
     #[test]
