@@ -183,6 +183,20 @@ pub fn contains(path: &Path, needle: &[u8]) -> bool {
     contains_groups(path, &[&[needle]])
 }
 
+/// Whether a jar's own classes use java.applet, which Java 26 removed (Sheep Farm Simulator:
+/// NoClassDefFoundError java/applet/AppletStub from its obfuscated game code). Libraries it
+/// bundles don't count: libGDX and Slick jars carry LWJGL 2's and Slick's unused applet
+/// containers and run on Java 27.
+pub fn jar_uses_applet(jar: &Path) -> bool {
+    const LIBRARIES: &[&str] = &["org/lwjgl/", "org/newdawn/", "com/badlogic/", "net/java/", "com/jcraft/", "javazoom/", "paulscode/", "de/matthiasmann/", "org/jogamp/", "com/jogamp/", "jogamp/", "javax/", "kotlin/", "org/apache/", "com/google/", "org/json/", "com/esotericsoftware/", "org/ninjacave/"];
+    let Ok(list) = std::process::Command::new("unzip").arg("-Z1").arg(jar).output() else { return false };
+    let names: Vec<String> = String::from_utf8_lossy(&list.stdout).lines().filter(|n| n.ends_with(".class") && !LIBRARIES.iter().any(|l| n.starts_with(l))).map(String::from).collect();
+    names.chunks(500).any(|chunk| {
+        let out = std::process::Command::new("unzip").arg("-p").arg(jar).args(chunk).output().map(|o| o.stdout).unwrap_or_default();
+        out.windows(12).any(|w| w == b"java/applet/")
+    })
+}
+
 /// Where a type-2 AppImage's squashfs image starts: right after its ELF runtime, whose section
 /// headers come last. None for anything else (checked against the squashfs magic).
 pub fn appimage_offset(path: &Path) -> Option<u64> {

@@ -185,8 +185,10 @@ fn pick_main(root: &Path, files: &[Found]) -> Option<usize> {
             let Binary::Elf(elf) = &f.binary else { return None };
             // glibc's libc.so.6 has an interpreter too; a bundle's own (Exodus) isn't the game.
             let name = f.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            // Nor is a bundled Java (a Processing export's java/bin/java).
-            if !elf.program || not_the_game(&f.path) || (name.starts_with("lib") && name.contains(".so")) || name.starts_with("ld-linux") || (name == "java" && f.path.parent().is_some_and(|d| d.ends_with("bin"))) {
+            // Nor is a bundled Java (a Processing export's java/bin/java) or anything else in it
+            // (Age of Conquest IV's jre/bin/jjs, jre/lib/jexec): a JRE has `release` and bin/java.
+            let jre_tool = f.path.ancestors().skip(1).any(|j| root.join(j).join("release").is_file() && root.join(j).join("bin/java").is_file());
+            if !elf.program || not_the_game(&f.path) || (name.starts_with("lib") && name.contains(".so")) || name.starts_with("ld-linux") || (name == "java" && f.path.parent().is_some_and(|d| d.ends_with("bin"))) || jre_tool {
                 return None;
             }
             let dir = root.join(f.path.parent().unwrap_or(Path::new("")));
@@ -251,10 +253,17 @@ pub fn processing_script(root: &Path, path: &Path) -> bool {
     root.join(path.parent().unwrap_or(Path::new(""))).join("lib/core.jar").is_file()
 }
 
-/// A Processing export's own Java (java/bin/java next to its script), if it brings one.
+/// A Processing export's own Java (java/bin/java next to its script), or an install4j
+/// launcher's (jre/bin/java), if it brings one.
 pub fn processing_java(root: &Path, path: &Path) -> Option<PathBuf> {
-    let java = root.join(path.parent().unwrap_or(Path::new(""))).join("java/bin/java");
-    java.is_file().then_some(java)
+    let dir = root.join(path.parent().unwrap_or(Path::new("")));
+    ["java/bin/java", "jre/bin/java"].iter().map(|j| dir.join(j)).find(|j| j.is_file())
+}
+
+/// An install4j launcher script: it finds a Java (the bundled jre/ first) and starts the game
+/// with it (Age of Conquest IV: no game program, only the JRE's own tools).
+pub fn install4j_script(root: &Path, path: &Path) -> bool {
+    binary::contains(&root.join(path), b"INSTALL4J")
 }
 
 /// What a Processing export needs to know about its Java: built on Processing 2 or older
@@ -283,6 +292,12 @@ fn pick_portable(root: &Path, files: &[Found]) -> Option<usize> {
         .filter(|(_, f)| matches!(f.binary, Binary::Script) && processing_script(root, &f.path))
         .min_by_key(|(_, f)| (!f.path.to_string_lossy().contains("linux64"), f.path.to_string_lossy().contains("linux-a"), f.path.components().count()));
     if let Some((i, _)) = processing {
+        return Some(i);
+    }
+    // Then an install4j launcher; when there are two (Age of Conquest IV: "Age of Conquest IV"
+    // and "conquest"), the one with the longer name, usually the game's full name.
+    let install4j = files.iter().enumerate().filter(|(_, f)| matches!(f.binary, Binary::Script) && install4j_script(root, &f.path)).max_by_key(|(_, f)| f.path.file_name().map_or(0, |n| n.len()));
+    if let Some((i, _)) = install4j {
         return Some(i);
     }
     for kind in [|b: &Binary| matches!(b, Binary::Love), |b: &Binary| matches!(b, Binary::Jar), |b: &Binary| matches!(b, Binary::Flash)] {
