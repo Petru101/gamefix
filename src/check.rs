@@ -50,12 +50,18 @@ pub enum Problem {
     /// loaded later by the graphics driver, then gets the old functions and crashes (2:22AM).
     /// The system's libstdc++ to preload, if found.
     OwnLibstdcxx(Option<String>),
-    /// NW.js on Chromium 56-90 quits at start with "Could not find the default font" under
+    /// A start-up file exporting its own HarfBuzz: the system's pango (through GTK) then gets
+    /// those old functions and crashes (JK Assassins, NW.js with Chromium 48). The system's
+    /// libharfbuzz.so.0 to preload.
+    OwnHarfbuzz(PathBuf, Option<String>),
+    /// NW.js on Chromium 56-77 quits at start with "Could not find the default font" under
     /// current fontconfig rules (lilac & her light, 65; 38-55 are fine). The Chromium version.
     NwjsFonts(String),
     /// Native libraries FNA.dll.config maps to that are neither shipped nor installed
     /// (Shipwreck's download has empty lib/ and lib64/).
     FnaLibs(Vec<String>),
+    /// MonoKickstart's config files the download left out (monoconfig, monomachineconfig).
+    KickFiles(Vec<String>),
     /// SDL2 add-ons (mixer, image, ...) come from Steam's runtime, built for the real SDL2, while
     /// the system's SDL2 is sdl2-compat on top of SDL3: C-Dogs SDL crashed with that mix and
     /// runs with the runtime's own SDL2 preloaded. That library's path.
@@ -123,6 +129,20 @@ const OPTIONAL_PLUGINS: &[(&str, &str)] = &[
     ("yad", "GOG's error-message window"),
 ];
 
+/// Whether two library files are the same library: their names up to ".so", without the
+/// "-<8 hex>" that auditwheel and PyInstaller add to bundled copies.
+fn same_library(a: &Path, b: &Path) -> bool {
+    let base = |p: &Path| {
+        let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let stem = name.split(".so").next().unwrap_or("").to_string();
+        match stem.rsplit_once('-') {
+            Some((head, hash)) if hash.len() == 8 && hash.chars().all(|c| c.is_ascii_hexdigit()) => head.to_string(),
+            _ => stem,
+        }
+    };
+    base(a) == base(b)
+}
+
 fn optional_plugin(path: &std::path::Path) -> Option<&'static str> {
     let name = path.file_name()?;
     OPTIONAL_PLUGINS.iter().find(|(n, _)| name == *n).map(|(_, what)| *what)
@@ -135,6 +155,8 @@ pub fn check(game: &Game, system: &System) -> Report {
         if let Binary::Pe(pe) = &f.binary {
             match pe.installer {
                 Some(kind) => installers.push((f.path.clone(), kind)),
+                // Ren'Py keeps its Windows Python and helpers in lib/windows-*: not a Windows build.
+                None if f.path.components().any(|c| c.as_os_str().to_string_lossy().starts_with("windows-")) && game.main.is_some() => {}
                 None if !scan::not_the_game(&f.path) && !(pe.dotnet && game.main.is_some()) => windows.push((f.path.clone(), pe.bits)),
                 None => {}
             }
@@ -292,6 +314,12 @@ pub fn check(game: &Game, system: &System) -> Report {
         problems.push(Problem::OldPulse(pulse_socket()));
     }
 
+    if main.path.to_string_lossy().contains(".bin.x86") && binary::contains(&game.full(main), b"monomachineconfig") {
+        let gone: Vec<String> = ["monoconfig", "monomachineconfig"].iter().filter(|f| !main_dir.join(f).exists()).map(|f| f.to_string()).collect();
+        if !gone.is_empty() {
+            problems.push(Problem::KickFiles(gone));
+        }
+    }
     if main.path.to_string_lossy().contains(".bin.x86") {
         let libs = net_standard(&main_dir);
         if !libs.is_empty() {
@@ -323,12 +351,17 @@ pub fn check(game: &Game, system: &System) -> Report {
     if !elf.needed.iter().any(|l| l == "libstdc++.so.6") && binary::symbols(&game.full(main)).is_some_and(|s| s.defined.iter().any(|d| d.starts_with("_ZNSt8ios_base4Init"))) {
         problems.push(Problem::OwnLibstdcxx(system.path("libstdc++.so.6", elf.bits).map(String::from)));
     }
+    let mut startup_files: Vec<&PathBuf> = startup.iter().copied().filter(|p| !p.to_string_lossy().contains("libharfbuzz")).collect();
+    startup_files.sort();
+    if let Some(file) = startup_files.into_iter().find(|p| binary::symbols(&game.root.join(p)).is_some_and(|s| s.defined.contains("hb_face_reference_table"))) {
+        problems.push(Problem::OwnHarfbuzz(file.clone(), system.path("libharfbuzz.so.0", elf.bits).map(String::from)));
+    }
     if let Some(version) = old_dotnet(&main_dir, &main.path) {
         problems.push(Problem::DotnetIcu(version));
     }
     if game.engine.as_ref().is_some_and(|e| e.name == "NW.js") {
         let lib = [main_dir.join("lib/libnw.so"), game.full(main)].into_iter().find(|p| p.is_file());
-        if let Some(version) = lib.and_then(|l| chromium_version(&l)).filter(|v| v.split('.').next().and_then(|m| m.parse::<u32>().ok()).is_some_and(|m| (56..=90).contains(&m))) {
+        if let Some(version) = lib.and_then(|l| chromium_version(&l)).filter(|v| v.split('.').next().and_then(|m| m.parse::<u32>().ok()).is_some_and(|m| (56..78).contains(&m))) {
             problems.push(Problem::NwjsFonts(version));
         }
     }
@@ -536,6 +569,11 @@ fn symbol_clashes(game: &Game, main: &Path, same: &[(&PathBuf, &Elf)]) -> Vec<Cl
                 }
             }
             for (shadow, mut syms) in per_shadow {
+                // The same library under another name gives the same functions (a PyInstaller
+                // bundle's renamed libz-a147dcb0.so.1.2.3 and the libz.so.1 it also packs).
+                if same_library(provider, shadow) {
+                    continue;
+                }
                 syms.sort();
                 clashes.push(Clash { victim: victim.clone(), provider: provider.clone(), shadow: shadow.clone(), count: syms.len(), example: readable(syms[0]) });
             }
@@ -780,6 +818,19 @@ impl Report {
                     let _ = writeln!(out, "  whose version is a single number (\"27\", until its first update): Dial didn't; with Java 21");
                     let _ = writeln!(out, "  (\"brew install openjdk@21\") it did.");
                 }
+                Problem::OwnHarfbuzz(file, preload) => {
+                    let _ = writeln!(out, "✗ {} has its own old copy of HarfBuzz (text shaping) built in and", file.display());
+                    let _ = writeln!(out, "  shared. When the system's text libraries load theirs, they get its old functions and the");
+                    let _ = writeln!(out, "  game crashes at start (JK Assassins: in hb_face_reference_table).");
+                    match preload {
+                        Some(p) => {
+                            let _ = writeln!(out, "    Fix (at launch): LD_PRELOAD={p}");
+                        }
+                        None => {
+                            let _ = writeln!(out, "    Fix (at launch): preload the system's libharfbuzz.so.0 (not found here).");
+                        }
+                    }
+                }
                 Problem::OwnLibstdcxx(preload) => {
                     let _ = writeln!(out, "✗ The program has its own old copy of the C++ standard library built in. When the graphics");
                     let _ = writeln!(out, "  driver loads the system's copy, that one gets the program's old functions and the game");
@@ -797,6 +848,11 @@ impl Report {
                     let _ = writeln!(out, "✗ SDL2 add-ons from Steam's runtime were built for the real SDL2, but this system's SDL2");
                     let _ = writeln!(out, "  is sdl2-compat (SDL3 underneath); some games crash with that mix (C-Dogs SDL did).");
                     let _ = writeln!(out, "    Fix (at launch): LD_PRELOAD={path} (the runtime's own SDL2)");
+                }
+                Problem::KickFiles(files) => {
+                    let _ = writeln!(out, "✗ The download lacks files the Mono it brings needs ({}), so it quits at once", files.join(", "));
+                    let _ = writeln!(out, "  (\"{} not found!\"). Only the developer can add them (Puzzle Kids left them out).", files[0]);
+                    let _ = writeln!(out, "    Fix: the game's .exe with Proton, or a Windows download.");
                 }
                 Problem::NetStandard(libs) => {
                     let _ = writeln!(out, "✗ Part of the game was built for .NET Standard, which the Mono it brings can't load");
@@ -868,6 +924,13 @@ impl Report {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn renamed_copies_are_the_same_library() {
+        assert!(same_library(Path::new("x/libz-a147dcb0.so.1.2.3"), Path::new("libz.so.1")));
+        assert!(!same_library(Path::new("libfmod.so"), Path::new("UnityPlayer.so")));
+        assert!(!same_library(Path::new("libSDL2-2.0.so.0"), Path::new("libSDL2.so")));
+    }
 
     #[test]
     fn origin_means_the_files_folder() {

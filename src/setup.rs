@@ -176,6 +176,11 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
                 preload.push(path.clone());
                 done.push("Loads the system's C++ library first, so the graphics driver doesn't crash the game (at launch).".into());
             }
+            Problem::OwnHarfbuzz(_, Some(path)) => {
+                preload.push(path.clone());
+                done.push("Loads the system's HarfBuzz first, so its text libraries don't get the game's old copy (at launch).".into());
+            }
+            Problem::OwnHarfbuzz(_, None) => not_fixed.push("Its built-in HarfBuzz: the system's libharfbuzz.so.0 to preload wasn't found.".into()),
             Problem::OwnLibstdcxx(None) => not_fixed.push("Its built-in C++ library: the system's libstdc++.so.6 to preload wasn't found.".into()),
             Problem::Sdl2Mix(path) => {
                 preload.push(path.clone());
@@ -243,6 +248,7 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
             }
             Problem::NetStandard(_) => not_fixed.push("Its .NET Standard parts: the Mono it brings can't load them; the .exe with Proton can.".into()),
             Problem::Alsa32(None) => not_fixed.push("Its 32-bit ALSA sound: needs Steam's runtime (install Steam), which has a plugin that works.".into()),
+            Problem::KickFiles(files) => not_fixed.push(format!("Its missing Mono files ({}): only the developer can add them; the .exe with Proton works.", files.join(", "))),
             Problem::FnaLibs(libs) => not_fixed.push(format!("Its missing native libraries ({}): get FNA's fnalibs, or use the Windows download with Proton.", libs.join(", "))),
             Problem::NoLinuxBuild | Problem::Damaged(_) | Problem::Package(..) | Problem::Flash { .. } | Problem::Archive(_) | Problem::WrongMachine(_) | Problem::Love { .. } | Problem::Python { .. } | Problem::Java { .. } => {}
         }
