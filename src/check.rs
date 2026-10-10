@@ -20,6 +20,9 @@ pub enum Problem {
     /// Nothing built, but a project's source files (the marker file and what it's for):
     /// A-Maze-Batz's download is its CMake project, dodge_the_creeps a Godot project.
     Source(PathBuf, &'static str),
+    /// Nothing to run but an HTML5 export (index.html with the engine's scripts): a game for a
+    /// browser (Ferryman, Construct 2: c2runtime.js, data.js).
+    Web(PathBuf),
     /// Nothing to run, but an archive the game may still be packed in (C-Dogs SDL: a .tar.gz
     /// inside the .zip).
     Archive(PathBuf),
@@ -96,6 +99,11 @@ pub enum Problem {
     /// .NET Core before 5 only looks for older ICU versions than current systems have, and
     /// quits at start (The Heart's Illumination, 2.1).
     DotnetIcu(String),
+    /// A self-contained .NET program whose deps.json lists static libraries (.a) the download
+    /// left out; the host refuses to start while any listed file is missing, though .a files
+    /// are only for building and never loaded (Sokoban, 3.1.11: System.IO.Compression.Native.a
+    /// and three more). Their names, in the program's folder.
+    DotnetStatic(Vec<String>),
 }
 
 pub struct Clash {
@@ -198,6 +206,15 @@ fn same_library(a: &Path, b: &Path) -> bool {
     base(a) == base(b)
 }
 
+/// An HTML5 export at the top or one folder down: index.html next to JavaScript files or a
+/// scripts/ folder.
+fn web_export(root: &Path) -> Option<PathBuf> {
+    let dirs = std::iter::once(root.to_path_buf()).chain(std::fs::read_dir(root).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.is_dir()));
+    dirs.filter(|d| d.join("index.html").is_file())
+        .find(|d| d.join("scripts").is_dir() || std::fs::read_dir(d).into_iter().flatten().flatten().any(|e| e.path().extension().is_some_and(|x| x == "js")))
+        .map(|d| d.join("index.html").strip_prefix(root).map(Path::to_path_buf).unwrap_or_default())
+}
+
 /// A project's build file at the top or one folder down, when there's nothing to run.
 fn source_project(root: &Path) -> Option<(PathBuf, &'static str)> {
     const MARKERS: [(&str, &str); 6] = [("project.godot", "a Godot project"), ("CMakeLists.txt", "a CMake project"), ("Cargo.toml", "a Rust project"), ("meson.build", "a Meson project"), ("configure.ac", "an Autotools project"), ("Makefile", "a Makefile project")];
@@ -255,12 +272,14 @@ pub fn check(game: &Game, system: &System) -> Report {
                     _ => None,
                 });
                 let source = if game.windows.is_none() { source_project(&game.root) } else { None };
+                let web = if game.windows.is_none() { web_export(&game.root) } else { None };
                 problems.push(match (damaged, game.archive, package) {
                     (Some(f), _, _) => Problem::Damaged(f.path.clone()),
                     _ if source.is_some() => {
                         let (file, kind) = source.unwrap();
                         Problem::Source(file, kind)
                     }
+                    _ if web.is_some() => Problem::Web(web.unwrap()),
                     (None, Some(i), _) => Problem::Archive(game.files[i].path.clone()),
                     (None, None, Some((path, kind))) => Problem::Package(path, kind),
                     (None, None, None) => Problem::NoLinuxBuild,
@@ -531,6 +550,10 @@ pub fn check(game: &Game, system: &System) -> Report {
     if let Some(version) = old_dotnet(&main_dir, &main.path) {
         problems.push(Problem::DotnetIcu(version));
     }
+    let statics = dotnet_missing_static(&main_dir, &main.path);
+    if !statics.is_empty() {
+        problems.push(Problem::DotnetStatic(statics));
+    }
     if game.engine.as_ref().is_some_and(|e| e.name == "NW.js") {
         let lib = [main_dir.join("lib/libnw.so"), game.full(main)].into_iter().find(|p| p.is_file());
         if let Some(version) = lib.and_then(|l| chromium_version(&l)).filter(|v| v.split('.').next().and_then(|m| m.parse::<u32>().ok()).is_some_and(|m| (59..74).contains(&m))) {
@@ -657,6 +680,25 @@ fn old_dotnet(dir: &Path, main: &Path) -> Option<String> {
     let version = dotnet_core_version(dir, main)?;
     let major: u32 = version.split('.').next()?.parse().ok()?;
     (major < 5).then_some(version)
+}
+
+/// Static libraries (.a) a self-contained .NET program's deps.json lists that aren't beside it.
+fn dotnet_missing_static(dir: &Path, main: &Path) -> Vec<String> {
+    let Some(stem) = main.file_name().map(|n| n.to_string_lossy().into_owned()) else { return Vec::new() };
+    if !dir.join("libhostfxr.so").is_file() {
+        return Vec::new();
+    }
+    let deps = std::fs::read_to_string(dir.join(format!("{stem}.deps.json"))).unwrap_or_default();
+    let mut missing: Vec<String> = deps
+        .split('"')
+        .filter(|s| s.ends_with(".a") && !s.contains(' '))
+        .filter_map(|s| s.rsplit('/').next())
+        .filter(|name| !dir.join(name).exists())
+        .map(String::from)
+        .collect();
+    missing.sort();
+    missing.dedup();
+    missing
 }
 
 /// A self-contained .NET Core program's framework version, from its deps.json:
@@ -947,6 +989,12 @@ impl Report {
                     let _ = writeln!(out, "  sound as it should (Empire Earth flickers without its own ddraw.dll).");
                     let _ = writeln!(out, "    Fix (at launch): WINEDLLOVERRIDES={}; gamefix setup --steam adds it.", crate::proton::overrides(dlls));
                 }
+                Problem::Web(file) => {
+                    let _ = writeln!(out, "✗ This is a web (HTML5) game ({}): it runs in a browser, not as a program.", file.display());
+                    let _ = writeln!(out, "  Opened straight from the disk it often stays blank: browsers stop a page opened from a");
+                    let _ = writeln!(out, "  file from loading the rest of the game.");
+                    let _ = writeln!(out, "    Fix: play it on its itch.io page, where it runs in the browser as made.");
+                }
                 Problem::NoLinuxBuild => {
                     let _ = writeln!(out, "✗ There is no Linux version of this game.");
                     let anticheat = crate::proton::anticheat(&game.root);
@@ -1163,7 +1211,8 @@ impl Report {
                     }
                     if only32 {
                         let _ = writeln!(out, "  It's a 32-bit export: if it draws with OpenGL, 64-bit Java can't load its 32-bit parts");
-                        let _ = writeln!(out, "  (Rainbeats couldn't); a 64-bit or Windows download works then.");
+                        let _ = writeln!(out, "  (Rainbeats, Protection Recommended couldn't). gamefix setup downloads the 64-bit ones");
+                        let _ = writeln!(out, "  for its JOGL version from Maven Central into its lib folder.");
                     }
                     if arm {
                         let _ = writeln!(out, "✗ But it's an export for ARM computers (Raspberry Pi): its OpenGL and sound parts can't");
@@ -1253,6 +1302,13 @@ impl Report {
                     } else {
                         let _ = writeln!(out, "    Fix: Steam's runtime has a 32-bit plugin that would work; install Steam to get it.");
                     }
+                }
+                Problem::DotnetStatic(files) => {
+                    let _ = writeln!(out, "✗ Its .NET list of files names {} the download left out: {}.", if files.len() == 1 { "one" } else { "some" }, files.join(", "));
+                    let _ = writeln!(out, "  They're static libraries, only used when building, never loaded; but .NET won't start");
+                    let _ = writeln!(out, "  while any listed file is missing (\"An assembly specified in the application dependencies");
+                    let _ = writeln!(out, "  manifest ... was not found\").");
+                    let _ = writeln!(out, "    Fix (once): empty files with those names next to the program (gamefix setup makes them).");
                 }
                 Problem::DotnetIcu(version) => {
                     let _ = writeln!(out, "✗ It's built on .NET Core {version}, which only looks for older versions of the ICU library");

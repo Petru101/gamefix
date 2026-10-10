@@ -132,6 +132,7 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
                 Ok(outcome)
             }
             None if report.problems.iter().any(|p| matches!(p, Problem::Archive(_))) => Err("The game is still packed in an archive: unpack it, then set up the folder it makes.".into()),
+            None if report.problems.iter().any(|p| matches!(p, Problem::Web(_))) => Err("It's a web game: play it on its itch.io page.".into()),
             None if report.problems.iter().any(|p| matches!(p, Problem::Source(..))) => Err("This is the game's source code: it has to be built first.".into()),
             None if report.problems.iter().any(|p| matches!(p, Problem::Package(_, "apk"))) => Err("It's an Android app; get the game's Linux or Windows download instead.".into()),
             None if report.problems.iter().any(|p| matches!(p, Problem::Package(..))) => Err("It's a package to install into the system; get the game's .tar.gz, .zip or AppImage download instead.".into()),
@@ -226,6 +227,17 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
                 env.push(("DOTNET_SYSTEM_GLOBALIZATION_INVARIANT", "1".into()));
                 done.push("Lets its old .NET start without the ICU library (at launch).".into());
             }
+            Problem::DotnetStatic(files) => {
+                let dir = game.full(main).parent().map(Path::to_path_buf).unwrap_or_else(|| game.root.clone());
+                for name in files {
+                    let file = dir.join(name);
+                    if !file.exists() {
+                        fs::write(&file, b"").map_err(|e| e.to_string())?;
+                        record.push(format!("created\t{}", file.display()));
+                    }
+                }
+                done.push(format!("Made empty stand-ins for the {} static librar{} its .NET list names but the download left out.", files.len(), if files.len() == 1 { "y" } else { "ies" }));
+            }
             Problem::MissingLibs { bits, libs, later, in_old_runtime, misplaced } => {
                 if let Some(run) = report.old_runtime.as_ref().filter(|_| !in_old_runtime.is_empty()) {
                     old_runtime = Some(run.clone());
@@ -311,7 +323,7 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
             Problem::Alsa32(None) => not_fixed.push("Its 32-bit ALSA sound: needs Steam's runtime (install Steam), which has a plugin that works.".into()),
             Problem::KickFiles(files) => not_fixed.push(format!("Its missing Mono files ({}): only the developer can add them; the .exe with Proton works.", files.join(", "))),
             Problem::FnaLibs(libs) => not_fixed.push(format!("Its missing native libraries ({}): get FNA's fnalibs, or use the Windows download with Proton.", libs.join(", "))),
-            Problem::NoLinuxBuild | Problem::OwnWindowsDlls(_) | Problem::MissingWindowsParts(_) | Problem::Source(..) | Problem::Damaged(_) | Problem::Package(..) | Problem::Flash { .. } | Problem::Archive(_) | Problem::WrongMachine(_) | Problem::Love { .. } | Problem::Python { .. } | Problem::Java { .. } => {}
+            Problem::NoLinuxBuild | Problem::OwnWindowsDlls(_) | Problem::MissingWindowsParts(_) | Problem::Source(..) | Problem::Web(_) | Problem::Damaged(_) | Problem::Package(..) | Problem::Flash { .. } | Problem::Archive(_) | Problem::WrongMachine(_) | Problem::Love { .. } | Problem::Python { .. } | Problem::Java { .. } => {}
         }
     }
     if !preload.is_empty() {
@@ -497,15 +509,67 @@ fn setup_runner(game: &Game, command: Vec<String>, file: &Path, name: &str, targ
     if record_path(game).exists() {
         undo(game)?;
     }
+    let mut done = Vec::new();
+    let mut not_fixed = Vec::new();
+    let mut record = Vec::new();
+    // A Processing export with only 32-bit OpenGL parts, on 64-bit Java: JOGL also looks for
+    // `<jar>-natives-linux-amd64.jar` next to its jars, and Maven Central keeps those.
+    if crate::scan::processing_script(&game.root, file) && crate::scan::processing_notes(&game.root, file).1 {
+        let lib = game.root.join(file.parent().unwrap_or(Path::new(""))).join("lib");
+        match jogl_natives(&lib) {
+            Ok((files, _)) if files.is_empty() => {}
+            Ok((files, version)) => {
+                record.extend(files.iter().map(|f| format!("created\t{}", f.display())));
+                done.push(format!("Downloaded the 64-bit OpenGL parts it lacks (JOGL {version}, from Maven Central) into its lib folder."));
+            }
+            Err(e) => not_fixed.push(e),
+        }
+    }
     let file = game.root.join(file);
     let exec: Vec<String> = command.iter().chain([&file.display().to_string()]).map(|a| exec_arg(a)).collect();
     let entry = write_entry(game, &exec, file.parent().unwrap_or(&game.root), "applications-games")?;
+    // Undo goes backwards: the entry first in the file is removed last.
+    record.insert(0, format!("created\t{}", entry.display()));
     let record_file = record_path(game);
     fs::create_dir_all(record_file.parent().unwrap()).map_err(|e| e.to_string())?;
-    fs::write(&record_file, format!("created\t{}\n", entry.display())).map_err(|e| e.to_string())?;
+    fs::write(&record_file, record.iter().map(|l| format!("{l}\n")).collect::<String>()).map_err(|e| e.to_string())?;
     refresh_menu();
-    let not_fixed = if targets.steam { vec![format!("Steam shortcuts for {name} games aren't supported yet; start it from the app menu.")] } else { Vec::new() };
-    Ok(Outcome { done: vec![format!("Added \"{}\" to the app menu, under Games (run with {name}).", game.name)], not_fixed })
+    if targets.steam {
+        not_fixed.push(format!("Steam shortcuts for {name} games aren't supported yet; start it from the app menu."));
+    }
+    done.insert(0, format!("Added \"{}\" to the app menu, under Games (run with {name}).", game.name));
+    Ok(Outcome { done, not_fixed })
+}
+
+/// JOGL's 64-bit native jars for the version an export carries (from its jars' manifests),
+/// downloaded next to them: `gluegen-rt-natives-linux-amd64.jar`, `jogl-all-natives-linux-amd64.jar`.
+/// Maven Central names some releases with a suffix (Rainbeats' 2.1.5 is 2.1.5-01 there).
+fn jogl_natives(lib: &Path) -> Result<(Vec<PathBuf>, String), String> {
+    let mut created = Vec::new();
+    let mut version = String::new();
+    for (artifact, group) in [("gluegen-rt", "org/jogamp/gluegen"), ("jogl-all", "org/jogamp/jogl")] {
+        let target = lib.join(format!("{artifact}-natives-linux-amd64.jar"));
+        if target.exists() {
+            continue;
+        }
+        let manifest = std::process::Command::new("unzip").arg("-p").arg(lib.join(format!("{artifact}.jar"))).arg("META-INF/MANIFEST.MF").output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+        let v = manifest.lines().find_map(|l| l.strip_prefix("Implementation-Version:")).map(|v| v.trim().to_string()).ok_or(format!("Its {artifact}.jar doesn't say which JOGL version it is, so its 64-bit parts couldn't be fetched."))?;
+        let fetched = [v.clone(), format!("{v}-01")].iter().any(|v| {
+            let url = format!("https://repo1.maven.org/maven2/{group}/{artifact}/{v}/{artifact}-{v}-natives-linux-amd64.jar");
+            let ok = std::process::Command::new("curl").args(["-sfL", "--max-time", "60", "-o"]).arg(&target).arg(&url).status().is_ok_and(|s| s.success());
+            let zip = fs::read(&target).is_ok_and(|b| b.starts_with(b"PK\x03\x04"));
+            if !(ok && zip) {
+                let _ = fs::remove_file(&target);
+            }
+            ok && zip
+        });
+        if !fetched {
+            return Err(format!("JOGL {v}'s 64-bit parts weren't found on Maven Central; 64-bit Java can't draw it with OpenGL."));
+        }
+        created.push(target);
+        version = v;
+    }
+    Ok((created, version))
 }
 
 /// A Windows-only game, run with Proton by Steam, like ticking "Force the use of a specific
