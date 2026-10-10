@@ -448,8 +448,8 @@ impl Report {
                     let _ = writeln!(out, "    Fix (at launch): LD_PRELOAD={}", preload.join(":"));
                 }
                 Problem::UnityH264(files) => {
-                    let _ = writeln!(out, "✗ Its videos (often the cutscenes) may stay black: they look like H.264, which Unity's");
-                    let _ = writeln!(out, "  Linux player can't decode (it plays VP8/WebM only). The game itself still runs:");
+                    let _ = writeln!(out, "✗ Its videos (intros, cutscenes) may not play (black or skipped): they look like H.264,");
+                    let _ = writeln!(out, "  which Unity's Linux player can't decode (it plays VP8/WebM only). The game still runs:");
                     list(&mut out, files);
                     let _ = writeln!(out, "    Fix: if the game has a Windows download, that with Proton plays them.");
                 }
