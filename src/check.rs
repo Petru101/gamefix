@@ -228,7 +228,10 @@ pub fn check(game: &Game, system: &System) -> Report {
     let Some((main, elf)) = game.main() else {
         match game.portable.map(|i| &game.files[i]) {
             Some(f) if matches!(f.binary, Binary::Love) => problems.push(Problem::Love { file: f.path.clone(), version: game.engine.as_ref().and_then(|e| e.version.clone()), love: system.love() }),
-            Some(f) if matches!(f.binary, Binary::Jar) => problems.push(Problem::Java { file: f.path.clone(), java: system.java() }),
+            Some(f) if matches!(f.binary, Binary::Jar) => {
+                let java = if binary::jar_uses_applet(&game.full(f)) { system.java_lts().or_else(|| system.java()) } else { system.java() };
+                problems.push(Problem::Java { file: f.path.clone(), java });
+            }
             Some(f) if matches!(f.binary, Binary::Script) => {
                 let java = scan::processing_java(&game.root, &f.path).or_else(|| system.java_lts()).or_else(|| system.java());
                 problems.push(Problem::Java { file: f.path.clone(), java });
@@ -811,6 +814,7 @@ impl Report {
                 (Binary::Python(p), _) if p.v2 => "Python 2 game".into(),
                 (Binary::Jar, _) => "Java game".into(),
                 (Binary::Flash, _) => "Flash game".into(),
+                (Binary::Script, _) if scan::install4j_script(&game.root, &f.path) => "Java game, install4j launcher".into(),
                 (Binary::Script, _) => "Processing game, runs with Java".into(),
                 _ => "Python game".into(),
             };
@@ -1063,6 +1067,14 @@ impl Report {
                 }
                 Problem::Java { file, java: Some(java) } if file.extension().is_some_and(|e| e == "jar") => {
                     let _ = writeln!(out, "• This is a Java game; Java is installed, so it runs with: {} -jar \"{}\"", java.display(), file.display());
+                    let _ = writeln!(out, "  gamefix setup adds that to the app menu.");
+                    if !java.to_string_lossy().contains("/openjdk@") && binary::jar_uses_applet(&game.root.join(file)) {
+                        let _ = writeln!(out, "  It uses Java applets, which Java 26 removed: it needs Java 25 or older (\"brew install");
+                        let _ = writeln!(out, "  openjdk@21\"; gamefix uses that one when it's there).");
+                    }
+                }
+                Problem::Java { file, java: Some(java) } if scan::install4j_script(&game.root, file) => {
+                    let _ = writeln!(out, "• This is a Java game; its launcher {} starts it with Java ({}).", file.display(), java.display());
                     let _ = writeln!(out, "  gamefix setup adds that to the app menu.");
                 }
                 Problem::Java { file, java: Some(java) } => {
