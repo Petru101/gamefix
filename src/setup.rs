@@ -89,8 +89,23 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
     let Some((main, _)) = game.main() else {
         // A game another program runs: that program and the file to give it.
         let runner = report.problems.iter().find_map(|p| match p {
-            Problem::Java { file, java: Some(java) } => Some((vec![java.display().to_string(), "-jar".into()], file, "Java")),
+            Problem::Java { file, java: Some(java) } if file.extension().is_some_and(|e| e == "jar") => Some((vec![java.display().to_string(), "-jar".into()], file, "Java")),
+            // A Processing export's script runs plain `java`, which may be Homebrew's, off the
+            // PATH menu entries get; and its exec bit is often lost.
+            Problem::Java { file, java: Some(java) } => {
+                let dir = java.parent().map(|d| d.display().to_string()).unwrap_or_default();
+                Some((vec!["env".into(), format!("PATH={dir}:/usr/bin:/bin"), "/bin/sh".into()], file, "Java"))
+            }
             Problem::Love { file, version, love: Some(love) } if !crate::check::old_love(version.as_deref()) => Some((love.clone(), file, "LÖVE")),
+            // Flathub's Ruffle sees only the home folder; give it the game's folder too.
+            Problem::Flash { file, ruffle: Some(ruffle) } => {
+                let mut command = ruffle.clone();
+                if command[0] == "flatpak" {
+                    let dir = game.root.join(file).parent().map(|d| d.display().to_string()).unwrap_or_default();
+                    command.insert(2, format!("--filesystem={dir}:ro"));
+                }
+                Some((command, file, "Ruffle"))
+            }
             _ => None,
         });
         return match game.windows {
@@ -100,7 +115,8 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
                 setup_runner(game, command, file, name, targets)
             }
             None if report.problems.iter().any(|p| matches!(p, Problem::Archive(_))) => Err("The game is still packed in an archive: unpack it, then set up the folder it makes.".into()),
-            None if report.problems.iter().any(|p| matches!(p, Problem::Love { .. } | Problem::Python { .. } | Problem::Java { .. })) => {
+            None if report.problems.iter().any(|p| matches!(p, Problem::Package(..))) => Err("It's a package to install into the system; get the game's .tar.gz, .zip or AppImage download instead.".into()),
+            None if report.problems.iter().any(|p| matches!(p, Problem::Love { .. } | Problem::Python { .. } | Problem::Java { .. } | Problem::Flash { .. })) => {
                 Err("This game needs another program to run it (see gamefix check); setting it up isn't supported yet.".into())
             }
             None => Err("No game program in this folder. If it's an installer, install the game first and set up the folder it installs to.".into()),
@@ -174,13 +190,30 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
                     old_runtime = Some(run.clone());
                     done.push("Starts it with Steam's runtime for older games, which has missing libraries (Steam does that by itself).".into());
                 }
-                let dirs = Problem::library_path(misplaced, &game.root);
-                // LD_LIBRARY_PATH splits on colons.
-                if dirs.iter().any(|d| d.contains(':')) {
-                    not_fixed.push("Libraries the game ships in a folder Linux doesn't look in: its path has a colon, which the fix can't handle.".into());
-                } else if !dirs.is_empty() {
-                    env.push(("LD_LIBRARY_PATH", dirs.join(":")));
-                    done.push("Points Linux to the libraries the game ships itself (at launch).".into());
+                // Just the libraries the system lacks, linked into a folder of their own: putting
+                // the game's folders on LD_LIBRARY_PATH would put everything else in them first
+                // too (Liberation Circuit's bundle holds its own glibc and an old libpulse).
+                if !misplaced.is_empty() {
+                    let links = data_home().join("gamefix/libs").join(slug(&game.name));
+                    // LD_LIBRARY_PATH splits on colons.
+                    if links.display().to_string().contains(':') {
+                        not_fixed.push("Libraries the game ships in a folder Linux doesn't look in: the home folder's path has a colon, which the fix can't handle.".into());
+                    } else {
+                        let new_dir = !links.exists();
+                        fs::create_dir_all(&links).map_err(|e| e.to_string())?;
+                        for (lib, dir) in misplaced {
+                            let link = links.join(lib);
+                            let _ = fs::remove_file(&link);
+                            std::os::unix::fs::symlink(game.root.join(dir).join(lib), &link).map_err(|e| e.to_string())?;
+                            record.push(format!("created\t{}", link.display()));
+                        }
+                        // After the links: undo goes in order and removes the folder once empty.
+                        if new_dir {
+                            record.push(format!("created-dir\t{}", links.display()));
+                        }
+                        env.push(("LD_LIBRARY_PATH", links.display().to_string()));
+                        done.push("Points Linux to the libraries the game ships itself (at launch, through links in ~/.local/share/gamefix/libs).".into());
+                    }
                 }
                 let others: Vec<&str> = libs.keys().filter(|l| !in_old_runtime.contains(*l) && !misplaced.contains_key(*l)).map(String::as_str).collect();
                 if !others.is_empty() {
@@ -204,13 +237,22 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
                 env.push(("ALSA_CONFIG_PATH", alsa_pulse32(pcm, ctl)?));
                 done.push("Sends its 32-bit ALSA sound through Steam's runtime's PulseAudio plugin (at launch).".into());
             }
+            Problem::OldPulse(server) => {
+                env.push(("PULSE_SERVER", server.clone()));
+                done.push("Tells its old PulseAudio library where the sound server is (at launch).".into());
+            }
+            Problem::NetStandard(_) => not_fixed.push("Its .NET Standard parts: the Mono it brings can't load them; the .exe with Proton can.".into()),
             Problem::Alsa32(None) => not_fixed.push("Its 32-bit ALSA sound: needs Steam's runtime (install Steam), which has a plugin that works.".into()),
             Problem::FnaLibs(libs) => not_fixed.push(format!("Its missing native libraries ({}): get FNA's fnalibs, or use the Windows download with Proton.", libs.join(", "))),
-            Problem::NoLinuxBuild | Problem::Damaged(_) | Problem::Archive(_) | Problem::WrongMachine(_) | Problem::Love { .. } | Problem::Python { .. } | Problem::Java { .. } => {}
+            Problem::NoLinuxBuild | Problem::Damaged(_) | Problem::Package(..) | Problem::Flash { .. } | Problem::Archive(_) | Problem::WrongMachine(_) | Problem::Love { .. } | Problem::Python { .. } | Problem::Java { .. } => {}
         }
     }
     if !preload.is_empty() {
         env.push(("LD_PRELOAD", preload.join(":")));
+    }
+    if report.pyinstaller && !env.iter().any(|(k, _)| *k == "GLIBC_TUNABLES") {
+        env.push(("GLIBC_TUNABLES", "glibc.rtld.execstack=2".into()));
+        done.push("Lets its packed libraries load even if they ask for an executable stack (at launch, in case).".into());
     }
     // What a packed program needs can't be read; the runtime only fills gaps, so it's safe.
     if report.packed && old_runtime.is_none() {
@@ -222,9 +264,17 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
     // The developer's launcher script, when it sets up where the libraries are; else the program.
     let start = game.launcher().map(|l| game.full(l)).unwrap_or_else(|| program.clone());
     if start != program {
+        let mode = fs::metadata(&start).map_err(|e| e.to_string())?.permissions().mode();
+        if mode & 0o100 == 0 {
+            fs::set_permissions(&start, fs::Permissions::from_mode(mode | 0o111)).map_err(|e| e.to_string())?;
+            record.push(format!("mode\t{:o}\t{}", mode & 0o7777, start.display()));
+        }
         done.push(format!("Starts it through its own launcher script, {}.", start.file_name().unwrap_or_default().to_string_lossy()));
     }
-    let workdir = start.parent().unwrap_or(&game.root);
+    // An Exodus bundle's program sits deep inside it; the launcher link at its top is meant to
+    // be started from there, next to the game's data (Liberation Circuit).
+    let exodus_top = start.ancestors().find(|d| d.join("exodus/bundles").is_dir() && start.starts_with(d.join("exodus")));
+    let workdir = exodus_top.or(start.parent()).unwrap_or(&game.root);
     let icon = icon(game, &main.path);
 
     if targets.menu {
@@ -291,28 +341,21 @@ fn plain_fonts() -> Result<PathBuf, String> {
     Ok(file)
 }
 
-/// ALSA settings for 32-bit games, as an ALSA_CONFIG_PATH value: the system's alsa.conf, then a
-/// file that redoes its loading hook (which reads conf.d, where PipeWire becomes the default,
-/// after every file in the path) with an override last, making the default device PulseAudio
-/// through the given plugins. Rewritten each time, as the plugins' paths come from Steam's
-/// install.
+/// ALSA settings for 32-bit games, as an ALSA_CONFIG_PATH value: a file of its own, not the
+/// system's alsa.conf (which loads conf.d, where PipeWire becomes the default after anything
+/// added to the path, and which old bundled ALSA libraries can't parse), making the default
+/// device PulseAudio through the given plugins. Rewritten each time, as the plugins' paths
+/// come from Steam's install.
 fn alsa_pulse32(pcm: &Path, ctl: &Path) -> Result<String, String> {
-    let dir = data_home().join("gamefix");
-    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let (top, over) = (dir.join("alsa32.conf"), dir.join("alsa32-pulse.conf"));
+    let file = data_home().join("gamefix/alsa32.conf");
+    fs::create_dir_all(file.parent().unwrap()).map_err(|e| e.to_string())?;
     let text = format!(
         "# Written by gamefix for 32-bit games that play sound through ALSA: PipeWire's ALSA plugin\n# is 64-bit only here, so the default device goes to PulseAudio (which PipeWire serves).\npcm_type.pulse {{ lib \"{}\" }}\nctl_type.pulse {{ lib \"{}\" }}\npcm.!default {{ type pulse }}\nctl.!default {{ type pulse }}\n",
         pcm.display(),
         ctl.display()
     );
-    fs::write(&over, text).map_err(|e| e.to_string())?;
-    let hook = format!(
-        "# Written by gamefix: alsa.conf's loading hook again, with {} last.\n@hooks [\n\t{{\n\t\tfunc load\n\t\tfiles [\n\t\t\t\"/var/lib/alsa/conf.d\"\n\t\t\t\"/usr/etc/alsa/conf.d\"\n\t\t\t\"/etc/alsa/conf.d\"\n\t\t\t\"/etc/asound.conf|||/usr/etc/asound.conf\"\n\t\t\t\"~/.asoundrc\"\n\t\t\t\"~/.config/alsa/asoundrc\"\n\t\t\t\"{}\"\n\t\t]\n\t\terrors false\n\t}}\n]\n",
-        over.display(),
-        over.display()
-    );
-    fs::write(&top, hook).map_err(|e| e.to_string())?;
-    Ok(format!("/usr/share/alsa/alsa.conf:{}", top.display()))
+    fs::write(&file, text).map_err(|e| e.to_string())?;
+    Ok(file.display().to_string())
 }
 
 /// Writes the game's app-menu entry running `exec` (already quoted) in `workdir`.
@@ -448,6 +491,11 @@ pub fn undo(game: &Game) -> Result<Vec<String>, String> {
         match parts.as_slice() {
             ["created", path] => {
                 if fs::remove_file(path).is_ok() {
+                    undone.push(format!("Removed {path}"));
+                }
+            }
+            ["created-dir", path] => {
+                if fs::remove_dir(path).is_ok() {
                     undone.push(format!("Removed {path}"));
                 }
             }

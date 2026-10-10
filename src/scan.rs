@@ -48,7 +48,7 @@ impl Game {
         self.files.iter().find(|f| {
             matches!(f.binary, Binary::Script)
                 && f.path.parent().is_some_and(|d| main.path.starts_with(d))
-                && binary::contains(&self.full(f), b"LD_LIBRARY_PATH")
+                && binary::sets_library_path(&self.full(f))
                 && binary::contains(&self.full(f), name.as_bytes())
         })
     }
@@ -98,7 +98,7 @@ pub fn scan(path: &Path) -> Option<Game> {
     };
     let portable = match main {
         Some(_) => None,
-        None if chosen.is_some() => chosen.as_ref().and_then(|c| files.iter().position(|f| &f.path == c && matches!(f.binary, Binary::Love | Binary::Jar | Binary::Python(_)))),
+        None if chosen.is_some() => chosen.as_ref().and_then(|c| files.iter().position(|f| &f.path == c && matches!(f.binary, Binary::Love | Binary::Jar | Binary::Flash | Binary::Python(_)))),
         None => pick_portable(&root, &files),
     };
     let archive = (main.is_none() && windows.is_none() && portable.is_none())
@@ -144,7 +144,7 @@ fn walk(root: &Path, rel: &Path, depth: usize, out: &mut Vec<Found>) {
             let keep = match &binary {
                 Binary::Pe(_) => is_exe,
                 Binary::Script => depth <= 2,
-                Binary::Love | Binary::Jar | Binary::Python(_) | Binary::Archive => depth <= 1,
+                Binary::Love | Binary::Jar | Binary::Flash | Binary::Python(_) | Binary::Archive | Binary::Package(_) => depth <= 1,
                 Binary::Elf(_) | Binary::Damaged => true,
             };
             if keep {
@@ -169,7 +169,10 @@ fn pick_main(root: &Path, files: &[Found]) -> Option<usize> {
         .enumerate()
         .filter_map(|(i, f)| {
             let Binary::Elf(elf) = &f.binary else { return None };
-            if !elf.program || not_the_game(&f.path) {
+            // glibc's libc.so.6 has an interpreter too; a bundle's own (Exodus) isn't the game.
+            let name = f.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            // Nor is a bundled Java (a Processing export's java/bin/java).
+            if !elf.program || not_the_game(&f.path) || (name.starts_with("lib") && name.contains(".so")) || name.starts_with("ld-linux") || (name == "java" && f.path.parent().is_some_and(|d| d.ends_with("bin"))) {
                 return None;
             }
             let dir = root.join(f.path.parent().unwrap_or(Path::new("")));
@@ -224,10 +227,31 @@ fn pick_windows(root: &Path, files: &[Found]) -> Option<usize> {
         .map(|(_, i)| i)
 }
 
+/// Whether a script is a Processing export's launcher: next to lib/core.jar.
+pub fn processing_script(root: &Path, path: &Path) -> bool {
+    root.join(path.parent().unwrap_or(Path::new(""))).join("lib/core.jar").is_file()
+}
+
+/// A Processing export's own Java (java/bin/java next to its script), if it brings one.
+pub fn processing_java(root: &Path, path: &Path) -> Option<PathBuf> {
+    let java = root.join(path.parent().unwrap_or(Path::new(""))).join("java/bin/java");
+    java.is_file().then_some(java)
+}
+
 /// A .love file, else a .jar, else the Python file that looks like the game's start: named like
 /// the folder or main/game/run, preferring ones that use pygame. Nearest the top first.
 fn pick_portable(root: &Path, files: &[Found]) -> Option<usize> {
-    for kind in [|b: &Binary| matches!(b, Binary::Love), |b: &Binary| matches!(b, Binary::Jar)] {
+    // A Processing export: a script starting Java next to lib/core.jar (application.linux64 etc.,
+    // the 64-bit one first).
+    let processing = files
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| matches!(f.binary, Binary::Script) && processing_script(root, &f.path))
+        .min_by_key(|(_, f)| (!f.path.to_string_lossy().contains("linux64"), f.path.components().count()));
+    if let Some((i, _)) = processing {
+        return Some(i);
+    }
+    for kind in [|b: &Binary| matches!(b, Binary::Love), |b: &Binary| matches!(b, Binary::Jar), |b: &Binary| matches!(b, Binary::Flash)] {
         if let Some((i, _)) = files.iter().enumerate().filter(|(_, f)| kind(&f.binary)).min_by_key(|(_, f)| f.path.components().count()) {
             return Some(i);
         }

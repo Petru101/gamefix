@@ -16,6 +16,10 @@ pub enum Problem {
     Archive(PathBuf),
     /// The Linux program is there but damaged (went through a text conversion): no fixing it.
     Damaged(PathBuf),
+    /// A Flash game (.swf); `ruffle` is how to start an installed Ruffle.
+    Flash { file: PathBuf, ruffle: Option<Vec<String>> },
+    /// Only a .deb or .rpm package, which Bazzite can't simply install.
+    Package(PathBuf, &'static str),
     /// A .love file: needs the LÖVE version it was made for; `love` is how to start an installed one.
     Love { file: PathBuf, version: Option<String>, love: Option<Vec<String>> },
     /// Python code: needs Python (2 is gone from current systems) and maybe pygame.
@@ -59,6 +63,12 @@ pub enum Problem {
     /// Sound only through ALSA in a 32-bit game, without a 32-bit plugin for ALSA's default
     /// device; the runtime's PulseAudio plugins (pcm, ctl) if there.
     Alsa32(Option<(PathBuf, PathBuf)>),
+    /// A bundled libpulse older than 1.0, which can't find the sound server by itself; the
+    /// server's address for PULSE_SERVER.
+    OldPulse(String),
+    /// The game's own .NET libraries built for .NET Standard, which the Mono it brings
+    /// (MonoKickstart) can't load: no System.Runtime / netstandard in its folder.
+    NetStandard(Vec<String>),
     /// .NET Core before 5 only looks for older ICU versions than current systems have, and
     /// quits at start (The Heart's Illumination, 2.1).
     DotnetIcu(String),
@@ -76,14 +86,6 @@ pub struct Clash {
 }
 
 impl Problem {
-    /// The folders, as absolute paths, holding the game's own copies of libraries ld.so misses.
-    pub fn library_path(misplaced: &BTreeMap<String, PathBuf>, root: &Path) -> Vec<String> {
-        let mut dirs: Vec<String> = misplaced.values().map(|d| root.join(d).display().to_string()).collect();
-        dirs.sort();
-        dirs.dedup();
-        dirs
-    }
-
     /// Libraries to put in LD_PRELOAD so the intended ones are found first: providers, then
     /// the victims themselves (the combination tested on Final Shot).
     pub fn preload(clashes: &[Clash]) -> Vec<PathBuf> {
@@ -105,6 +107,9 @@ pub struct Report {
     pub glibc: Option<(u32, u32)>,
     /// The program is UPX-packed, so the libraries it needs couldn't be read.
     pub packed: bool,
+    /// A PyInstaller bundle on a glibc that refuses executable stacks: its packed libraries
+    /// can't be checked, so setup allows them in case.
+    pub pyinstaller: bool,
     /// run.sh of Steam's runtime for older games, if installed.
     pub old_runtime: Option<PathBuf>,
     /// Missing libraries only optional plugins need: what is lost, and the libraries.
@@ -136,12 +141,17 @@ pub fn check(game: &Game, system: &System) -> Report {
         }
     }
     let mut problems = Vec::new();
-    let mut report = Report { problems: Vec::new(), libs_checked: 0, windows, installers, glibc: system.glibc, packed: false, old_runtime: system.old_runtime.as_ref().map(|r| r.run.clone()), harmless: Vec::new() };
+    let mut report = Report { problems: Vec::new(), libs_checked: 0, windows, installers, glibc: system.glibc, packed: false, pyinstaller: false, old_runtime: system.old_runtime.as_ref().map(|r| r.run.clone()), harmless: Vec::new() };
 
     let Some((main, elf)) = game.main() else {
         match game.portable.map(|i| &game.files[i]) {
             Some(f) if matches!(f.binary, Binary::Love) => problems.push(Problem::Love { file: f.path.clone(), version: game.engine.as_ref().and_then(|e| e.version.clone()), love: system.love() }),
             Some(f) if matches!(f.binary, Binary::Jar) => problems.push(Problem::Java { file: f.path.clone(), java: system.java() }),
+            Some(f) if matches!(f.binary, Binary::Script) => {
+                let java = scan::processing_java(&game.root, &f.path).or_else(|| system.java());
+                problems.push(Problem::Java { file: f.path.clone(), java });
+            }
+            Some(f) if matches!(f.binary, Binary::Flash) => problems.push(Problem::Flash { file: f.path.clone(), ruffle: system.ruffle() }),
             Some(f) => {
                 let python = game.files.iter().filter_map(|f| match &f.binary {
                     Binary::Python(p) => Some(p),
@@ -150,11 +160,19 @@ pub fn check(game: &Game, system: &System) -> Report {
                 let (v2, pygame) = python.fold((false, false), |(v2, pg), p| (v2 || p.v2, pg || p.pygame));
                 problems.push(Problem::Python { file: f.path.clone(), v2, pygame });
             }
-            None => problems.push(match (game.files.iter().find(|f| matches!(f.binary, Binary::Damaged)), game.archive) {
-                (Some(f), _) => Problem::Damaged(f.path.clone()),
-                (None, Some(i)) => Problem::Archive(game.files[i].path.clone()),
-                (None, None) => Problem::NoLinuxBuild,
-            }),
+            None => {
+                let damaged = game.files.iter().find(|f| matches!(f.binary, Binary::Damaged));
+                let package = game.files.iter().find_map(|f| match f.binary {
+                    Binary::Package(kind) => Some((f.path.clone(), kind)),
+                    _ => None,
+                });
+                problems.push(match (damaged, game.archive, package) {
+                    (Some(f), _, _) => Problem::Damaged(f.path.clone()),
+                    (None, Some(i), _) => Problem::Archive(game.files[i].path.clone()),
+                    (None, None, Some((path, kind))) => Problem::Package(path, kind),
+                    (None, None, None) => Problem::NoLinuxBuild,
+                });
+            }
         }
         report.problems = problems;
         return report;
@@ -163,6 +181,7 @@ pub fn check(game: &Game, system: &System) -> Report {
         problems.push(Problem::WrongMachine(elf.machine));
     }
     report.packed = elf.packed;
+    report.pyinstaller = elf.pyinstaller && system.refuses_exec_stack();
     let mode = std::fs::metadata(game.full(main)).map(|m| m.permissions().mode()).unwrap_or(0);
     if mode & 0o100 == 0 {
         problems.push(Problem::NotExecutable(main.path.clone()));
@@ -193,7 +212,7 @@ pub fn check(game: &Game, system: &System) -> Report {
     // A launcher script next to the program or above it may point LD_LIBRARY_PATH anywhere in
     // the folder; it isn't evaluated.
     let launcher_path = game.files.iter().any(|f| {
-        matches!(f.binary, Binary::Script) && f.path.parent().is_some_and(|d| main.path.starts_with(d)) && binary::contains(&game.full(f), b"LD_LIBRARY_PATH")
+        matches!(f.binary, Binary::Script) && f.path.parent().is_some_and(|d| main.path.starts_with(d)) && binary::sets_library_path(&game.full(f))
     });
     let reachable = |path: &Path, e: &Elf, lib: &str| system.has(lib, elf.bits) || search(path, e).iter().any(|d| d.join(lib).is_file());
 
@@ -211,8 +230,10 @@ pub fn check(game: &Game, system: &System) -> Report {
     while let Some((path, e)) = queue.pop_front() {
         for lib in &e.needed {
             let Some(&(p, dep)) = by_name.get(OsStr::new(lib)) else { continue };
-            // ld.so gets the game's copy through the search path or a launcher's LD_LIBRARY_PATH.
-            let loads_copy = launcher_path || search(path, e).iter().any(|d| d.join(lib).is_file());
+            // ld.so gets the game's copy through the search path or a launcher's LD_LIBRARY_PATH,
+            // or, when the system lacks it, through the LD_LIBRARY_PATH the fix sets for it
+            // (so what that copy needs counts too: Liberation Circuit's Allegro needs libwrap).
+            let loads_copy = launcher_path || search(path, e).iter().any(|d| d.join(lib).is_file()) || !system.has(lib, elf.bits);
             if loads_copy && !replaceable(p) && startup.insert(p) {
                 queue.push_back((p, dep));
             }
@@ -261,6 +282,21 @@ pub fn check(game: &Game, system: &System) -> Report {
     }
     if let Some(sdl2) = sdl2_mix {
         problems.push(Problem::Sdl2Mix(sdl2.display().to_string()));
+    }
+
+    // libpulse before 1.0, bundled, doesn't look for the server in XDG_RUNTIME_DIR, so it finds
+    // none and the game gets no sound (Sascha's PyInstaller bundle, libpulse 0.9.22).
+    let old_pulse = game.files.iter().any(|f| f.path.file_name().is_some_and(|n| n.to_string_lossy().starts_with("libpulsecommon-0.")))
+        || (elf.pyinstaller && binary::contains(&game.full(main), b"libpulsecommon-0."));
+    if old_pulse {
+        problems.push(Problem::OldPulse(pulse_socket()));
+    }
+
+    if main.path.to_string_lossy().contains(".bin.x86") {
+        let libs = net_standard(&main_dir);
+        if !libs.is_empty() {
+            problems.push(Problem::NetStandard(libs));
+        }
     }
 
     // A 32-bit game that can only play sound through ALSA (nothing in it knows PulseAudio or
@@ -354,6 +390,38 @@ fn fna_libs(dir: &Path, bits: u8) -> Vec<String> {
 
 /// The .NET Core version a self-contained .NET program next to `dir` ships, if older than 5 and
 /// not already set to work without ICU.
+/// The game's own .NET libraries next to a MonoKickstart program that reference .NET Standard's
+/// assemblies (System.Runtime, netstandard) when the folder has neither; the framework's own
+/// files mention those names too, so they're skipped. Mario is Doomed: Comora.dll.
+fn net_standard(dir: &Path) -> Vec<String> {
+    if ["System.Runtime.dll", "netstandard.dll", "Facades"].iter().any(|f| dir.join(f).exists()) {
+        return Vec::new();
+    }
+    let framework = |n: &str| ["System", "mscorlib", "Mono.", "Microsoft.", "MonoGame.", "FNA", "OpenTK", "Tao.", "SDL2-CS"].iter().any(|p| n.starts_with(p));
+    let mut out: Vec<String> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let ext = name.rsplit('.').next().unwrap_or("").to_lowercase();
+            ((ext == "dll" || ext == "exe") && !framework(&name) && binary::contains_groups(&e.path(), &[&[b"\0System.Runtime\0", b"\0netstandard\0"]])).then_some(name)
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// The PulseAudio socket (PipeWire's pulse server), as PULSE_SERVER takes it.
+fn pulse_socket() -> String {
+    let runtime = std::env::var("XDG_RUNTIME_DIR").ok().filter(|d| !d.is_empty()).unwrap_or_else(|| {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        let uid = status.lines().find_map(|l| l.strip_prefix("Uid:")).and_then(|v| v.split_whitespace().next()).unwrap_or("1000").to_string();
+        format!("/run/user/{uid}")
+    });
+    format!("unix:{runtime}/pulse/native")
+}
+
 /// LÖVE 0.x, which today's LÖVE 11 can't run.
 pub fn old_love(version: Option<&str>) -> bool {
     version.is_some_and(|v| v.starts_with("0."))
@@ -518,6 +586,8 @@ impl Report {
                 (Binary::Love, Some(e)) => format!("LÖVE game{}", e.version.as_ref().map(|v| format!(", made for LÖVE {v}")).unwrap_or_default()),
                 (Binary::Python(p), _) if p.v2 => "Python 2 game".into(),
                 (Binary::Jar, _) => "Java game".into(),
+                (Binary::Flash, _) => "Flash game".into(),
+                (Binary::Script, _) => "Processing game, runs with Java".into(),
                 _ => "Python game".into(),
             };
             let _ = writeln!(out, "  Runs:  {} ({what})", f.path.display());
@@ -536,6 +606,12 @@ impl Report {
             let _ = writeln!(out);
         }
 
+        if self.pyinstaller {
+            let _ = writeln!(out, "• It's a PyInstaller bundle (Python, with its libraries packed inside), so those libraries");
+            let _ = writeln!(out, "  can't be checked. gamefix setup lets ones asking for an executable stack load, in case");
+            let _ = writeln!(out, "  (old pygame's SDL 1.2 does: Sascha wouldn't start without it).");
+            let _ = writeln!(out);
+        }
         if self.packed {
             let _ = writeln!(out, "• Its program is packed (UPX), so the libraries it needs can't be read until it runs.");
             if self.old_runtime.is_some() {
@@ -545,7 +621,7 @@ impl Report {
             let _ = writeln!(out);
         }
         if self.problems.is_empty() {
-            let _ = writeln!(out, "No {}problems found in its files ({} libraries checked).", if self.packed { "other " } else { "" }, self.libs_checked);
+            let _ = writeln!(out, "No {}problems found in its files ({} libraries checked).", if self.packed || self.pyinstaller { "other " } else { "" }, self.libs_checked);
             let _ = writeln!(out, "If it still doesn't start, the next step is running it and reading what it prints.");
             return out;
         }
@@ -574,6 +650,26 @@ impl Report {
                     } else if !self.installers.is_empty() {
                         let _ = writeln!(out, "    It's an installer: run it with Proton first, then check the folder it installs to.");
                     }
+                }
+                Problem::Flash { file, ruffle: Some(ruffle) } => {
+                    let _ = writeln!(out, "• This is a Flash game. Flash Player is gone, but Ruffle (installed) plays most Flash games:");
+                    let _ = writeln!(out, "  {} \"{}\"", ruffle.join(" "), file.display());
+                    let _ = writeln!(out, "  gamefix setup adds that to the app menu.");
+                }
+                Problem::Flash { file, ruffle: None } => {
+                    let _ = writeln!(out, "✗ This is a Flash game ({}): Flash Player was retired in 2020.", file.display());
+                    let _ = writeln!(out, "    Fix: install Ruffle from Flathub (rs.ruffle.Ruffle), which plays most Flash games; then");
+                    let _ = writeln!(out, "    gamefix setup adds it to the app menu.");
+                }
+                Problem::Package(file, "deb") => {
+                    let _ = writeln!(out, "✗ This download is a Debian/Ubuntu package ({}). Bazzite can't install those,", file.display());
+                    let _ = writeln!(out, "  and the game inside expects to be installed into the system's folders.");
+                    let _ = writeln!(out, "    Fix: look on the game's page for a .tar.gz, .zip, AppImage or Flatpak download instead.");
+                }
+                Problem::Package(file, _) => {
+                    let _ = writeln!(out, "✗ This download is a Fedora-style package ({}). On Bazzite installing one means", file.display());
+                    let _ = writeln!(out, "  layering it into the system (rpm-ostree install, then a restart).");
+                    let _ = writeln!(out, "    Fix: a .tar.gz, .zip, AppImage or Flatpak download from the game's page is simpler.");
                 }
                 Problem::Damaged(file) => {
                     let _ = writeln!(out, "✗ The Linux program is damaged in the download itself: {}", file.display());
@@ -662,7 +758,8 @@ impl Report {
                     }
                     if !misplaced.is_empty() {
                         let _ = writeln!(out, "  The game ships some itself (marked), in a folder Linux doesn't look in for them.");
-                        let _ = writeln!(out, "    Fix (at launch): LD_LIBRARY_PATH={}", Problem::library_path(misplaced, &game.root).join(":"));
+                        let _ = writeln!(out, "    Fix (at launch): LD_LIBRARY_PATH pointing to just those (gamefix setup links them into");
+                        let _ = writeln!(out, "    a folder of their own, so the game's copies of what the system has aren't used).");
                     }
                     let unfixable: Vec<&str> = libs.keys().filter(|l| !in_old_runtime.contains(*l) && !misplaced.contains_key(*l)).map(String::as_str).collect();
                     if !unfixable.is_empty() && self.old_runtime.is_some() {
@@ -673,9 +770,15 @@ impl Report {
                     let _ = writeln!(out, "✗ This is a Java game ({}): it runs with \"java -jar\", and Java isn't installed.", file.display());
                     let _ = writeln!(out, "    Fix: on Bazzite, run \"brew install openjdk\" in a terminal; then gamefix setup adds it to the app menu.");
                 }
-                Problem::Java { file, java: Some(java) } => {
+                Problem::Java { file, java: Some(java) } if file.extension().is_some_and(|e| e == "jar") => {
                     let _ = writeln!(out, "• This is a Java game; Java is installed, so it runs with: {} -jar \"{}\"", java.display(), file.display());
                     let _ = writeln!(out, "  gamefix setup adds that to the app menu.");
+                }
+                Problem::Java { file, java: Some(java) } => {
+                    let _ = writeln!(out, "• This is a Processing game; its script {} starts it with Java ({}).", file.display(), java.display());
+                    let _ = writeln!(out, "  gamefix setup adds that to the app menu. Processing from before 2018 can't start on a Java");
+                    let _ = writeln!(out, "  whose version is a single number (\"27\", until its first update): Dial didn't; with Java 21");
+                    let _ = writeln!(out, "  (\"brew install openjdk@21\") it did.");
                 }
                 Problem::OwnLibstdcxx(preload) => {
                     let _ = writeln!(out, "✗ The program has its own old copy of the C++ standard library built in. When the graphics");
@@ -694,6 +797,17 @@ impl Report {
                     let _ = writeln!(out, "✗ SDL2 add-ons from Steam's runtime were built for the real SDL2, but this system's SDL2");
                     let _ = writeln!(out, "  is sdl2-compat (SDL3 underneath); some games crash with that mix (C-Dogs SDL did).");
                     let _ = writeln!(out, "    Fix (at launch): LD_PRELOAD={path} (the runtime's own SDL2)");
+                }
+                Problem::NetStandard(libs) => {
+                    let _ = writeln!(out, "✗ Part of the game was built for .NET Standard, which the Mono it brings can't load");
+                    let _ = writeln!(out, "  (its folder has no System.Runtime or netstandard), so it quits at start: {}.", libs.join(", "));
+                    let _ = writeln!(out, "  That's how the developer packaged it; nothing on this system can fill it in.");
+                    let _ = writeln!(out, "    Fix: the game's .exe with Proton (Proton's Mono has those), or a Windows download.");
+                }
+                Problem::OldPulse(server) => {
+                    let _ = writeln!(out, "✗ It brings its own PulseAudio library from before 2011, which doesn't know where today's");
+                    let _ = writeln!(out, "  sound server (PipeWire) is, so it gets no sound or quits loading one (Sascha did).");
+                    let _ = writeln!(out, "    Fix (at launch): PULSE_SERVER={server}");
                 }
                 Problem::Alsa32(plugins) => {
                     let _ = writeln!(out, "✗ It plays sound only through ALSA, as a 32-bit program, and this system has no 32-bit");

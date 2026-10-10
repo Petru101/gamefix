@@ -19,6 +19,10 @@ pub enum Binary {
     /// A zip, tar or 7z archive: the game may still be packed inside.
     Archive,
     Python(Python),
+    /// A Flash movie or game (.swf), which Flash Player ran; Ruffle does now.
+    Flash,
+    /// A distribution package (.deb or .rpm): meant to be installed into /usr.
+    Package(&'static str),
     /// A Linux program whose bytes above 0x7F were each replaced with U+FFFD's UTF-8 (EF BF BD):
     /// it went through a text conversion on the developer's side and can't run.
     Damaged,
@@ -42,6 +46,9 @@ pub struct Elf {
     pub runpath: Vec<String>,
     /// Compressed by UPX: what it needs is only known once it unpacks itself at start.
     pub packed: bool,
+    /// A PyInstaller one-file bundle: Python and its libraries are packed at the end and
+    /// unpacked to /tmp at start, so they can't be read here.
+    pub pyinstaller: bool,
     /// Asks for an executable stack: glibc 2.41+ refuses to dlopen such libraries.
     /// A missing PT_GNU_STACK counts, as x86 defaults to executable.
     pub exec_stack: bool,
@@ -75,6 +82,12 @@ pub fn identify(path: &Path) -> Option<Binary> {
         Some(Binary::Love)
     } else if ext == "jar" && head.starts_with(b"PK\x03\x04") {
         Some(Binary::Jar)
+    } else if ext == "swf" && [&b"FWS"[..], b"CWS", b"ZWS"].iter().any(|m| head.starts_with(m)) {
+        Some(Binary::Flash)
+    } else if ext == "deb" && head.starts_with(b"!<arch>\ndebian") {
+        Some(Binary::Package("deb"))
+    } else if ext == "rpm" && head.starts_with(b"\xed\xab\xee\xdb") {
+        Some(Binary::Package("rpm"))
     } else if ["zip", "gz", "tgz", "xz", "bz2", "7z", "rar"].contains(&ext.as_str())
         && [&b"PK\x03\x04"[..], b"\x1f\x8b", b"BZh", b"\xfd7zXZ\0", b"7z\xbc\xaf\x27\x1c", b"Rar!"].iter().any(|m| head.starts_with(m))
     {
@@ -165,6 +178,14 @@ pub fn symbols(path: &Path) -> Option<Symbols> {
 /// Whether the file holds these bytes anywhere.
 pub fn contains(path: &Path, needle: &[u8]) -> bool {
     contains_groups(path, &[&[needle]])
+}
+
+/// Whether a script sets LD_LIBRARY_PATH; macOS's DYLD_LIBRARY_PATH, which MonoKickstart's
+/// Kick script sets, doesn't count.
+pub fn sets_library_path(path: &Path) -> bool {
+    let Ok(text) = std::fs::read(path) else { return false };
+    let needle = b"LD_LIBRARY_PATH";
+    text.windows(needle.len()).enumerate().any(|(i, w)| w == needle && (i == 0 || text[i - 1] != b'Y'))
 }
 
 /// Whether the file holds, for every group, at least one of its byte strings; read once.
@@ -301,7 +322,13 @@ fn elf(f: &mut File, h: &[u8]) -> Option<Elf> {
     f.seek(SeekFrom::Start(0)).ok()?;
     f.take(4096).read_to_end(&mut start).ok()?;
     let packed = start.windows(4).any(|w| w == b"UPX!");
-    Some(Elf { bits, machine, program, needed, rpath, runpath, packed, exec_stack })
+    // PyInstaller's archive ends with its cookie ("MEI\x0c\x0b\x0a\x0b\x0e" and a few fields).
+    let mut end = Vec::new();
+    let size = f.seek(SeekFrom::End(0)).ok()?;
+    f.seek(SeekFrom::Start(size.saturating_sub(4096))).ok()?;
+    f.read_to_end(&mut end).ok()?;
+    let pyinstaller = end.windows(8).any(|w| w == b"MEI\x0c\x0b\x0a\x0b\x0e");
+    Some(Elf { bits, machine, program, needed, rpath, runpath, packed, pyinstaller, exec_stack })
 }
 
 fn pe(f: &mut File, h: &[u8]) -> Option<Pe> {
@@ -333,6 +360,18 @@ fn pe(f: &mut File, h: &[u8]) -> Option<Pe> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn library_path_scripts() {
+        let dir = std::env::temp_dir().join(format!("gamefix-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (kick, launch) = (dir.join("Kick"), dir.join("launch"));
+        std::fs::write(&kick, "#!/bin/bash\nexport DYLD_LIBRARY_PATH=$DYLD_LIBRARY_PATH:./\n./game.bin.x86_64 $@\n").unwrap();
+        std::fs::write(&launch, "#!/bin/bash\nLD_LIBRARY_PATH=$LD_LIBRARY_PATH:./x64 ./x64/insatia\n").unwrap();
+        assert!(!sets_library_path(&kick));
+        assert!(sets_library_path(&launch));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn python2_statements() {

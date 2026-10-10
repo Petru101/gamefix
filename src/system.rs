@@ -131,6 +131,18 @@ impl System {
         pipewire_default && !plugin32
     }
 
+    /// How to start Ruffle, the Flash player: Flathub's (it can read the home folder only, so
+    /// setup adds the game's folder) or one on the PATH.
+    pub fn ruffle(&self) -> Option<Vec<String>> {
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+        let flatpak = [PathBuf::from("/var/lib/flatpak"), home.join(".local/share/flatpak")].iter().any(|d| d.join("app/rs.ruffle.Ruffle/current").exists());
+        if flatpak {
+            return Some(vec!["flatpak".into(), "run".into(), "rs.ruffle.Ruffle".into()]);
+        }
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        std::env::split_paths(&path).map(|d| d.join("ruffle")).find(|l| l.is_file()).map(|l| vec![l.display().to_string()])
+    }
+
     pub fn refuses_exec_stack(&self) -> bool {
         self.glibc.is_some_and(|v| v >= (2, 41))
     }
