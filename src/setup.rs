@@ -191,7 +191,7 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
                 env.push(("DOTNET_SYSTEM_GLOBALIZATION_INVARIANT", "1".into()));
                 done.push("Lets its old .NET start without the ICU library (at launch).".into());
             }
-            Problem::MissingLibs { libs, in_old_runtime, misplaced, .. } => {
+            Problem::MissingLibs { bits, libs, later, in_old_runtime, misplaced } => {
                 if let Some(run) = report.old_runtime.as_ref().filter(|_| !in_old_runtime.is_empty()) {
                     old_runtime = Some(run.clone());
                     done.push("Starts it with Steam's runtime for older games, which has missing libraries (Steam does that by itself).".into());
@@ -199,31 +199,46 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
                 // Just the libraries the system lacks, linked into a folder of their own: putting
                 // the game's folders on LD_LIBRARY_PATH would put everything else in them first
                 // too (Liberation Circuit's bundle holds its own glibc and an old libpulse).
-                if !misplaced.is_empty() {
-                    let links = data_home().join("gamefix/libs").join(slug(&game.name));
-                    // LD_LIBRARY_PATH splits on colons.
-                    if links.display().to_string().contains(':') {
-                        not_fixed.push("Libraries the game ships in a folder Linux doesn't look in: the home folder's path has a colon, which the fix can't handle.".into());
-                    } else {
-                        let new_dir = !links.exists();
-                        fs::create_dir_all(&links).map_err(|e| e.to_string())?;
-                        for (lib, dir) in misplaced {
-                            let link = links.join(lib);
-                            let _ = fs::remove_file(&link);
-                            std::os::unix::fs::symlink(game.root.join(dir).join(lib), &link).map_err(|e| e.to_string())?;
-                            record.push(format!("created\t{}", link.display()));
-                        }
-                        // After the links: undo goes in order and removes the folder once empty.
-                        if new_dir {
-                            record.push(format!("created-dir\t{}", links.display()));
-                        }
-                        env.push(("LD_LIBRARY_PATH", links.display().to_string()));
+                // Ones nothing here has are fetched there from Fedora's or Debian's packages.
+                // Also what only plugins need: with the game's own folders first on the path, a
+                // bundled library may load at start after all (Because's SDL needs libcaca).
+                let others: Vec<String> = libs.keys().chain(later.keys()).filter(|l| !in_old_runtime.contains(*l) && !misplaced.contains_key(*l)).cloned().collect();
+                let links = data_home().join("gamefix/libs").join(slug(&game.name));
+                // LD_LIBRARY_PATH splits on colons.
+                if (!misplaced.is_empty() || !others.is_empty()) && links.display().to_string().contains(':') {
+                    not_fixed.push("Libraries the game needs: the home folder's path has a colon, which the fix can't handle.".into());
+                } else if !misplaced.is_empty() || !others.is_empty() {
+                    // An empty one left from before counts as new, so undo removes it too.
+                    let new_dir = fs::read_dir(&links).map(|mut d| d.next().is_none()).unwrap_or(true);
+                    fs::create_dir_all(&links).map_err(|e| e.to_string())?;
+                    // Before what goes in it: undo goes backwards, so the folder is empty by then.
+                    if new_dir {
+                        record.push(format!("created-dir\t{}", links.display()));
+                    }
+                    for (lib, dir) in misplaced {
+                        let link = links.join(lib);
+                        let _ = fs::remove_file(&link);
+                        std::os::unix::fs::symlink(game.root.join(dir).join(lib), &link).map_err(|e| e.to_string())?;
+                        record.push(format!("created\t{}", link.display()));
+                    }
+                    if !misplaced.is_empty() {
                         done.push("Points Linux to the libraries the game ships itself (at launch, through links in ~/.local/share/gamefix/libs).".into());
                     }
-                }
-                let others: Vec<&str> = libs.keys().filter(|l| !in_old_runtime.contains(*l) && !misplaced.contains_key(*l)).map(String::as_str).collect();
-                if !others.is_empty() {
-                    not_fixed.push(format!("Missing libraries nothing here provides: {}.", others.join(", ")));
+                    if !others.is_empty() {
+                        let fetched = crate::fetch::fetch(&others, *bits, &links);
+                        record.extend(fetched.files.iter().map(|f| format!("created\t{}", f.display())));
+                        if !fetched.sources.is_empty() {
+                            done.push(format!("Fetched libraries the system lacks into ~/.local/share/gamefix/libs, from {} (at launch).", fetched.sources.join(", ")));
+                        }
+                        if !fetched.missing.is_empty() {
+                            not_fixed.push(format!("Missing libraries no Fedora or Debian package has: {}.", fetched.missing.join(", ")));
+                        }
+                    }
+                    if fs::read_dir(&links).map(|mut d| d.next().is_some()).unwrap_or(false) {
+                        env.push(("LD_LIBRARY_PATH", links.display().to_string()));
+                    } else if new_dir && fs::remove_dir(&links).is_ok() {
+                        record.retain(|r| r != &format!("created-dir\t{}", links.display()));
+                    }
                 }
             }
             Problem::UnitySingleInstance => {
@@ -269,7 +284,22 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
         }
     }
     // The developer's launcher script, when it sets up where the libraries are; else the program.
-    let start = game.launcher().map(|l| game.full(l)).unwrap_or_else(|| program.clone());
+    let mut start = game.launcher().map(|l| game.full(l)).unwrap_or_else(|| program.clone());
+    // A launcher that replaces LD_LIBRARY_PATH would drop the folder set here: start the
+    // program itself then, with the game's libraries the launcher pointed it to linked into that
+    // folder, only those the system lacks; its whole folder first would hide newer system ones
+    // (Because's old libogg broke the system's libsndfile).
+    if start != program && !crate::binary::keeps_library_path(&start) && env.iter().any(|(k, _)| *k == "LD_LIBRARY_PATH") {
+        let links = data_home().join("gamefix/libs").join(slug(&game.name));
+        for (lib, dir) in &report.launcher_libs {
+            let link = links.join(lib);
+            if link.symlink_metadata().is_err() {
+                std::os::unix::fs::symlink(game.root.join(dir).join(lib), &link).map_err(|e| e.to_string())?;
+                record.push(format!("created\t{}", link.display()));
+            }
+        }
+        start = program.clone();
+    }
     if start != program {
         let mode = fs::metadata(&start).map_err(|e| e.to_string())?.permissions().mode();
         if mode & 0o100 == 0 {

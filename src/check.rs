@@ -116,6 +116,10 @@ pub struct Report {
     /// A PyInstaller bundle on a glibc that refuses executable stacks: its packed libraries
     /// can't be checked, so setup allows them in case.
     pub pyinstaller: bool,
+    /// The game's own libraries it finds at start only through its launcher's LD_LIBRARY_PATH
+    /// and the system lacks: (name, folder relative to the game), for when setup has to start
+    /// it without that launcher.
+    pub launcher_libs: Vec<(String, PathBuf)>,
     /// run.sh of Steam's runtime for older games, if installed.
     pub old_runtime: Option<PathBuf>,
     /// Missing libraries only optional plugins need: what is lost, and the libraries.
@@ -163,7 +167,7 @@ pub fn check(game: &Game, system: &System) -> Report {
         }
     }
     let mut problems = Vec::new();
-    let mut report = Report { problems: Vec::new(), libs_checked: 0, windows, installers, glibc: system.glibc, packed: false, pyinstaller: false, old_runtime: system.old_runtime.as_ref().map(|r| r.run.clone()), harmless: Vec::new() };
+    let mut report = Report { problems: Vec::new(), libs_checked: 0, windows, installers, glibc: system.glibc, packed: false, pyinstaller: false, launcher_libs: Vec::new(), old_runtime: system.old_runtime.as_ref().map(|r| r.run.clone()), harmless: Vec::new() };
 
     let Some((main, elf)) = game.main() else {
         match game.portable.map(|i| &game.files[i]) {
@@ -269,7 +273,13 @@ pub fn check(game: &Game, system: &System) -> Report {
         let at_start = startup.contains(path);
         for lib in &e.needed {
             let copy = by_name.get(OsStr::new(lib)).map(|(p, _)| *p);
-            if reachable(path, e, lib) || (copy.is_some() && (!at_start || launcher_path)) {
+            if reachable(path, e, lib) {
+                continue;
+            }
+            if let Some(copy) = copy.filter(|_| !at_start || launcher_path) {
+                if at_start && !system.has(lib, elf.bits) && !report.launcher_libs.iter().any(|(l, _)| l == lib) {
+                    report.launcher_libs.push((lib.clone(), copy.parent().unwrap_or(Path::new("")).to_path_buf()));
+                }
                 continue;
             }
             if let Some(what) = optional_plugin(path).or_else(|| java_window_part(path, lib)) {
@@ -807,8 +817,10 @@ impl Report {
                         let _ = writeln!(out, "    a folder of their own, so the game's copies of what the system has aren't used).");
                     }
                     let unfixable: Vec<&str> = libs.keys().filter(|l| !in_old_runtime.contains(*l) && !misplaced.contains_key(*l)).map(String::as_str).collect();
-                    if !unfixable.is_empty() && self.old_runtime.is_some() {
-                        let _ = writeln!(out, "  Nothing here has {}.", unfixable.join(", "));
+                    if !unfixable.is_empty() {
+                        let _ = writeln!(out, "  Neither the system{} nor the game has {}.", if self.old_runtime.is_some() { ", Steam's runtime" } else { "" }, unfixable.join(", "));
+                        let _ = writeln!(out, "    Fix: gamefix setup looks for them in Fedora's packages (the release this system is built");
+                        let _ = writeln!(out, "    on), then Debian's, and downloads them into ~/.local/share/gamefix/libs for this game.");
                     }
                 }
                 Problem::Java { file, java: None } => {

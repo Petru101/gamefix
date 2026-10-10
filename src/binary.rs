@@ -190,6 +190,12 @@ pub fn sets_library_path(path: &Path) -> bool {
     text.windows(needle.len()).enumerate().any(|(i, w)| w == needle && (i == 0 || text[i - 1] != b'Y'))
 }
 
+/// Whether a script that sets LD_LIBRARY_PATH keeps what was there ("$LD_LIBRARY_PATH"),
+/// rather than replacing it (labb.sh: `LD_LIBRARY_PATH=. ./labb`).
+pub fn keeps_library_path(path: &Path) -> bool {
+    contains_groups(path, &[&[b"$LD_LIBRARY_PATH", b"${LD_LIBRARY_PATH"]])
+}
+
 /// Whether the file holds, for every group, at least one of its byte strings; read once.
 pub fn contains_groups(path: &Path, groups: &[&[&[u8]]]) -> bool {
     find_groups(path, groups).iter().all(|&f| f)

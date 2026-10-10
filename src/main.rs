@@ -1,5 +1,6 @@
 mod binary;
 mod check;
+mod fetch;
 mod rightclick;
 mod scan;
 mod setup;
