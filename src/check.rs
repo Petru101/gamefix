@@ -930,8 +930,8 @@ impl Report {
                     let _ = writeln!(out, "✗ Unity before 5.4 may quit at once with \"Player is already running\" while Steam or");
                     let _ = writeln!(out, "  another Chrome-based app is open: its check that it isn't running twice mistakes their");
                     let _ = writeln!(out, "  helper processes for the game (Particle Fleet, Creeper World 3).");
-                    let _ = writeln!(out, "    Fix: start it where it can't see other programs (a private process namespace),");
-                    let _ = writeln!(out, "    or run the Windows build with Proton.");
+                    let _ = writeln!(out, "    Fix (at launch): hide those helpers' command lines from it (gamefix setup does that");
+                    let _ = writeln!(out, "    with bwrap), or run the Windows build with Proton.");
                 }
             }
             let _ = writeln!(out);
