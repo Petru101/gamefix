@@ -4,6 +4,7 @@
 //! so they work without gamefix. What was changed is recorded under ~/.local/share/gamefix/games/.
 
 use crate::check::{Problem, Report};
+use crate::proton::{self, Advice};
 use crate::scan::Game;
 use crate::steam::{self, Steam};
 use std::fs;
@@ -486,8 +487,10 @@ fn setup_runner(game: &Game, command: Vec<String>, file: &Path, name: &str, targ
     Ok(Outcome { done: vec![format!("Added \"{}\" to the app menu, under Games (run with {name}).", game.name)], not_fixed })
 }
 
-/// A Windows-only game: a non-Steam shortcut forced to Proton, like ticking "Force the use of a
-/// specific Steam Play compatibility tool" in its properties.
+/// A Windows-only game, run with Proton by Steam, like ticking "Force the use of a specific
+/// Steam Play compatibility tool" in its properties. A Steam game gets the Proton ProtonDB's
+/// reports say runs it (Steam's own choice stays when there's none); a download becomes a
+/// non-Steam shortcut with Experimental. Games whose anti-cheat stops them are left alone.
 fn setup_windows(game: &Game, exe: &crate::scan::Found, targets: &Targets) -> Result<Outcome, String> {
     if !targets.steam {
         return Err("Windows games can only be set up in Steam for now: add --steam.".into());
@@ -496,10 +499,65 @@ fn setup_windows(game: &Game, exe: &crate::scan::Found, targets: &Targets) -> Re
     if steam.running() {
         return Err(STEAM_OPEN.into());
     }
-    let proton = steam.proton().ok_or("No Proton is installed in Steam. Install \"Proton Experimental\" from the Steam library (it's listed under Tools) and try again.")?;
+    let appid = steam::installed_app(&game.root);
+    let hint = appid.and_then(proton::hint);
+    let mut done = Vec::new();
+    let mut not_fixed = Vec::new();
+    if let Some(hint) = hint.as_ref().filter(|h| h.advice == Advice::AntiCheat) {
+        not_fixed.push(format!("Its anti-cheat stops it under Proton ({}). Nothing on this side gets past that, so nothing was changed.", hint.reason()));
+        return Ok(Outcome { done, not_fixed });
+    }
+    let anticheat = proton::anticheat(&game.root);
+    if let Some((what, _)) = anticheat.iter().find(|(_, works)| !works) {
+        not_fixed.push(format!("It uses {what}, an anti-cheat that doesn't run under Proton. Nothing on this side gets past that, so nothing was changed."));
+        return Ok(Outcome { done, not_fixed });
+    }
+    for (what, _) in &anticheat {
+        not_fixed.push(format!("It uses {what}: that runs under Proton only if the game's developer turned it on. If it won't start or can't go online, nothing on this side can change that."));
+    }
     if record_path(game).exists() {
         undo(game)?;
     }
+    let advised = match hint.as_ref().map(|h| &h.advice) {
+        Some(Advice::Ge) => match steam.newest_ge() {
+            Some(tool) => Some(tool),
+            None => match proton::fetch_ge(&steam) {
+                Ok(tool) => {
+                    done.push(format!("Downloaded {tool} into Steam's compatibility tools (undo leaves it: other games can use it)."));
+                    Some(tool)
+                }
+                Err(e) => {
+                    not_fixed.push(format!("{e} ProtonDB's reports say it runs with GE-Proton; ProtonUp-Qt (Flathub) can install that."));
+                    None
+                }
+            },
+        },
+        Some(Advice::Official(version)) => Some(steam::official_name(version)),
+        _ => None,
+    };
+    if let Some(appid) = appid {
+        let (Some(tool), Some(hint)) = (advised, &hint) else {
+            if not_fixed.is_empty() {
+                not_fixed.push("ProtonDB's reports don't name a Proton that runs it better than Steam's own choice, so nothing was changed.".into());
+            }
+            return Ok(Outcome { done, not_fixed });
+        };
+        let config = steam.config();
+        let previous = steam::compat_tool(&config, appid)?;
+        steam::set_compat_tool(&config, appid, Some(&tool))?;
+        let record = format!("steam-compat\t{appid}\t{}\t{}\n", config.display(), previous.map_or("-".to_string(), |p| format!("={p}")));
+        let record_file = record_path(game);
+        fs::create_dir_all(record_file.parent().unwrap()).map_err(|e| e.to_string())?;
+        fs::write(&record_file, record).map_err(|e| e.to_string())?;
+        done.push(format!("Set it to run with {tool} in Steam: {}.", hint.reason()));
+        if let Advice::Official(version) = &hint.advice {
+            if !steam.tools().contains(&tool) {
+                not_fixed.push(format!("Proton {version} isn't installed yet: if Steam doesn't fetch it when the game starts, install it from the library (Tools)."));
+            }
+        }
+        return Ok(Outcome { done, not_fixed });
+    }
+    let proton = steam.proton().ok_or("No Proton is installed in Steam. Install \"Proton Experimental\" from the Steam library (it's listed under Tools) and try again.")?;
     let program = game.full(exe);
     let workdir = program.parent().unwrap_or(&game.root);
     let file = steam.shortcuts();
@@ -514,14 +572,11 @@ fn setup_windows(game: &Game, exe: &crate::scan::Found, targets: &Targets) -> Re
     let record_file = record_path(game);
     fs::create_dir_all(record_file.parent().unwrap()).map_err(|e| e.to_string())?;
     fs::write(&record_file, record.join("\n") + "\n").map_err(|e| e.to_string())?;
-    let mut not_fixed = Vec::new();
     if targets.menu {
         not_fixed.push("App-menu entries for Windows games aren't supported yet; start it from Steam.".into());
     }
-    Ok(Outcome {
-        done: vec![format!("Added \"{}\" to Steam as a non-Steam game.", game.name), format!("Set it to run with Proton ({proton}).")],
-        not_fixed,
-    })
+    done.extend([format!("Added \"{}\" to Steam as a non-Steam game.", game.name), format!("Set it to run with Proton ({proton}).")]);
+    Ok(Outcome { done, not_fixed })
 }
 
 /// Steam runs launch options with `sh -c`, `%command%` standing for its launch helpers and the

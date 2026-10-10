@@ -807,8 +807,34 @@ impl Report {
                 }
                 Problem::NoLinuxBuild => {
                     let _ = writeln!(out, "✗ There is no Linux version of this game.");
-                    if let Some(i) = game.windows {
-                        let _ = writeln!(out, "    Fix: run {} with Proton: gamefix setup --steam adds it to Steam that way.", game.files[i].path.display());
+                    let anticheat = crate::proton::anticheat(&game.root);
+                    let steam_app = crate::steam::installed_app(&game.root);
+                    let hint = steam_app.and_then(crate::proton::hint);
+                    if let Some((what, _)) = anticheat.iter().find(|(_, works)| !works) {
+                        let _ = writeln!(out, "✗ It uses {what}, an anti-cheat that doesn't run under Proton. Nothing on this");
+                        let _ = writeln!(out, "  side gets past that.");
+                    } else if let Some(hint) = hint.as_ref().filter(|h| h.advice == crate::proton::Advice::AntiCheat) {
+                        let _ = writeln!(out, "✗ Its anti-cheat stops it under Proton: {}.", hint.reason());
+                        let _ = writeln!(out, "  Nothing on this side gets past that.");
+                    } else if let Some(i) = game.windows {
+                        match (steam_app, &hint) {
+                            (Some(_), Some(hint)) => {
+                                let _ = writeln!(out, "    On ProtonDB it worked with {} for {} players, where Steam's default Proton", hint.tool(), hint.reports);
+                                let _ = writeln!(out, "    failed for {}.", hint.of);
+                                let _ = writeln!(out, "    Fix: gamefix setup --steam sets it to {}.", hint.tool());
+                            }
+                            (Some(_), None) => {
+                                let _ = writeln!(out, "    Steam runs it with Proton. ProtonDB's reports don't name a Proton that runs it");
+                                let _ = writeln!(out, "    better than Steam's own choice.");
+                            }
+                            _ => {
+                                let _ = writeln!(out, "    Fix: run {} with Proton: gamefix setup --steam adds it to Steam that way.", game.files[i].path.display());
+                            }
+                        }
+                        for (what, _) in &anticheat {
+                            let _ = writeln!(out, "• It uses {what}: that runs under Proton only if the game's developer turned it on.");
+                            let _ = writeln!(out, "  If it won't start or can't go online, nothing on this side can change that.");
+                        }
                     } else if !self.installers.is_empty() {
                         let _ = writeln!(out, "    It's an installer: run it with Proton first, then check the folder it installs to.");
                     }

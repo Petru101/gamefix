@@ -35,24 +35,76 @@ impl Steam {
         self.root.join("config/config.vdf")
     }
 
-    /// The Proton to use for Windows games: Valve's Experimental if installed, else any
-    /// other Proton Steam knows about. These are Steam's internal names.
-    pub fn proton(&self) -> Option<String> {
-        let common = self.root.join("steamapps/common");
-        for (dir, name) in [("Proton - Experimental", "proton_experimental"), ("Proton 10.0", "proton_10"), ("Proton 9.0", "proton_9")] {
-            if common.join(dir).join("proton").is_file() {
-                return Some(name.into());
+    /// Steam's library folders (where games and Valve's Protons are installed), its own first.
+    pub fn libraries(&self) -> Vec<PathBuf> {
+        let mut out = vec![self.root.clone()];
+        let text = fs::read_to_string(self.root.join("steamapps/libraryfolders.vdf")).unwrap_or_default();
+        let Ok(doc) = vdf::parse(&text) else { return out };
+        let Some(vdf::Node::Map(folders)) = vdf::get(&doc, &["libraryfolders"]) else { return out };
+        for (_, folder) in folders {
+            if let vdf::Node::Map(fields) = folder {
+                if let Some((_, vdf::Node::Str(path))) = fields.iter().find(|(k, _)| k == "path") {
+                    let path = PathBuf::from(vdf::unescape(path));
+                    if !out.iter().any(|p| same_dir(p, &path)) {
+                        out.push(path);
+                    }
+                }
             }
         }
-        // Custom ones (GE-Proton) name themselves in compatibilitytool.vdf.
-        let custom = fs::read_dir(self.root.join("compatibilitytools.d")).ok()?;
-        custom.flatten().find_map(|d| {
-            let doc = vdf::parse(&fs::read_to_string(d.path().join("compatibilitytool.vdf")).ok()?).ok()?;
-            match vdf::get(&doc, &["compatibilitytools", "compat_tools"])? {
-                vdf::Node::Map(tools) => tools.first().map(|(name, _)| vdf::unescape(name)),
-                _ => None,
+        out
+    }
+
+    /// The compatibility tools installed, by Steam's internal names: Valve's Protons from their
+    /// app manifests ("Proton 9.0" is proton_9 wherever it is: its folder may still be called
+    /// "Proton 9.0 (Beta)"), then custom ones (GE-Proton) from compatibilitytools.d.
+    pub fn tools(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for library in self.libraries() {
+            let Ok(entries) = fs::read_dir(library.join("steamapps")) else { continue };
+            for entry in entries.flatten() {
+                if !entry.file_name().to_string_lossy().starts_with("appmanifest_") {
+                    continue;
+                }
+                let Ok(doc) = vdf::parse(&fs::read_to_string(entry.path()).unwrap_or_default()) else { continue };
+                let field = |key| match vdf::get(&doc, &["AppState", key]) {
+                    Some(vdf::Node::Str(v)) => vdf::unescape(v),
+                    _ => String::new(),
+                };
+                let name = match field("name").as_str() {
+                    "Proton Experimental" => "proton_experimental".to_string(),
+                    "Proton Hotfix" => "proton_hotfix".to_string(),
+                    n => match n.strip_prefix("Proton ") {
+                        Some(v) if !version_key(v).is_empty() && v.chars().all(|c| c.is_ascii_digit() || c == '.') => official_name(v),
+                        _ => continue,
+                    },
+                };
+                if library.join("steamapps/common").join(field("installdir")).join("proton").is_file() && !out.contains(&name) {
+                    out.push(name);
+                }
             }
-        })
+        }
+        let mut custom: Vec<String> = fs::read_dir(self.root.join("compatibilitytools.d")).into_iter().flatten().flatten().filter_map(|d| custom_tool(&d.path())).collect();
+        custom.sort();
+        out.extend(custom);
+        out
+    }
+
+    /// The Proton for Windows games nothing better is known for: Valve's Experimental if
+    /// installed, else its newest numbered one, else a custom one.
+    pub fn proton(&self) -> Option<String> {
+        let tools = self.tools();
+        let numbered = |t: &&String| t.strip_prefix("proton_").is_some_and(|v| v.chars().all(|c| c.is_ascii_digit()));
+        tools
+            .iter()
+            .find(|t| *t == "proton_experimental")
+            .or_else(|| tools.iter().filter(numbered).max_by_key(|t| version_key(t)))
+            .or_else(|| tools.iter().find(|t| !t.starts_with("proton_")))
+            .cloned()
+    }
+
+    /// The newest GE-Proton installed, by Steam's internal name.
+    pub fn newest_ge(&self) -> Option<String> {
+        self.tools().into_iter().filter(|t| t.starts_with("GE-Proton")).max_by_key(|t| version_key(t))
     }
 
     /// Asks Steam to quit properly (saving its settings) and waits up to a minute.
@@ -77,9 +129,37 @@ impl Steam {
     }
 }
 
-/// The Steam app installed in this folder (`<library>/steamapps/common/<installdir>`), from the
-/// library's `appmanifest_<appid>.acf` files.
+/// Steam's internal name for one of Valve's Protons: "7.0" is proton_7, "5.13" proton_513.
+pub fn official_name(version: &str) -> String {
+    let (major, minor) = version.split_once('.').unwrap_or((version, "0"));
+    if minor == "0" { format!("proton_{major}") } else { format!("proton_{major}{minor}") }
+}
+
+/// A custom tool's internal name, from the compatibilitytool.vdf in its folder.
+pub fn custom_tool(dir: &Path) -> Option<String> {
+    let doc = vdf::parse(&fs::read_to_string(dir.join("compatibilitytool.vdf")).ok()?).ok()?;
+    match vdf::get(&doc, &["compatibilitytools", "compat_tools"])? {
+        vdf::Node::Map(tools) => tools.first().map(|(name, _)| vdf::unescape(name)),
+        _ => None,
+    }
+}
+
+/// The numbers in a tool's name, for comparing versions: GE-Proton10-9 before GE-Proton10-25.
+fn version_key(name: &str) -> Vec<u32> {
+    name.split(|c: char| !c.is_ascii_digit()).filter_map(|p| p.parse().ok()).collect()
+}
+
+fn same_dir(a: &Path, b: &Path) -> bool {
+    a == b || fs::canonicalize(a).ok().is_some_and(|a| fs::canonicalize(b).ok() == Some(a))
+}
+
+/// The Steam app installed in this folder or one it's in (`<library>/steamapps/common/<installdir>`),
+/// from the library's `appmanifest_<appid>.acf` files.
 pub fn installed_app(dir: &Path) -> Option<u32> {
+    dir.ancestors().find_map(app_in)
+}
+
+fn app_in(dir: &Path) -> Option<u32> {
     let common = dir.parent()?;
     if common.file_name()? != "common" {
         return None;
@@ -364,6 +444,15 @@ fn renumber(list: &mut [(Vec<u8>, Node)]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_names() {
+        assert_eq!(official_name("7.0"), "proton_7");
+        assert_eq!(official_name("5.13"), "proton_513");
+        assert_eq!(official_name("10.0"), "proton_10");
+        assert!(version_key("GE-Proton10-25") > version_key("GE-Proton10-9"));
+        assert!(version_key("GE-Proton11-7-x86_64") > version_key("GE-Proton10-25"));
+    }
 
     #[test]
     fn crc_matches_the_standard() {

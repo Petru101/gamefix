@@ -62,7 +62,16 @@ fn tokens(text: &str) -> Result<Vec<Token>, String> {
                 out.push(Token::Str(text[i + 1..end].to_string()));
             }
             c if c.is_whitespace() => {}
-            // Comments and unquoted tokens never appear in the files gamefix edits.
+            // Only in files gamefix just reads (GE-Proton's compatibilitytool.vdf): writing
+            // would drop them.
+            '/' if chars.peek().is_some_and(|&(_, d)| d == '/') => {
+                for (_, d) in chars.by_ref() {
+                    if d == '\n' {
+                        break;
+                    }
+                }
+            }
+            // Unquoted tokens never appear in the files gamefix edits.
             c => return Err(format!("unexpected '{c}'")),
         }
     }
@@ -168,6 +177,13 @@ mod tests {
     }
 
     /// Real files, if given: GAMEFIX_TEXT_VDF=a.vdf:b.vdf cargo test
+    #[test]
+    fn comments_are_skipped() {
+        let text = "\"compat_tools\"\n{\n  \"GE-Proton11-7-x86_64\" // Internal name of this tool\n  {\n    // a // comment\n    \"install_path\" \".\"\n  }\n}\n";
+        let doc = parse(text).unwrap();
+        assert!(matches!(get(&doc, &["compat_tools", "GE-Proton11-7-x86_64", "install_path"]), Some(Node::Str(p)) if p == "."));
+    }
+
     #[test]
     fn real_files_round_trip() {
         let Some(paths) = std::env::var_os("GAMEFIX_TEXT_VDF") else { return };

@@ -1,6 +1,7 @@
 mod binary;
 mod check;
 mod fetch;
+mod proton;
 mod rightclick;
 mod scan;
 mod setup;
