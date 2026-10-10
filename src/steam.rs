@@ -125,6 +125,13 @@ impl Steam {
         })
     }
 
+    /// The Wine prefix Proton makes for an app or shortcut the first time it starts it: in the
+    /// library the game is installed in, else in Steam's own (shortcuts).
+    pub fn prefix(&self, game_dir: &Path, appid: u32) -> PathBuf {
+        let steamapps = game_dir.ancestors().find(|d| d.file_name().is_some_and(|n| n == "common") && d.parent().is_some_and(|p| p.ends_with("steamapps"))).and_then(Path::parent);
+        steamapps.map(Path::to_path_buf).unwrap_or_else(|| self.root.join("steamapps")).join("compatdata").join(appid.to_string()).join("pfx")
+    }
+
     /// The newest GE-Proton installed, by Steam's internal name.
     pub fn newest_ge(&self) -> Option<String> {
         self.tools().into_iter().filter(|t| t.starts_with("GE-Proton")).max_by_key(|t| version_key(t))

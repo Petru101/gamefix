@@ -14,6 +14,9 @@ pub enum Problem {
     /// A Windows game's own copies of DLLs Wine has built in (names without ".dll"), next to
     /// its program: Windows would load them, Wine uses its own unless told otherwise.
     OwnWindowsDlls(Vec<String>),
+    /// Windows parts the game's program needs that neither the game brings nor Proton's Wine
+    /// has (MFC, the Visual Basic runtime, XNA, ...), and what provides each.
+    MissingWindowsParts(Vec<(String, crate::proton::Provider)>),
     /// Nothing built, but a project's source files (the marker file and what it's for):
     /// A-Maze-Batz's download is its CMake project, dodge_the_creeps a Godot project.
     Source(PathBuf, &'static str),
@@ -268,6 +271,10 @@ pub fn check(game: &Game, system: &System) -> Report {
             let dlls = crate::proton::ignored_dlls(&game.full(&game.files[i]));
             if !dlls.is_empty() {
                 problems.push(Problem::OwnWindowsDlls(dlls));
+            }
+            let parts = crate::proton::missing_parts(&game.full(&game.files[i]));
+            if !parts.is_empty() {
+                problems.push(Problem::MissingWindowsParts(parts));
             }
         }
         report.problems = problems;
@@ -886,6 +893,26 @@ impl Report {
                     let _ = writeln!(out, "✗ This is the game's source code ({kind}: {}), not a built game.", file.display());
                     let _ = writeln!(out, "    It has to be built first (its README usually says how), or use a download with a");
                     let _ = writeln!(out, "    ready-made program if there is one.");
+                }
+                Problem::MissingWindowsParts(parts) => {
+                    use crate::proton::Provider;
+                    let names = |want: fn(&Provider) -> bool| parts.iter().filter(|(_, p)| want(p)).map(|(d, _)| d.as_str()).collect::<Vec<_>>().join(", ");
+                    let components: Vec<&str> = parts.iter().filter_map(|(_, p)| if let Provider::Component(c) = p { Some(*c) } else { None }).collect();
+                    if !components.is_empty() {
+                        let _ = writeln!(out, "✗ It needs parts of Windows that neither the game brings nor Proton has: {}.", names(|p| matches!(p, Provider::Component(_))));
+                        let _ = writeln!(out, "    Fix: install {} into its Proton prefix (protontricks); gamefix setup --steam does", components.join(" "));
+                        let _ = writeln!(out, "    that once the game has been started from Steam once.");
+                    }
+                    let debug = names(|p| *p == Provider::DebugBuild);
+                    if !debug.is_empty() {
+                        let _ = writeln!(out, "✗ It needs {debug}: Microsoft's debug C++ runtime, which only developers' machines have.");
+                        let _ = writeln!(out, "  The developer shipped a debug build; only they can fix that (a release build).");
+                    }
+                    let unknown = names(|p| *p == Provider::Unknown);
+                    if !unknown.is_empty() {
+                        let _ = writeln!(out, "✗ It needs {unknown}, which neither the game brings nor Proton has, and no known");
+                        let _ = writeln!(out, "  package provides: the download probably left it out.");
+                    }
                 }
                 Problem::OwnWindowsDlls(dlls) => {
                     let files: Vec<String> = dlls.iter().map(|d| format!("{d}.dll")).collect();

@@ -175,14 +175,15 @@ const KNOWN_DLLS: [&str; 30] = [
 /// Used without an installed Proton to read the list from: Windows parts that wrappers replace.
 const WRAPPED: [&str; 10] = ["ddraw", "d3dimm", "dinput", "dinput8", "dsound", "winmm", "version", "opengl32", "d3d10", "d3d10_1"];
 
-/// The DLLs Proton's Wine has built in, from the Proton Steam uses by default.
+/// The files Proton's Wine has built in (DLLs, drivers: "ddraw.dll"), from the Proton Steam
+/// uses by default.
 fn wine_builtins() -> Option<Vec<String>> {
     let steam = Steam::find()?;
     let lib = steam.tool_dir(&steam.proton()?)?.join("files/lib/wine");
     let mut names: Vec<String> = ["i386-windows", "x86_64-windows"]
         .iter()
         .flat_map(|d| fs::read_dir(lib.join(d)).into_iter().flatten().flatten())
-        .filter_map(|e| e.file_name().to_string_lossy().to_lowercase().strip_suffix(".dll").map(String::from))
+        .map(|e| e.file_name().to_string_lossy().to_lowercase())
         .collect();
     names.sort();
     names.dedup();
@@ -197,7 +198,7 @@ fn wine_builtins() -> Option<Vec<String>> {
 pub fn ignored_dlls(program: &Path) -> Vec<String> {
     let builtins = wine_builtins();
     let built_in = |name: &str| match &builtins {
-        Some(list) => list.binary_search(&name.to_string()).is_ok(),
+        Some(list) => list.binary_search(&format!("{name}.dll")).is_ok(),
         None => WRAPPED.contains(&name),
     };
     let mut out: Vec<String> = fs::read_dir(program.parent().unwrap_or(Path::new(".")))
@@ -212,6 +213,76 @@ pub fn ignored_dlls(program: &Path) -> Vec<String> {
         .collect();
     out.sort();
     out
+}
+
+/// What provides a Windows part a game needs and Proton's Wine lacks.
+#[derive(Debug, PartialEq, Clone)]
+pub enum Provider {
+    /// A winetricks component (protontricks installs it into the game's prefix).
+    Component(&'static str),
+    /// Microsoft's debug C++ runtime: only on developers' machines, never redistributable.
+    DebugBuild,
+    Unknown,
+}
+
+/// The winetricks component providing a DLL Wine lacks, from what old games use: MFC, the
+/// Visual Basic runtimes, OpenAL, PhysX's loader, an MP3 codec.
+fn provider(dll: &str) -> Provider {
+    let stem = dll.trim_end_matches(".dll");
+    let stem = stem.strip_suffix('u').filter(|s| s.starts_with("mfc")).unwrap_or(stem);
+    const MFC: [&str; 10] = ["mfc40", "mfc42", "mfc70", "mfc71", "mfc80", "mfc90", "mfc100", "mfc110", "mfc120", "mfc140"];
+    if let Some(mfc) = MFC.iter().find(|m| **m == stem) {
+        return Provider::Component(mfc);
+    }
+    match stem {
+        "msvbvm60" => Provider::Component("vb6run"),
+        "msvbvm50" => Provider::Component("vb5run"),
+        "vb40032" => Provider::Component("vb4run"),
+        "openal32" => Provider::Component("openal"),
+        "physxloader" | "physxcore" | "physxcooking" | "physxdevice" => Provider::Component("physx"),
+        "l3codeca" => Provider::Component("l3codecx"),
+        s if ["msvcp", "msvcr", "vcruntime", "ucrtbase", "concrt", "vcomp"].iter().any(|p| s.starts_with(p)) && s.ends_with('d') => Provider::DebugBuild,
+        _ => Provider::Unknown,
+    }
+}
+
+/// Follows the program's imports through the DLLs next to it (where Windows looks first), and
+/// lists what's left that Proton's Wine doesn't have built in. Delay-loaded DLLs are left out:
+/// a game may never use them. A .NET program referencing XNA without bringing it needs XNA
+/// (Wine has none): 3.1 for programs built for .NET 2, else 4.0. Nothing without an installed
+/// Proton to compare with, or when the program is packed (its real imports are compressed).
+pub fn missing_parts(program: &Path) -> Vec<(String, Provider)> {
+    let mut missing = Vec::new();
+    let Some(builtins) = wine_builtins() else { return missing };
+    let shipped: std::collections::HashMap<String, PathBuf> = fs::read_dir(program.parent().unwrap_or(Path::new(".")))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| (e.file_name().to_string_lossy().to_lowercase(), e.path()))
+        .collect();
+    let Some(first) = crate::binary::imports(program) else { return missing };
+    // A reference to Microsoft's XNA assemblies carries their public key token; MonoGame and FNA
+    // keep XNA's namespaces but not its signature (Picross for a Cause, MonoGame).
+    const XNA_TOKEN: &[u8] = b"\x84\x2c\xf8\xbe\x1d\xe5\x05\x53";
+    if first.dotnet && crate::binary::contains(program, XNA_TOKEN) && !shipped.contains_key("microsoft.xna.framework.dll") {
+        let v2 = crate::binary::dotnet_runtime(program).is_some_and(|v| v.starts_with("v2."));
+        missing.push(("Microsoft.Xna.Framework.dll".into(), Provider::Component(if v2 { "xna31" } else { "xna40" })));
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut todo = vec![first];
+    while let Some(file) = todo.pop() {
+        for dll in file.needed {
+            if dll.starts_with("api-ms-win-") || dll.starts_with("ext-ms-") || !seen.insert(dll.clone()) {
+                continue;
+            }
+            match shipped.get(&dll) {
+                Some(path) => todo.extend(crate::binary::imports(path)),
+                None if builtins.binary_search(&dll).is_err() => missing.push((dll.clone(), provider(&dll))),
+                None => {}
+            }
+        }
+    }
+    missing
 }
 
 /// A WINEDLLOVERRIDES value making Wine use the game's own copies first.
@@ -304,6 +375,17 @@ mod tests {
         // NVIDIA-only: nothing without an NVIDIA GPU.
         assert!(options(1088850, &["amd"]).is_none());
         assert!(options(1088850, &["nvidia"]).is_some());
+    }
+
+    #[test]
+    fn providers() {
+        assert_eq!(provider("mfc42u.dll"), Provider::Component("mfc42"));
+        assert_eq!(provider("mfc140.dll"), Provider::Component("mfc140"));
+        assert_eq!(provider("msvbvm60.dll"), Provider::Component("vb6run"));
+        assert_eq!(provider("physxloader.dll"), Provider::Component("physx"));
+        assert_eq!(provider("msvcp140d.dll"), Provider::DebugBuild);
+        assert_eq!(provider("ucrtbased.dll"), Provider::DebugBuild);
+        assert_eq!(provider("somegame.dll"), Provider::Unknown);
     }
 
     #[test]

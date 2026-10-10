@@ -296,7 +296,7 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
             Problem::Alsa32(None) => not_fixed.push("Its 32-bit ALSA sound: needs Steam's runtime (install Steam), which has a plugin that works.".into()),
             Problem::KickFiles(files) => not_fixed.push(format!("Its missing Mono files ({}): only the developer can add them; the .exe with Proton works.", files.join(", "))),
             Problem::FnaLibs(libs) => not_fixed.push(format!("Its missing native libraries ({}): get FNA's fnalibs, or use the Windows download with Proton.", libs.join(", "))),
-            Problem::NoLinuxBuild | Problem::OwnWindowsDlls(_) | Problem::Source(..) | Problem::Damaged(_) | Problem::Package(..) | Problem::Flash { .. } | Problem::Archive(_) | Problem::WrongMachine(_) | Problem::Love { .. } | Problem::Python { .. } | Problem::Java { .. } => {}
+            Problem::NoLinuxBuild | Problem::OwnWindowsDlls(_) | Problem::MissingWindowsParts(_) | Problem::Source(..) | Problem::Damaged(_) | Problem::Package(..) | Problem::Flash { .. } | Problem::Archive(_) | Problem::WrongMachine(_) | Problem::Love { .. } | Problem::Python { .. } | Problem::Java { .. } => {}
         }
     }
     if !preload.is_empty() {
@@ -507,6 +507,11 @@ fn setup_windows(game: &Game, report: &Report, exe: &crate::scan::Found, targets
     }
     let appid = steam::installed_app(&game.root);
     let own: Vec<String> = report.problems.iter().find_map(|p| if let Problem::OwnWindowsDlls(d) = p { Some(d.clone()) } else { None }).unwrap_or_default();
+    let mut components: Vec<&str> = report.problems.iter().flat_map(|p| match p {
+        Problem::MissingWindowsParts(parts) => parts.iter().filter_map(|(_, p)| if let proton::Provider::Component(c) = p { Some(*c) } else { None }).collect(),
+        _ => Vec::new(),
+    }).collect();
+    components.dedup();
     let hint = appid.and_then(proton::hint);
     let mut done = Vec::new();
     let mut not_fixed = Vec::new();
@@ -578,6 +583,7 @@ fn setup_windows(game: &Game, report: &Report, exe: &crate::scan::Found, targets
                 done.push(format!("  WINEDLLOVERRIDES={}: Wine uses the game's own {} instead of its built-in copy, as Windows would.", proton::overrides(&own), dll_files(&own)));
             }
         }
+        install_components(&steam, game, appid, &components, &mut done, &mut not_fixed, &mut record);
         if record.is_empty() {
             if not_fixed.is_empty() {
                 not_fixed.push("ProtonDB's reports don't name a Proton or launch options that run it better than Steam's own setup, so nothing was changed.".into());
@@ -603,6 +609,7 @@ fn setup_windows(game: &Game, report: &Report, exe: &crate::scan::Found, targets
     let previous = steam::compat_tool(&config, appid)?;
     steam::set_compat_tool(&config, appid, Some(&proton))?;
     record.push(format!("steam-compat\t{appid}\t{}\t{}", config.display(), previous.map_or("-".to_string(), |p| format!("={p}"))));
+    install_components(&steam, game, appid, &components, &mut done, &mut not_fixed, &mut record);
 
     let record_file = record_path(game);
     fs::create_dir_all(record_file.parent().unwrap()).map_err(|e| e.to_string())?;
@@ -615,6 +622,36 @@ fn setup_windows(game: &Game, report: &Report, exe: &crate::scan::Found, targets
         done.push(format!("Set its launch options to {line}: Wine uses the game's own {} instead of its built-in copy, as Windows would.", dll_files(&own)));
     }
     Ok(Outcome { done, not_fixed })
+}
+
+/// Installs winetricks components into the game's Proton prefix with protontricks (the host's,
+/// else Flathub's). The prefix only exists once Steam has started the game, so before that
+/// it says to start it once and set it up again. Undo leaves them: a prefix can't be cleanly
+/// rolled back, and they're harmless there.
+fn install_components(steam: &Steam, game: &Game, appid: u32, components: &[&str], done: &mut Vec<String>, not_fixed: &mut Vec<String>, record: &mut Vec<String>) {
+    if components.is_empty() {
+        return;
+    }
+    let list = components.join(" ");
+    if !steam.prefix(&game.root, appid).is_dir() {
+        not_fixed.push(format!("The Windows parts it needs ({list}) go into its Proton prefix, which Steam makes the first time it starts the game: start it once (it may fail), close Steam, then run gamefix setup again."));
+        return;
+    }
+    let run = |mut command: Command| command.arg(appid.to_string()).arg("-q").args(components).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().is_ok_and(|s| s.success());
+    let installed = match Command::new("protontricks").arg("--version").output() {
+        Ok(_) => run(Command::new("protontricks")),
+        Err(_) => {
+            let mut flatpak = Command::new("flatpak");
+            flatpak.args(["run", "com.github.Matoking.protontricks"]);
+            run(flatpak)
+        }
+    };
+    if installed {
+        record.push(format!("installed\t{appid}\t{list}"));
+        done.push(format!("Installed {list} into its Proton prefix (protontricks; undo leaves them, they're harmless)."));
+    } else {
+        not_fixed.push(format!("Installing {list} with protontricks failed; `protontricks {appid} {list}` in a terminal shows why."));
+    }
 }
 
 /// Adds WINEDLLOVERRIDES making Wine use the game's own copies of these DLLs to the settings.

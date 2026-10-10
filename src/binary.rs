@@ -386,6 +386,71 @@ fn elf(f: &mut File, h: &[u8]) -> Option<Elf> {
     Some(Elf { bits, machine, program, needed, rpath, runpath, packed, pyinstaller, exec_stack })
 }
 
+/// The DLLs a Windows program or library needs to start (delay-loaded ones, loaded the first
+/// time they're used, aren't counted).
+pub struct Imports {
+    /// A .NET program: its own references (XNA) aren't imports.
+    pub dotnet: bool,
+    pub needed: Vec<String>,
+}
+
+/// Reads the import tables through the section headers. None when they don't hold plausible
+/// DLL names: a packed program (Cookard) keeps the real ones compressed.
+pub fn imports(path: &Path) -> Option<Imports> {
+    let data = std::fs::read(path).ok()?;
+    let lfanew = u32le(data.get(..0x40)?, 0x3c) as usize;
+    if data.get(lfanew..lfanew + 4)? != b"PE\0\0" {
+        return None;
+    }
+    let sections = u16le(&data, lfanew + 6) as usize;
+    let opt = lfanew + 24;
+    let opt_size = u16le(&data, lfanew + 20) as usize;
+    let dirs = match u16le(data.get(opt..opt + 2)?, 0) {
+        0x10b => opt + 96,
+        0x20b => opt + 112,
+        _ => return None,
+    };
+    let dir_count = u32le(&data, dirs - 4) as usize;
+    let dir = |i: usize| if i < dir_count && dirs + i * 8 + 8 <= data.len() { u32le(&data, dirs + i * 8) as u64 } else { 0 };
+    // (virtual address, size, file offset) of each section.
+    let table: Vec<(u64, u64, u64)> = (0..sections)
+        .filter_map(|i| {
+            let s = data.get(opt + opt_size + i * 40..opt + opt_size + i * 40 + 40)?;
+            Some((u32le(s, 12) as u64, u32le(s, 8).max(u32le(s, 16)) as u64, u32le(s, 20) as u64))
+        })
+        .collect();
+    let at = |rva: u64| table.iter().find(|(va, size, _)| *va <= rva && rva < va + size).map(|(va, _, raw)| (raw + rva - va) as usize).filter(|&o| o < data.len());
+    let name_at = |rva: u64| -> Option<String> {
+        let start = at(rva)?;
+        let end = start + data[start..].iter().take(256).position(|&b| b == 0)?;
+        let name = String::from_utf8(data[start..end].to_vec()).ok()?.to_lowercase();
+        let plausible = name.chars().all(|c| c.is_ascii_alphanumeric() || "_.+- ".contains(c)) && [".dll", ".drv", ".exe", ".ocx", ".sys", ".cpl"].iter().any(|e| name.ends_with(e));
+        plausible.then_some(name)
+    };
+    // Import descriptors (directory entry 1): 20 bytes each, the DLL's name at 12, all zero at the end.
+    let mut needed = Vec::new();
+    if dir(1) != 0 {
+        for i in 0..4096u64 {
+            let d = at(dir(1) + i * 20)?;
+            let desc = data.get(d..d + 20)?;
+            if desc.iter().all(|&b| b == 0) {
+                break;
+            }
+            needed.push(name_at(u32le(desc, 12) as u64)?);
+        }
+    }
+    Some(Imports { dotnet: dir(14) != 0, needed })
+}
+
+/// The .NET runtime a .NET program was built for, from its metadata ("v2.0.50727", "v4.0.30319").
+pub fn dotnet_runtime(path: &Path) -> Option<String> {
+    let data = std::fs::read(path).ok()?;
+    let at = data.windows(4).position(|w| w == b"BSJB")?;
+    let len = u32le(data.get(at..at + 16)?, 12) as usize;
+    let version = data.get(at + 16..at + 16 + len.min(32))?;
+    Some(String::from_utf8_lossy(version).trim_end_matches('\0').to_string())
+}
+
 /// The maker a Windows file names in its version information ("CompanyName"), if any.
 pub fn company(path: &Path) -> Option<String> {
     let data = std::fs::read(path).ok()?;
@@ -427,6 +492,42 @@ fn pe(f: &mut File, h: &[u8]) -> Option<Pe> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A minimal 32-bit Windows program: one section holding the import table, naming two DLLs.
+    #[test]
+    fn windows_imports() {
+        let mut f = vec![0u8; 0x600];
+        f[..2].copy_from_slice(b"MZ");
+        f[0x3c..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+        f[0x40..0x44].copy_from_slice(b"PE\0\0");
+        let (coff, opt) = (0x44, 0x58);
+        f[coff..coff + 2].copy_from_slice(&0x14cu16.to_le_bytes());
+        f[coff + 2..coff + 4].copy_from_slice(&1u16.to_le_bytes());
+        f[coff + 16..coff + 18].copy_from_slice(&224u16.to_le_bytes());
+        f[opt..opt + 2].copy_from_slice(&0x10bu16.to_le_bytes());
+        f[opt + 92..opt + 96].copy_from_slice(&16u32.to_le_bytes());
+        f[opt + 104..opt + 108].copy_from_slice(&0x1000u32.to_le_bytes());
+        // The section: 0x200 bytes at file offset 0x400, mapped at 0x1000.
+        let s = opt + 224;
+        for (at, v) in [(8, 0x200u32), (12, 0x1000), (16, 0x200), (20, 0x400)] {
+            f[s + at..s + at + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        for (i, (rva, name)) in [(0x1100u32, &b"MFC42.DLL\0"[..]), (0x1110, b"kernel32.dll\0")].into_iter().enumerate() {
+            f[0x400 + i * 20 + 12..0x400 + i * 20 + 16].copy_from_slice(&rva.to_le_bytes());
+            let at = 0x400 + rva as usize - 0x1000;
+            f[at..at + name.len()].copy_from_slice(name);
+        }
+        let path = std::env::temp_dir().join(format!("gamefix-pe-{}", std::process::id()));
+        std::fs::write(&path, &f).unwrap();
+        let imports = imports(&path).unwrap();
+        assert_eq!(imports.needed, ["mfc42.dll", "kernel32.dll"]);
+        assert!(!imports.dotnet);
+        // A name that isn't one (a packed program's table): unreadable, not a list of nonsense.
+        f[0x500..0x503].copy_from_slice(b"\xc3\xa9h");
+        std::fs::write(&path, &f).unwrap();
+        assert!(super::imports(&path).is_none());
+        std::fs::remove_file(&path).unwrap();
+    }
 
     #[test]
     fn library_path_scripts() {
