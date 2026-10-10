@@ -30,6 +30,9 @@ pub struct Game {
     pub main: Option<usize>,
     /// Index into `files` of the Windows program to run, when there's no Linux one.
     pub windows: Option<usize>,
+    /// Index into `files` of a game another program runs (a .love file, Python code), when
+    /// there's no Linux program.
+    pub portable: Option<usize>,
     pub engine: Option<Engine>,
 }
 
@@ -48,6 +51,8 @@ impl Game {
 }
 
 pub fn scan(path: &Path) -> Option<Game> {
+    // Absolute, so what setup writes works from anywhere.
+    let path = &fs::canonicalize(path).ok()?;
     let meta = fs::metadata(path).ok()?;
     let (root, chosen) = if meta.is_dir() {
         (path.to_path_buf(), None)
@@ -75,14 +80,22 @@ pub fn scan(path: &Path) -> Option<Game> {
         None if chosen.is_some() => picked(false),
         None => pick_windows(&root, &files),
     };
+    let portable = match main {
+        Some(_) => None,
+        None if chosen.is_some() => chosen.as_ref().and_then(|c| files.iter().position(|f| &f.path == c && matches!(f.binary, Binary::Love | Binary::Python(_)))),
+        None => pick_portable(&root, &files),
+    };
     let program = main.or(windows);
-    let engine = program.and_then(|i| engine(&root, &files[i].path, &files));
+    let engine = match portable {
+        Some(i) if matches!(files[i].binary, Binary::Love) => Some(Engine { name: "LÖVE", version: love_version(&root.join(&files[i].path)) }),
+        _ => program.and_then(|i| engine(&root, &files[i].path, &files)),
+    };
     let name = program
         .and_then(|i| unity_product(&root, &files[i].path))
         .or_else(|| chosen.as_ref().filter(|_| shared_folder(&root)).map(|c| stem(c)))
         .or_else(|| root.file_name().map(|n| n.to_string_lossy().into_owned()))
         .unwrap_or_else(|| root.display().to_string());
-    Some(Game { root, name, files, main, windows, engine })
+    Some(Game { root, name, files, main, windows, portable, engine })
 }
 
 /// Folders that hold unrelated downloads rather than one game.
@@ -112,6 +125,7 @@ fn walk(root: &Path, rel: &Path, depth: usize, out: &mut Vec<Found>) {
             let keep = match &binary {
                 Binary::Pe(_) => is_exe,
                 Binary::Script => depth == 0,
+                Binary::Love | Binary::Python(_) => depth <= 1,
                 Binary::Elf(_) => true,
             };
             if keep {
@@ -142,7 +156,7 @@ fn pick_main(root: &Path, files: &[Found]) -> Option<usize> {
             let dir = root.join(f.path.parent().unwrap_or(Path::new("")));
             let s = stem(&f.path);
             let mut score = 0;
-            if dir.join(format!("{s}_Data")).is_dir() || dir.join(format!("{s}.pck")).is_file() {
+            if dir.join(format!("{s}_Data")).is_dir() || dir.join(format!("{s}.pck")).is_file() || dir.join("data.pck").is_file() {
                 score += 10;
             }
             if f.path.components().count() == 1 {
@@ -191,6 +205,43 @@ fn pick_windows(root: &Path, files: &[Found]) -> Option<usize> {
         .map(|(_, i)| i)
 }
 
+/// A .love file, else the Python file that looks like the game's start: named like the folder
+/// or main/game/run, preferring ones that use pygame.
+fn pick_portable(root: &Path, files: &[Found]) -> Option<usize> {
+    if let Some(i) = files.iter().position(|f| matches!(f.binary, Binary::Love)) {
+        return Some(i);
+    }
+    let folder: String = root.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default().chars().filter(|c| c.is_alphanumeric()).collect();
+    files
+        .iter()
+        .enumerate()
+        .filter_map(|(i, f)| {
+            let Binary::Python(py) = &f.binary else { return None };
+            let s = stem(&f.path).to_lowercase();
+            let mut score = 0;
+            if (!s.is_empty() && folder.contains(&s)) || ["main", "game", "run"].contains(&s.as_str()) {
+                score += 3;
+            }
+            if py.pygame {
+                score += 1;
+            }
+            Some((score, i))
+        })
+        .max_by_key(|&(score, i)| (score, std::cmp::Reverse(i)))
+        .map(|(_, i)| i)
+}
+
+/// The LÖVE version the game says it was made for: `t.version = "0.10.1"` in its conf.lua.
+/// The .love is a zip; unzip reads it (missing it, the version stays unknown).
+fn love_version(file: &Path) -> Option<String> {
+    let out = std::process::Command::new("unzip").arg("-p").arg(file).arg("conf.lua").output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let line = text.lines().find(|l| l.contains(".version") && l.contains('='))?;
+    let value = line.split('=').nth(1)?.trim().trim_start_matches(['"', '\'']);
+    let v: String = value.chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+    (!v.is_empty()).then_some(v)
+}
+
 fn engine(root: &Path, main: &Path, files: &[Found]) -> Option<Engine> {
     let dir = root.join(main.parent().unwrap_or(Path::new("")));
     let s = stem(main);
@@ -200,7 +251,7 @@ fn engine(root: &Path, main: &Path, files: &[Found]) -> Option<Engine> {
         return Some(Engine { name: "Unity", version });
     }
     let named = |n: &str| files.iter().any(|f| f.path.file_name().is_some_and(|x| x == n));
-    if dir.join(format!("{s}.pck")).is_file() || ends_with_pck(&dir.join(main.file_name()?)) {
+    if dir.join(format!("{s}.pck")).is_file() || dir.join("data.pck").is_file() || ends_with_pck(&dir.join(main.file_name()?)) {
         return Some(Engine { name: "Godot", version: None });
     }
     if main.components().any(|c| c.as_os_str() == "Binaries") || root.join("Engine").is_dir() {
@@ -213,13 +264,17 @@ fn engine(root: &Path, main: &Path, files: &[Found]) -> Option<Engine> {
     if dir.join("data.win").is_file() || (main.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe")) && binary::contains(&dir.join(main.file_name()?), b"data.win")) {
         return Some(Engine { name: "GameMaker", version: None });
     }
-    if root.join("renpy").is_dir() {
+    if main.ancestors().any(|a| root.join(a).join("renpy").is_dir()) {
         return Some(Engine { name: "Ren'Py", version: None });
     }
     if named("UnityPlayer.so") {
         return Some(Engine { name: "Unity", version: None });
     }
-    None
+    let here = |n: &str| dir.join(n).exists();
+    let (name, found) = [("Defold", here("game.projectc")), ("MonoGame", here("MonoGame.Framework.dll")), ("FNA", here("FNA.dll")), ("NW.js", here("nw.pak") || here("lib/libnw.so")), ("Java", here("jre") && std::fs::read_dir(&dir).into_iter().flatten().flatten().any(|e| e.path().extension().is_some_and(|x| x == "jar")))]
+        .into_iter()
+        .find(|(_, found)| *found)?;
+    found.then_some(Engine { name, version: None })
 }
 
 /// Godot can embed its data in the program; such files end with "GDPC".

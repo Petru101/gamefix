@@ -11,6 +11,10 @@ use std::path::{Path, PathBuf};
 
 pub enum Problem {
     NoLinuxBuild,
+    /// A .love file: needs the LÖVE version it was made for.
+    Love { file: PathBuf, version: Option<String> },
+    /// Python code: needs Python (2 is gone from current systems) and maybe pygame.
+    Python { file: PathBuf, v2: bool, pygame: bool },
     WrongMachine(u16),
     NotExecutable(PathBuf),
     /// Library name → the game's files that need it; and which of them Steam's runtime for
@@ -22,6 +26,8 @@ pub enum Problem {
     SymbolClash(Vec<Clash>),
     /// Unity before 5.4: its single-instance check mistakes other programs for the game.
     UnitySingleInstance,
+    /// H.264 videos in a Unity Linux build: its player only decodes VP8 there.
+    UnityH264(Vec<PathBuf>),
 }
 
 pub struct Clash {
@@ -55,6 +61,8 @@ pub struct Report {
     pub windows: Vec<(PathBuf, u8)>,
     pub installers: Vec<(PathBuf, &'static str)>,
     pub glibc: Option<(u32, u32)>,
+    /// The program is UPX-packed, so the libraries it needs couldn't be read.
+    pub packed: bool,
     /// run.sh of Steam's runtime for older games, if installed.
     pub old_runtime: Option<PathBuf>,
     /// Missing libraries only optional plugins need: what is lost, and the libraries.
@@ -86,16 +94,28 @@ pub fn check(game: &Game, system: &System) -> Report {
         }
     }
     let mut problems = Vec::new();
-    let mut report = Report { problems: Vec::new(), libs_checked: 0, windows, installers, glibc: system.glibc, old_runtime: system.old_runtime.as_ref().map(|r| r.run.clone()), harmless: Vec::new() };
+    let mut report = Report { problems: Vec::new(), libs_checked: 0, windows, installers, glibc: system.glibc, packed: false, old_runtime: system.old_runtime.as_ref().map(|r| r.run.clone()), harmless: Vec::new() };
 
     let Some((main, elf)) = game.main() else {
-        problems.push(Problem::NoLinuxBuild);
+        match game.portable.map(|i| &game.files[i]) {
+            Some(f) if matches!(f.binary, Binary::Love) => problems.push(Problem::Love { file: f.path.clone(), version: game.engine.as_ref().and_then(|e| e.version.clone()) }),
+            Some(f) => {
+                let python = game.files.iter().filter_map(|f| match &f.binary {
+                    Binary::Python(p) => Some(p),
+                    _ => None,
+                });
+                let (v2, pygame) = python.fold((false, false), |(v2, pg), p| (v2 || p.v2, pg || p.pygame));
+                problems.push(Problem::Python { file: f.path.clone(), v2, pygame });
+            }
+            None => problems.push(Problem::NoLinuxBuild),
+        }
         report.problems = problems;
         return report;
     };
     if elf.machine != EM_X86_64 && elf.machine != EM_386 {
         problems.push(Problem::WrongMachine(elf.machine));
     }
+    report.packed = elf.packed;
     let mode = std::fs::metadata(game.full(main)).map(|m| m.permissions().mode()).unwrap_or(0);
     if mode & 0o100 == 0 {
         problems.push(Problem::NotExecutable(main.path.clone()));
@@ -123,14 +143,21 @@ pub fn check(game: &Game, system: &System) -> Report {
             if system.has(lib, elf.bits) || bundled.contains(std::ffi::OsStr::new(lib)) || search.iter().any(|d| d.join(lib).is_file()) {
                 continue;
             }
-            match optional_plugin(path) {
+            match optional_plugin(path).or_else(|| java_window_part(path, lib)) {
                 Some(what) => optional.entry(what).or_default().push(lib.clone()),
                 None => missing.entry(lib.clone()).or_default().push((*path).clone()),
             }
         }
     }
     report.libs_checked = same.iter().filter(|(_, e)| !e.program).count();
-    report.harmless = optional.into_iter().collect();
+    report.harmless = optional
+        .into_iter()
+        .map(|(what, mut libs)| {
+            libs.sort();
+            libs.dedup();
+            (what, libs)
+        })
+        .collect();
     if !missing.is_empty() {
         let in_old_runtime = missing.keys().filter(|l| system.old_runtime.as_ref().is_some_and(|r| r.has(l, elf.bits))).cloned().collect();
         problems.push(Problem::MissingLibs { bits: elf.bits, libs: missing, in_old_runtime });
@@ -155,9 +182,51 @@ pub fn check(game: &Game, system: &System) -> Report {
     if old_unity.is_some_and(|v| v < (5, 4)) {
         problems.push(Problem::UnitySingleInstance);
     }
+    if game.engine.as_ref().is_some_and(|e| e.name == "Unity") {
+        let videos = h264_videos(&game.root, &main.path);
+        if !videos.is_empty() {
+            problems.push(Problem::UnityH264(videos));
+        }
+    }
 
     report.problems = problems;
     report
+}
+
+/// The start of an MP4 file: its "ftyp" box with a common brand.
+const MP4_BRANDS: &[&[u8]] = &[b"ftypisom", b"ftypmp42", b"ftypmp41", b"ftypiso2", b"ftypavc1", b"ftypM4V ", b"ftypqt  "];
+
+/// Videos Unity's Linux player can't play: H.264 files in StreamingAssets, and H.264 clips
+/// the build kept untranscoded in its .resource files (an MP4 header and H.264's "avcC" box).
+fn h264_videos(root: &Path, main: &Path) -> Vec<PathBuf> {
+    let stem = main.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let data = main.parent().unwrap_or(Path::new("")).join(format!("{stem}_Data"));
+    let mut found = Vec::new();
+    let mut dirs = vec![data.clone()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(root.join(&dir)).into_iter().flatten().flatten() {
+            let path = dir.join(entry.file_name());
+            let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                if path.starts_with(data.join("StreamingAssets")) || dir == data {
+                    dirs.push(path);
+                }
+            } else if (["mp4", "m4v", "mov"].contains(&ext.as_str()) && path.starts_with(data.join("StreamingAssets")))
+                || (ext == "resource" && binary::contains_groups(&root.join(&path), &[MP4_BRANDS, &[b"avcC"]]))
+            {
+                found.push(path);
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// Java runtimes bundled with games are often trimmed of AWT, the windowing toolkit games drawing
+/// with OpenGL (LWJGL, libGDX) don't use; the AWT libraries left behind then miss libawt.so.
+fn java_window_part(path: &Path, lib: &str) -> Option<&'static str> {
+    let in_jre = path.components().any(|c| c.as_os_str() == "jre");
+    (in_jre && lib.starts_with("libawt")).then_some("the bundled Java's windowing toolkit (AWT, unused by games that draw with OpenGL)")
 }
 
 /// A DT_RPATH or DT_RUNPATH list as folders, with $ORIGIN standing for the file's own folder.
@@ -258,6 +327,14 @@ impl Report {
             let engine = game.engine.as_ref().map(|e| format!(", {}{}", e.name, e.version.as_ref().map(|v| format!(" {v}")).unwrap_or_default())).unwrap_or_default();
             let _ = writeln!(out, "  Runs:  {} (Windows, {}-bit{engine})", game.files[game.windows.unwrap()].path.display(), pe.bits);
         }
+        if let Some(f) = game.portable.filter(|_| game.main().is_none()).map(|i| &game.files[i]) {
+            let what = match (&f.binary, &game.engine) {
+                (Binary::Love, Some(e)) => format!("LÖVE game{}", e.version.as_ref().map(|v| format!(", made for LÖVE {v}")).unwrap_or_default()),
+                (Binary::Python(p), _) if p.v2 => "Python 2 game".into(),
+                _ => "Python game".into(),
+            };
+            let _ = writeln!(out, "  Runs:  {} ({what})", f.path.display());
+        }
         if !self.windows.is_empty() && game.windows.is_none() {
             let _ = writeln!(out, "  {}: {}", if game.main().is_some() { "Also has a Windows build" } else { "Windows build" }, self.windows.iter().map(|(p, bits)| format!("{} ({bits}-bit)", p.display())).collect::<Vec<_>>().join(", "));
         }
@@ -272,8 +349,16 @@ impl Report {
             let _ = writeln!(out);
         }
 
+        if self.packed {
+            let _ = writeln!(out, "• Its program is packed (UPX), so the libraries it needs can't be read until it runs.");
+            if self.old_runtime.is_some() {
+                let _ = writeln!(out, "  Steam's runtime for older games has most libraries old games miss; gamefix setup");
+                let _ = writeln!(out, "  starts it through that in case.");
+            }
+            let _ = writeln!(out);
+        }
         if self.problems.is_empty() {
-            let _ = writeln!(out, "No problems found in its files ({} libraries checked).", self.libs_checked);
+            let _ = writeln!(out, "No {}problems found in its files ({} libraries checked).", if self.packed { "other " } else { "" }, self.libs_checked);
             let _ = writeln!(out, "If it still doesn't start, the next step is running it and reading what it prints.");
             return out;
         }
@@ -285,6 +370,28 @@ impl Report {
                         let _ = writeln!(out, "    Fix: run {} with Proton: gamefix setup --steam adds it to Steam that way.", game.files[i].path.display());
                     } else if !self.installers.is_empty() {
                         let _ = writeln!(out, "    It's an installer: run it with Proton first, then check the folder it installs to.");
+                    }
+                }
+                Problem::Love { file, version } => {
+                    let _ = writeln!(out, "✗ This is a LÖVE game: {} is run by the LÖVE program, which isn't part of the system.", file.display());
+                    // LÖVE 11 changed its API; 0.x games mostly fail on it (0.10.1: crashes loading sounds).
+                    if version.as_deref().is_some_and(|v| v.starts_with("0.")) {
+                        let _ = writeln!(out, "  It was made for LÖVE {}, and the LÖVE you can install (11, on Flathub) can't run", version.as_deref().unwrap_or_default());
+                        let _ = writeln!(out, "  games made for 0.10 or older.");
+                        let _ = writeln!(out, "    Fix: if the game has a Windows download, use that with Proton (it brings its own LÖVE).");
+                    } else {
+                        let _ = writeln!(out, "    Fix: install LÖVE from Flathub (org.love2d.love2d) and open the .love file with it.");
+                    }
+                }
+                Problem::Python { file, v2: true, .. } => {
+                    let _ = writeln!(out, "✗ This is a Python 2 game ({}). Python 2 was retired in 2020 and current", file.display());
+                    let _ = writeln!(out, "  Linux systems don't include it anymore, so it can't run here.");
+                    let _ = writeln!(out, "    Fix: if the game has a Windows download, use that with Proton.");
+                }
+                Problem::Python { file, pygame, .. } => {
+                    let _ = writeln!(out, "✗ This is a Python game ({}): it needs Python 3{} to run.", file.display(), if *pygame { " with pygame" } else { "" });
+                    if *pygame {
+                        let _ = writeln!(out, "    pygame isn't part of the system; if the game has a Windows download, that with Proton is simpler.");
                     }
                 }
                 Problem::WrongMachine(m) => {
@@ -339,6 +446,12 @@ impl Report {
                     }
                     let preload: Vec<String> = Problem::preload(clashes).iter().map(|p| game.root.join(p).display().to_string()).collect();
                     let _ = writeln!(out, "    Fix (at launch): LD_PRELOAD={}", preload.join(":"));
+                }
+                Problem::UnityH264(files) => {
+                    let _ = writeln!(out, "✗ Its videos (often the cutscenes) may stay black: they look like H.264, which Unity's");
+                    let _ = writeln!(out, "  Linux player can't decode (it plays VP8/WebM only). The game itself still runs:");
+                    list(&mut out, files);
+                    let _ = writeln!(out, "    Fix: if the game has a Windows download, that with Proton plays them.");
                 }
                 Problem::UnitySingleInstance => {
                     let _ = writeln!(out, "✗ Unity before 5.4 may quit at once with \"Player is already running\" while Steam or");

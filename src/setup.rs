@@ -89,6 +89,9 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
     let Some((main, _)) = game.main() else {
         return match game.windows {
             Some(i) => setup_windows(game, &game.files[i], targets),
+            None if report.problems.iter().any(|p| matches!(p, Problem::Love { .. } | Problem::Python { .. })) => {
+                Err("This game needs another program to run it (see gamefix check); setting it up isn't supported yet.".into())
+            }
             None => Err("No game program in this folder. If it's an installer, install the game first and set up the folder it installs to.".into()),
         };
     };
@@ -158,7 +161,15 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
                     not_fixed.push("Old Unity \"Player is already running\": needs bwrap, which isn't installed. If it happens, close Steam before starting.".into());
                 }
             }
-            Problem::NoLinuxBuild | Problem::WrongMachine(_) => {}
+            Problem::UnityH264(_) => not_fixed.push("Its H.264 videos: Unity's Linux player can't play them; the Windows download with Proton can.".into()),
+            Problem::NoLinuxBuild | Problem::WrongMachine(_) | Problem::Love { .. } | Problem::Python { .. } => {}
+        }
+    }
+    // What a packed program needs can't be read; the runtime only fills gaps, so it's safe.
+    if report.packed && old_runtime.is_none() {
+        if let Some(run) = &report.old_runtime {
+            old_runtime = Some(run.clone());
+            done.push("Starts it with Steam's runtime for older games, in case it needs libraries this system dropped (it's packed, so they can't be read).".into());
         }
     }
     let workdir = program.parent().unwrap_or(&game.root);

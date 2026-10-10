@@ -12,6 +12,15 @@ pub enum Binary {
     Elf(Elf),
     Pe(Pe),
     Script,
+    /// A LÖVE game: a zip of Lua code that the `love` program runs.
+    Love,
+    Python(Python),
+}
+
+pub struct Python {
+    /// Bytecode or source for Python 2, which current systems no longer have.
+    pub v2: bool,
+    pub pygame: bool,
 }
 
 pub struct Elf {
@@ -24,6 +33,8 @@ pub struct Elf {
     /// it), as written: usually relative to its own folder through $ORIGIN.
     pub rpath: Vec<String>,
     pub runpath: Vec<String>,
+    /// Compressed by UPX: what it needs is only known once it unpacks itself at start.
+    pub packed: bool,
     /// Asks for an executable stack: glibc 2.41+ refuses to dlopen such libraries.
     /// A missing PT_GNU_STACK counts, as x86 defaults to executable.
     pub exec_stack: bool,
@@ -42,15 +53,33 @@ pub fn identify(path: &Path) -> Option<Binary> {
     let mut head = [0u8; 64];
     let n = f.read(&mut head).ok()?;
     let head = &head[..n];
+    let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
     if head.starts_with(b"\x7fELF") && n == 64 {
         elf(&mut f, head).map(Binary::Elf)
     } else if head.starts_with(b"MZ") && n == 64 {
         pe(&mut f, head).map(Binary::Pe)
-    } else if head.starts_with(b"#!") {
+    } else if head.starts_with(b"#!") && ext != "py" {
         Some(Binary::Script)
+    } else if ext == "love" && head.starts_with(b"PK\x03\x04") {
+        Some(Binary::Love)
+    } else if ext == "pyc" && n >= 4 && head[2..4] == *b"\r\n" {
+        // The first two bytes number the bytecode format: Python 2 used 20121-62211 (2.7),
+        // Python 3 started again at 3000.
+        Some(Binary::Python(Python { v2: u16le(head, 0) >= 20000, pygame: contains(path, b"pygame") }))
+    } else if ext == "py" {
+        let mut text = String::new();
+        File::open(path).ok()?.take(1 << 20).read_to_string(&mut text).ok()?;
+        Some(Binary::Python(Python { v2: python2_source(&text), pygame: text.contains("import pygame") || text.contains("from pygame") }))
     } else {
         None
     }
+}
+
+/// Statements only Python 2 accepts: `print "..."` and `except Error, e:`.
+fn python2_source(text: &str) -> bool {
+    text.lines().map(str::trim_start).any(|l| {
+        l.strip_prefix("print ").is_some_and(|r| r.starts_with(['"', '\''])) || (l.starts_with("except ") && l.contains(", ") && l.trim_end().ends_with(':') && !l.contains('('))
+    })
 }
 
 /// A library's dynamic symbols: what it offers to others and what it expects from them.
@@ -118,7 +147,14 @@ pub fn symbols(path: &Path) -> Option<Symbols> {
 
 /// Whether the file holds these bytes anywhere.
 pub fn contains(path: &Path, needle: &[u8]) -> bool {
+    contains_groups(path, &[&[needle]])
+}
+
+/// Whether the file holds, for every group, at least one of its byte strings; read once.
+pub fn contains_groups(path: &Path, groups: &[&[&[u8]]]) -> bool {
     let Ok(mut f) = File::open(path) else { return false };
+    let longest = groups.iter().flat_map(|g| g.iter()).map(|n| n.len()).max().unwrap_or(1);
+    let mut found = vec![false; groups.len()];
     let mut buf = vec![0u8; 1 << 20];
     let mut carry = 0;
     loop {
@@ -127,10 +163,13 @@ pub fn contains(path: &Path, needle: &[u8]) -> bool {
             return false;
         }
         let end = carry + n;
-        if buf[..end].windows(needle.len()).any(|w| w == needle) {
+        for (g, group) in groups.iter().enumerate() {
+            found[g] = found[g] || group.iter().any(|needle| buf[..end].windows(needle.len()).any(|w| w == *needle));
+        }
+        if found.iter().all(|&f| f) {
             return true;
         }
-        carry = (needle.len() - 1).min(end);
+        carry = (longest - 1).min(end);
         buf.copy_within(end - carry..end, 0);
     }
 }
@@ -165,6 +204,7 @@ fn elf(f: &mut File, h: &[u8]) -> Option<Elf> {
     };
     let wide = bits == 64;
     let machine = u16le(h, 18);
+    let kind = u16le(h, 16);
     let (phoff, phentsize, phnum) = if wide {
         (u64le(h, 32), u16le(h, 54) as usize, u16le(h, 56) as usize)
     } else {
@@ -229,7 +269,13 @@ fn elf(f: &mut File, h: &[u8]) -> Option<Elf> {
         }
     }
 
-    Some(Elf { bits, machine, program, needed, rpath, runpath, exec_stack })
+    // A static program has no interpreter and no dynamic section (UPX-packed ones look like that).
+    let program = program || (kind == 2 && dynamic.is_none());
+    let mut start = Vec::new();
+    f.seek(SeekFrom::Start(0)).ok()?;
+    f.take(4096).read_to_end(&mut start).ok()?;
+    let packed = start.windows(4).any(|w| w == b"UPX!");
+    Some(Elf { bits, machine, program, needed, rpath, runpath, packed, exec_stack })
 }
 
 fn pe(f: &mut File, h: &[u8]) -> Option<Pe> {
@@ -256,4 +302,16 @@ fn pe(f: &mut File, h: &[u8]) -> Option<Pe> {
         .find(|(marker, _)| stub.windows(marker.len()).any(|w| w == marker.as_bytes()))
         .map(|(_, name)| name);
     Some(Pe { bits, installer, dotnet })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn python2_statements() {
+        assert!(python2_source("import pygame\nprint \"hello\"\n"));
+        assert!(python2_source("try:\n    x()\nexcept IOError, e:\n    pass\n"));
+        assert!(!python2_source("print(\"hello\")\ntry:\n    x()\nexcept (IOError, OSError):\n    pass\n"));
+    }
 }
