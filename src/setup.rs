@@ -200,8 +200,13 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
                 env.push(("FONTCONFIG_FILE", plain_fonts()?.display().to_string()));
                 done.push("Gives its NW.js a plain font list it can read (at launch; the first start takes longer).".into());
             }
+            Problem::Alsa32(Some((pcm, ctl))) => {
+                env.push(("ALSA_CONFIG_PATH", alsa_pulse32(pcm, ctl)?));
+                done.push("Sends its 32-bit ALSA sound through Steam's runtime's PulseAudio plugin (at launch).".into());
+            }
+            Problem::Alsa32(None) => not_fixed.push("Its 32-bit ALSA sound: needs Steam's runtime (install Steam), which has a plugin that works.".into()),
             Problem::FnaLibs(libs) => not_fixed.push(format!("Its missing native libraries ({}): get FNA's fnalibs, or use the Windows download with Proton.", libs.join(", "))),
-            Problem::NoLinuxBuild | Problem::Archive(_) | Problem::WrongMachine(_) | Problem::Love { .. } | Problem::Python { .. } | Problem::Java { .. } => {}
+            Problem::NoLinuxBuild | Problem::Damaged(_) | Problem::Archive(_) | Problem::WrongMachine(_) | Problem::Love { .. } | Problem::Python { .. } | Problem::Java { .. } => {}
         }
     }
     if !preload.is_empty() {
@@ -284,6 +289,30 @@ fn plain_fonts() -> Result<PathBuf, String> {
         fs::write(&file, text).map_err(|e| e.to_string())?;
     }
     Ok(file)
+}
+
+/// ALSA settings for 32-bit games, as an ALSA_CONFIG_PATH value: the system's alsa.conf, then a
+/// file that redoes its loading hook (which reads conf.d, where PipeWire becomes the default,
+/// after every file in the path) with an override last, making the default device PulseAudio
+/// through the given plugins. Rewritten each time, as the plugins' paths come from Steam's
+/// install.
+fn alsa_pulse32(pcm: &Path, ctl: &Path) -> Result<String, String> {
+    let dir = data_home().join("gamefix");
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let (top, over) = (dir.join("alsa32.conf"), dir.join("alsa32-pulse.conf"));
+    let text = format!(
+        "# Written by gamefix for 32-bit games that play sound through ALSA: PipeWire's ALSA plugin\n# is 64-bit only here, so the default device goes to PulseAudio (which PipeWire serves).\npcm_type.pulse {{ lib \"{}\" }}\nctl_type.pulse {{ lib \"{}\" }}\npcm.!default {{ type pulse }}\nctl.!default {{ type pulse }}\n",
+        pcm.display(),
+        ctl.display()
+    );
+    fs::write(&over, text).map_err(|e| e.to_string())?;
+    let hook = format!(
+        "# Written by gamefix: alsa.conf's loading hook again, with {} last.\n@hooks [\n\t{{\n\t\tfunc load\n\t\tfiles [\n\t\t\t\"/var/lib/alsa/conf.d\"\n\t\t\t\"/usr/etc/alsa/conf.d\"\n\t\t\t\"/etc/alsa/conf.d\"\n\t\t\t\"/etc/asound.conf|||/usr/etc/asound.conf\"\n\t\t\t\"~/.asoundrc\"\n\t\t\t\"~/.config/alsa/asoundrc\"\n\t\t\t\"{}\"\n\t\t]\n\t\terrors false\n\t}}\n]\n",
+        over.display(),
+        over.display()
+    );
+    fs::write(&top, hook).map_err(|e| e.to_string())?;
+    Ok(format!("/usr/share/alsa/alsa.conf:{}", top.display()))
 }
 
 /// Writes the game's app-menu entry running `exec` (already quoted) in `workdir`.

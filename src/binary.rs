@@ -19,6 +19,9 @@ pub enum Binary {
     /// A zip, tar or 7z archive: the game may still be packed inside.
     Archive,
     Python(Python),
+    /// A Linux program whose bytes above 0x7F were each replaced with U+FFFD's UTF-8 (EF BF BD):
+    /// it went through a text conversion on the developer's side and can't run.
+    Damaged,
 }
 
 pub struct Python {
@@ -59,7 +62,11 @@ pub fn identify(path: &Path) -> Option<Binary> {
     let head = &head[..n];
     let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
     if head.starts_with(b"\x7fELF") && n == 64 {
-        elf(&mut f, head).map(Binary::Elf)
+        match elf(&mut f, head) {
+            Some(elf) => Some(Binary::Elf(elf)),
+            None if head.windows(3).any(|w| w == b"\xef\xbf\xbd") => Some(Binary::Damaged),
+            None => None,
+        }
     } else if head.starts_with(b"MZ") && n == 64 {
         pe(&mut f, head).map(Binary::Pe)
     } else if head.starts_with(b"#!") && ext != "py" {
@@ -162,22 +169,27 @@ pub fn contains(path: &Path, needle: &[u8]) -> bool {
 
 /// Whether the file holds, for every group, at least one of its byte strings; read once.
 pub fn contains_groups(path: &Path, groups: &[&[&[u8]]]) -> bool {
-    let Ok(mut f) = File::open(path) else { return false };
-    let longest = groups.iter().flat_map(|g| g.iter()).map(|n| n.len()).max().unwrap_or(1);
+    find_groups(path, groups).iter().all(|&f| f)
+}
+
+/// For each group, whether the file holds at least one of its byte strings; read once.
+pub fn find_groups(path: &Path, groups: &[&[&[u8]]]) -> Vec<bool> {
     let mut found = vec![false; groups.len()];
+    let Ok(mut f) = File::open(path) else { return found };
+    let longest = groups.iter().flat_map(|g| g.iter()).map(|n| n.len()).max().unwrap_or(1);
     let mut buf = vec![0u8; 1 << 20];
     let mut carry = 0;
     loop {
-        let Ok(n) = f.read(&mut buf[carry..]) else { return false };
+        let Ok(n) = f.read(&mut buf[carry..]) else { return found };
         if n == 0 {
-            return false;
+            return found;
         }
         let end = carry + n;
         for (g, group) in groups.iter().enumerate() {
             found[g] = found[g] || group.iter().any(|needle| buf[..end].windows(needle.len()).any(|w| w == *needle));
         }
         if found.iter().all(|&f| f) {
-            return true;
+            return found;
         }
         carry = (longest - 1).min(end);
         buf.copy_within(end - carry..end, 0);
@@ -256,6 +268,9 @@ fn elf(f: &mut File, h: &[u8]) -> Option<Elf> {
                 1 => names.push(val),
                 15 => rpaths.push(val),
                 29 => runpaths.push(val),
+                // DT_FLAGS_1 with DF_1_PIE: a static-pie program has it and no interpreter
+                // (AppImages with the new static runtime, OpenRA).
+                0x6fff_fffb if val & 0x0800_0000 != 0 => program = true,
                 5 => strtab = val,
                 10 => strsz = val,
                 _ => {}

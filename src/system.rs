@@ -2,7 +2,7 @@
 //! Steam's runtime for older games.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub struct System {
@@ -40,6 +40,13 @@ impl OldRuntime {
 
     pub fn has(&self, name: &str, bits: u8) -> bool {
         has(&self.libs, name, bits)
+    }
+
+    /// Its 32-bit ALSA plugins for PulseAudio (pcm, ctl), which PipeWire also serves.
+    pub fn alsa_pulse32(&self) -> Option<(PathBuf, PathBuf)> {
+        let dir = self.dir.join("usr/lib/i386-linux-gnu/alsa-lib");
+        let (pcm, ctl) = (dir.join("libasound_module_pcm_pulse.so"), dir.join("libasound_module_ctl_pulse.so"));
+        (pcm.is_file() && ctl.is_file()).then_some((pcm, ctl))
     }
 
     /// Where the runtime keeps a library, for preloading it.
@@ -114,6 +121,14 @@ impl System {
         }
         let path = std::env::var_os("PATH").unwrap_or_default();
         std::env::split_paths(&path).map(|d| d.join("love")).find(|l| l.is_file()).map(|l| vec![l.display().to_string()])
+    }
+
+    /// Whether 32-bit programs find no sound device through ALSA: its default device is
+    /// PipeWire's plugin, which Fedora and Bazzite only install in 64-bit.
+    pub fn alsa32_broken(&self) -> bool {
+        let pipewire_default = ["/etc/alsa/conf.d/99-pipewire-default.conf", "/usr/share/alsa/alsa.conf.d/99-pipewire-default.conf"].iter().any(|p| Path::new(p).exists());
+        let plugin32 = ["/usr/lib/alsa-lib", "/usr/lib/i386-linux-gnu/alsa-lib", "/usr/lib32/alsa-lib"].iter().any(|d| Path::new(d).join("libasound_module_pcm_pipewire.so").exists());
+        pipewire_default && !plugin32
     }
 
     pub fn refuses_exec_stack(&self) -> bool {

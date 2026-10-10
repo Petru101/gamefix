@@ -14,6 +14,8 @@ pub enum Problem {
     /// Nothing to run, but an archive the game may still be packed in (C-Dogs SDL: a .tar.gz
     /// inside the .zip).
     Archive(PathBuf),
+    /// The Linux program is there but damaged (went through a text conversion): no fixing it.
+    Damaged(PathBuf),
     /// A .love file: needs the LÖVE version it was made for; `love` is how to start an installed one.
     Love { file: PathBuf, version: Option<String>, love: Option<Vec<String>> },
     /// Python code: needs Python (2 is gone from current systems) and maybe pygame.
@@ -54,6 +56,9 @@ pub enum Problem {
     /// the system's SDL2 is sdl2-compat on top of SDL3: C-Dogs SDL crashed with that mix and
     /// runs with the runtime's own SDL2 preloaded. That library's path.
     Sdl2Mix(String),
+    /// Sound only through ALSA in a 32-bit game, without a 32-bit plugin for ALSA's default
+    /// device; the runtime's PulseAudio plugins (pcm, ctl) if there.
+    Alsa32(Option<(PathBuf, PathBuf)>),
     /// .NET Core before 5 only looks for older ICU versions than current systems have, and
     /// quits at start (The Heart's Illumination, 2.1).
     DotnetIcu(String),
@@ -145,9 +150,10 @@ pub fn check(game: &Game, system: &System) -> Report {
                 let (v2, pygame) = python.fold((false, false), |(v2, pg), p| (v2 || p.v2, pg || p.pygame));
                 problems.push(Problem::Python { file: f.path.clone(), v2, pygame });
             }
-            None => problems.push(match game.archive {
-                Some(i) => Problem::Archive(game.files[i].path.clone()),
-                None => Problem::NoLinuxBuild,
+            None => problems.push(match (game.files.iter().find(|f| matches!(f.binary, Binary::Damaged)), game.archive) {
+                (Some(f), _) => Problem::Damaged(f.path.clone()),
+                (None, Some(i)) => Problem::Archive(game.files[i].path.clone()),
+                (None, None) => Problem::NoLinuxBuild,
             }),
         }
         report.problems = problems;
@@ -255,6 +261,16 @@ pub fn check(game: &Game, system: &System) -> Report {
     }
     if let Some(sdl2) = sdl2_mix {
         problems.push(Problem::Sdl2Mix(sdl2.display().to_string()));
+    }
+
+    // A 32-bit game that can only play sound through ALSA (nothing in it knows PulseAudio or
+    // PipeWire) finds no device where ALSA's default is the 64-bit-only PipeWire plugin.
+    // RogueBox's bundled pygame (SDL 1.2) then quits loading its first sound.
+    if elf.bits == 32 && system.alsa32_broken() {
+        let (alsa, pulse) = same.iter().map(|(p, _)| binary::find_groups(&game.root.join(p), &[&[b"libasound"], &[b"libpulse", b"libpipewire"]])).fold((false, false), |(a, p), f| (a || f[0], p || f[1]));
+        if alsa && !pulse {
+            problems.push(Problem::Alsa32(system.old_runtime.as_ref().and_then(|r| r.alsa_pulse32())));
+        }
     }
 
     // glibc only refuses to make the stack executable for libraries loaded later; if the program
@@ -490,6 +506,9 @@ impl Report {
                 .map(|e| format!(", {}{}", e.name, e.version.as_ref().map(|v| format!(" {v}")).unwrap_or_default()))
                 .unwrap_or_default();
             let _ = writeln!(out, "  Runs:  {} (Linux, {}-bit{engine})", main.path.display(), elf.bits);
+            if let Some(l) = game.launcher() {
+                let _ = writeln!(out, "  Start: {} (the developer's launcher: it sets where the game's libraries are)", l.path.display());
+            }
         } else if let Some(Binary::Pe(pe)) = game.windows.map(|i| &game.files[i].binary) {
             let engine = game.engine.as_ref().map(|e| format!(", {}{}", e.name, e.version.as_ref().map(|v| format!(" {v}")).unwrap_or_default())).unwrap_or_default();
             let _ = writeln!(out, "  Runs:  {} (Windows, {}-bit{engine})", game.files[game.windows.unwrap()].path.display(), pe.bits);
@@ -554,6 +573,15 @@ impl Report {
                         let _ = writeln!(out, "    Fix: run {} with Proton: gamefix setup --steam adds it to Steam that way.", game.files[i].path.display());
                     } else if !self.installers.is_empty() {
                         let _ = writeln!(out, "    It's an installer: run it with Proton first, then check the folder it installs to.");
+                    }
+                }
+                Problem::Damaged(file) => {
+                    let _ = writeln!(out, "✗ The Linux program is damaged in the download itself: {}", file.display());
+                    let _ = writeln!(out, "  It was saved as text somewhere along the way (every byte above 127 became the \"unknown");
+                    let _ = writeln!(out, "  character\" mark), so it can't run. Downloading it again won't help; only the developer");
+                    let _ = writeln!(out, "  can fix it by uploading it again.");
+                    if let Some(i) = game.windows {
+                        let _ = writeln!(out, "    Fix: run {} with Proton instead: gamefix setup --steam adds it to Steam that way.", game.files[i].path.display());
                     }
                 }
                 Problem::Love { file, version, love } => {
@@ -666,6 +694,17 @@ impl Report {
                     let _ = writeln!(out, "✗ SDL2 add-ons from Steam's runtime were built for the real SDL2, but this system's SDL2");
                     let _ = writeln!(out, "  is sdl2-compat (SDL3 underneath); some games crash with that mix (C-Dogs SDL did).");
                     let _ = writeln!(out, "    Fix (at launch): LD_PRELOAD={path} (the runtime's own SDL2)");
+                }
+                Problem::Alsa32(plugins) => {
+                    let _ = writeln!(out, "✗ It plays sound only through ALSA, as a 32-bit program, and this system has no 32-bit");
+                    let _ = writeln!(out, "  plugin for ALSA's default device (PipeWire's comes in 64-bit only). It gets no sound,");
+                    let _ = writeln!(out, "  and some games quit (RogueBox Adventures does, loading its first sound).");
+                    if plugins.is_some() {
+                        let _ = writeln!(out, "    Fix (at launch): an ALSA setting that sends its sound through Steam's runtime's 32-bit");
+                        let _ = writeln!(out, "    PulseAudio plugin (PipeWire plays it).");
+                    } else {
+                        let _ = writeln!(out, "    Fix: Steam's runtime has a 32-bit plugin that would work; install Steam to get it.");
+                    }
                 }
                 Problem::DotnetIcu(version) => {
                     let _ = writeln!(out, "✗ It's built on .NET Core {version}, which only looks for older versions of the ICU library");

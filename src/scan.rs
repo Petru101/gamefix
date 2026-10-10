@@ -145,7 +145,7 @@ fn walk(root: &Path, rel: &Path, depth: usize, out: &mut Vec<Found>) {
                 Binary::Pe(_) => is_exe,
                 Binary::Script => depth <= 2,
                 Binary::Love | Binary::Jar | Binary::Python(_) | Binary::Archive => depth <= 1,
-                Binary::Elf(_) => true,
+                Binary::Elf(_) | Binary::Damaged => true,
             };
             if keep {
                 out.push(Found { path, binary });
