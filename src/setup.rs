@@ -88,13 +88,14 @@ fn icon(game: &Game, main: &Path) -> String {
 pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome, String> {
     let Some((main, _)) = game.main() else {
         // A game another program runs: that program and the file to give it.
+        let java_audio = crate::check::uses_java_sound(game);
         let runner = report.problems.iter().find_map(|p| match p {
-            Problem::Java { file, java: Some(java) } if file.extension().is_some_and(|e| e == "jar") => Some((vec![java.display().to_string(), "-jar".into()], file, "Java")),
+            Problem::Java { file, java: Some(java) } if file.extension().is_some_and(|e| e == "jar") => Some((java_sound(vec![java.display().to_string(), "-jar".into()], java_audio), file, "Java")),
             // A Processing export's script runs plain `java`, which may be Homebrew's, off the
             // PATH menu entries get; and its exec bit is often lost.
             Problem::Java { file, java: Some(java) } => {
                 let dir = java.parent().map(|d| d.display().to_string()).unwrap_or_default();
-                Some((vec!["env".into(), format!("PATH={dir}:/usr/bin:/bin"), "/bin/sh".into()], file, "Java"))
+                Some((java_sound(vec!["env".into(), format!("PATH={dir}:/usr/bin:/bin"), "/bin/sh".into()], java_audio), file, "Java"))
             }
             Problem::Love { file, version, love: Some(love) } if !crate::check::old_love(version.as_deref()) => Some((love.clone(), file, "LÖVE")),
             // Flathub's Ruffle sees only the home folder; give it the game's folder too.
@@ -276,6 +277,10 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
                 env.push(("ALSA_CONFIG_PATH", alsa_pulse32(pcm, ctl)?));
                 done.push("Sends its 32-bit ALSA sound through Steam's runtime's PulseAudio plugin (at launch).".into());
             }
+            Problem::JavaSound(plugin) => {
+                env.push(("ALSA_CONFIG_PATH", java_sound_conf(plugin)?));
+                done.push("Sends its Java's own sound to PipeWire (at launch).".into());
+            }
             Problem::OldPulse(server) => {
                 env.push(("PULSE_SERVER", server.clone()));
                 done.push("Tells its old PulseAudio library where the sound server is (at launch).".into());
@@ -411,6 +416,38 @@ fn alsa_pulse32(pcm: &Path, ctl: &Path) -> Result<String, String> {
     );
     fs::write(&file, text).map_err(|e| e.to_string())?;
     Ok(file.display().to_string())
+}
+
+/// Java's own sound for a game gamefix starts with Java: the command with the ALSA setting in
+/// front, when PipeWire's plugin is there (else, or if the setting can't be written, as it was).
+fn java_sound(command: Vec<String>, needed: bool) -> Vec<String> {
+    if !needed {
+        return command;
+    }
+    let Some(conf) = crate::system::System::load().pipewire_alsa(64).and_then(|p| java_sound_conf(&p).ok()) else { return command };
+    let setting = format!("ALSA_CONFIG_PATH={conf}");
+    match command.first().map(String::as_str) {
+        Some("env") => [vec!["env".into(), setting], command[1..].to_vec()].concat(),
+        _ => [vec!["env".into(), setting], command].concat(),
+    }
+}
+
+/// ALSA settings for Java's own sound, as an ALSA_CONFIG_PATH value: the system's alsa.conf,
+/// then PipeWire's plugin named by path (Homebrew's ALSA library only looks in its own folder)
+/// and the card's names (hw, plughw), which Java opens directly, sent to PipeWire. Tested:
+/// Dial, Black & White and a tone at the expected level.
+fn java_sound_conf(plugin: &Path) -> Result<String, String> {
+    let file = data_home().join("gamefix/java-sound.conf");
+    fs::create_dir_all(file.parent().unwrap()).map_err(|e| e.to_string())?;
+    let card = |kind: &str, body: &str| format!("pcm.!{kind} {{\n\t@args [ CARD DEV SUBDEV ]\n\t@args.CARD {{ type string default \"0\" }}\n\t@args.DEV {{ type integer default 0 }}\n\t@args.SUBDEV {{ type integer default -1 }}\n{body}}}\n");
+    let text = format!(
+        "# Written by gamefix for Java games: Java's own sound opens the card (hw, plughw), which PipeWire holds;\n# these send it to PipeWire instead.\npcm_type.pipewire {{ lib \"{}\" }}\n{}{}",
+        plugin.display(),
+        card("hw", "\ttype pipewire\n\tplayback_node \"-1\"\n\tcapture_node \"-1\"\n"),
+        card("plughw", "\ttype plug\n\tslave.pcm \"hw\"\n")
+    );
+    fs::write(&file, text).map_err(|e| e.to_string())?;
+    Ok(format!("/usr/share/alsa/alsa.conf:{}", file.display()))
 }
 
 /// Writes the game's app-menu entry running `exec` (already quoted) in `workdir`.

@@ -72,6 +72,9 @@ pub enum Problem {
     /// A bundled libpulse older than 1.0, which can't find the sound server by itself; the
     /// server's address for PULSE_SERVER.
     OldPulse(String),
+    /// The game brings its own Java, whose sound (javax.sound) opens the card itself and gets
+    /// nothing while PipeWire holds it; PipeWire's ALSA plugin to send it there.
+    JavaSound(PathBuf),
     /// The game's own copy of a library the system also has, loaded first, older than what a
     /// system library loaded with it expects: (the copy, the system library, a function the
     /// copy lacks, the system's copy to preload).
@@ -374,6 +377,11 @@ pub fn check(game: &Game, system: &System) -> Report {
         }
     }
 
+    // A bundled Java: its own sound opens the card directly (see System::pipewire_alsa).
+    if let Some(plugin) = (game.files.iter().any(|f| f.path.file_name().is_some_and(|n| n == "libjsound.so")) && uses_java_sound(game)).then(|| system.pipewire_alsa(elf.bits)).flatten() {
+        problems.push(Problem::JavaSound(plugin));
+    }
+
     // A 32-bit game that can only play sound through ALSA (nothing in it knows PulseAudio or
     // PipeWire) finds no device where ALSA's default is the 64-bit-only PipeWire plugin.
     // RogueBox's bundled pygame (SDL 1.2) then quits loading its first sound.
@@ -536,6 +544,18 @@ fn net_standard(dir: &Path) -> Vec<String> {
         .collect();
     out.sort();
     out
+}
+
+/// Whether a Java game plays sound with Java's own (javax.sound: Processing's Minim, JSyn)
+/// rather than OpenAL: LWJGL and libGDX carry OpenAL's native library in their jars
+/// (libopenal64.so, OpenAL64.dll), and the jar's file names are stored as they are.
+pub fn uses_java_sound(game: &Game) -> bool {
+    let jars = || std::iter::once(game.root.clone()).chain(game.files.iter().filter_map(|f| f.path.parent().map(|d| game.root.join(d)))).collect::<BTreeSet<_>>();
+    let openal = jars().iter().flat_map(|d| std::fs::read_dir(d).into_iter().flatten().flatten()).map(|e| e.path()).chain(game.files.iter().map(|f| game.full(f))).any(|p| {
+        let name = p.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+        name.starts_with("libopenal") || (name.ends_with(".jar") && binary::contains(&p, b"libopenal"))
+    });
+    !openal
 }
 
 /// The PulseAudio socket (PipeWire's pulse server), as PULSE_SERVER takes it.
@@ -928,7 +948,8 @@ impl Report {
                 }
                 Problem::Java { file, java: Some(java) } => {
                     let _ = writeln!(out, "• This is a Processing game; its script {} starts it with Java ({}).", file.display(), java.display());
-                    let _ = writeln!(out, "  gamefix setup adds that to the app menu.");
+                    let _ = writeln!(out, "  gamefix setup adds that to the app menu, with Java's own sound sent to PipeWire (it would");
+                    let _ = writeln!(out, "  open the sound card directly, which PipeWire already holds, and get none).");
                     let (applet, only32) = scan::processing_notes(&game.root, file);
                     let lts = java.to_string_lossy().contains("/openjdk@");
                     if applet && !lts {
@@ -998,6 +1019,11 @@ impl Report {
                             let _ = writeln!(out, "    Fix (at launch): preload the system's copy (not found here).");
                         }
                     }
+                }
+                Problem::JavaSound(_) => {
+                    let _ = writeln!(out, "✗ It brings its own Java, and Java's own sound opens the sound card directly, which PipeWire");
+                    let _ = writeln!(out, "  already holds: no sound (Dial, Black & White, Rainbeats had none).");
+                    let _ = writeln!(out, "    Fix (at launch): an ALSA setting for this game that sends Java's sound to PipeWire.");
                 }
                 Problem::OldPulse(server) => {
                     let _ = writeln!(out, "✗ It brings its own PulseAudio library from before 2011, which doesn't know where today's");

@@ -161,6 +161,16 @@ impl System {
         std::env::split_paths(&path).map(|d| d.join("ruffle")).find(|l| l.is_file()).map(|l| vec![l.display().to_string()])
     }
 
+    /// PipeWire's ALSA plugin for this many bits, when ALSA's default goes to PipeWire. Java's
+    /// own sound needs it named by path: it opens the card itself (hw/plughw, which PipeWire
+    /// holds), and Homebrew's Java brings an ALSA library that only looks in Homebrew's folder.
+    pub fn pipewire_alsa(&self, bits: u8) -> Option<PathBuf> {
+        let pipewire_default = ["/etc/alsa/conf.d/99-pipewire-default.conf", "/usr/share/alsa/alsa.conf.d/99-pipewire-default.conf"].iter().any(|p| Path::new(p).exists());
+        let dirs: &[&str] = if bits == 64 { &["/usr/lib64/alsa-lib", "/usr/lib/x86_64-linux-gnu/alsa-lib"] } else { &["/usr/lib/alsa-lib", "/usr/lib/i386-linux-gnu/alsa-lib", "/usr/lib32/alsa-lib"] };
+        let plugin = dirs.iter().map(|d| Path::new(d).join("libasound_module_pcm_pipewire.so")).find(|p| p.is_file());
+        plugin.filter(|_| pipewire_default)
+    }
+
     pub fn refuses_exec_stack(&self) -> bool {
         self.glibc.is_some_and(|v| v >= (2, 41))
     }
