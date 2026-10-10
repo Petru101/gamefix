@@ -21,7 +21,7 @@ fn installed_binary() -> PathBuf {
 }
 
 /// Game folders, Linux programs (some games' are marked as libraries) and Windows programs.
-const MIME_TYPES: &str = "inode/directory;application/x-executable;application/x-pie-executable;application/x-sharedlib;application/vnd.microsoft.portable-executable;application/x-ms-dos-executable;application/x-msdownload;";
+const MIME_TYPES: &str = "inode/directory;application/x-executable;application/x-pie-executable;application/x-sharedlib;application/vnd.microsoft.portable-executable;application/x-ms-dos-executable;application/x-msdownload;application/x-cd-image;application/vnd.efi.iso;";
 
 const ACTIONS: [(&str, &str, &str, &str); 5] = [
     ("check", "Check what's wrong", "dialog-information", "check"),

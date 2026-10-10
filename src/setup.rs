@@ -126,6 +126,10 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
             Problem::Love { file, version: Some(v), .. } if crate::check::old_love(Some(v)) => crate::love::build_for(v).map(|b| (file, b)),
             _ => None,
         });
+        let disc = report.problems.iter().find_map(|p| match p {
+            Problem::Disc { file, installer: Some(installer), .. } => Some(Installer::Disc { iso: game.root.join(file), inside: installer.clone() }),
+            _ => None,
+        });
         return match game.windows {
             Some(i) => setup_windows(game, report, &game.files[i], targets),
             None if runner.is_some() => {
@@ -139,6 +143,9 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
                 outcome.done.splice(0..0, note);
                 Ok(outcome)
             }
+            None if disc.is_some() => setup_install(game, disc.unwrap(), targets),
+            None if !report.installers.is_empty() => setup_install(game, Installer::File(game.root.join(&report.installers[0].0)), targets),
+            None if report.problems.iter().any(|p| matches!(p, Problem::Disc { .. })) => Err("No installer was found on the disc image (see gamefix check).".into()),
             None if report.problems.iter().any(|p| matches!(p, Problem::Archive(_))) => Err("The game is still packed in an archive: unpack it, then set up the folder it makes.".into()),
             None if report.problems.iter().any(|p| matches!(p, Problem::Web(_))) => Err("It's a web game: play it on its itch.io page.".into()),
             None if report.problems.iter().any(|p| matches!(p, Problem::Source(..))) => Err("This is the game's source code: it has to be built first.".into()),
@@ -347,7 +354,7 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
             Problem::Alsa32(None) => not_fixed.push("Its 32-bit ALSA sound: needs Steam's runtime (install Steam), which has a plugin that works.".into()),
             Problem::KickFiles(files) => not_fixed.push(format!("Its missing Mono files ({}): only the developer can add them; the .exe with Proton works.", files.join(", "))),
             Problem::FnaLibs(libs) => not_fixed.push(format!("Its missing native libraries ({}): get FNA's fnalibs, or use the Windows download with Proton.", libs.join(", "))),
-            Problem::NoLinuxBuild | Problem::OwnWindowsDlls(_) | Problem::MissingWindowsParts(_) | Problem::Source(..) | Problem::Web(_) | Problem::Damaged(_) | Problem::Package(..) | Problem::Flash { .. } | Problem::Dos { .. } | Problem::Archive(_) | Problem::WrongMachine(_) | Problem::Love { .. } | Problem::Python { .. } | Problem::Java { .. } => {}
+            Problem::NoLinuxBuild | Problem::OwnWindowsDlls(_) | Problem::MissingWindowsParts(_) | Problem::Source(..) | Problem::Web(_) | Problem::Damaged(_) | Problem::Package(..) | Problem::Flash { .. } | Problem::Dos { .. } | Problem::Disc { .. } | Problem::Archive(_) | Problem::WrongMachine(_) | Problem::Love { .. } | Problem::Python { .. } | Problem::Java { .. } => {}
         }
     }
     if !preload.is_empty() {
@@ -605,6 +612,122 @@ fn program_path(name: &str) -> Option<PathBuf> {
     }
     let path = std::env::var_os("PATH").unwrap_or_default();
     std::env::split_paths(&path).map(|d| d.join(name)).find(|p| p.is_file())
+}
+
+/// What a Windows game is installed from.
+enum Installer {
+    /// A disc image and the installer's path on it.
+    Disc { iso: PathBuf, inside: String },
+    File(PathBuf),
+}
+
+/// In a folder setup_install installed a game into: what from, the program, its name.
+const INSTALL_NOTE: &str = "gamefix-install.txt";
+
+/// A Windows game that has to be installed first (a disc image, an installer): runs the
+/// installer once with Proton (umu-run, with the Proton Steam will use) in a prefix of its own
+/// in ~/Games, then adds the installed program to Steam, with launch options pointing Steam at
+/// that prefix (its registry and saves are there). Undo leaves the installed game.
+fn setup_install(game: &Game, installer: Installer, targets: &Targets) -> Result<Outcome, String> {
+    if !targets.steam {
+        return Err("Windows games can only be set up in Steam for now: add --steam.".into());
+    }
+    let steam = Steam::find().ok_or("Steam isn't installed, or nobody has logged in to it yet.")?;
+    if steam.running() {
+        return Err(STEAM_OPEN.into());
+    }
+    let tool = steam.proton().ok_or("No Proton is installed in Steam: install Proton Experimental (Library → Tools), then set it up again.")?;
+    let tool_dir = steam.tool_dir(&tool).ok_or(format!("Couldn't find where {tool} is installed."))?;
+    let source = match &installer {
+        Installer::Disc { iso, .. } => iso.clone(),
+        Installer::File(file) => file.clone(),
+    };
+    // A game an earlier setup installed from the same disc or installer (undo leaves it) is
+    // used again: its folder in ~/Games names its source in gamefix-install.txt.
+    let games = PathBuf::from(std::env::var_os("HOME").ok_or("No home folder.")?).join("Games");
+    let earlier = fs::read_dir(&games).into_iter().flatten().flatten().find_map(|entry| {
+        let text = fs::read_to_string(entry.path().join(INSTALL_NOTE)).ok()?;
+        let field = |key: &str| text.lines().find_map(|l| l.strip_prefix(key)?.strip_prefix('\t').map(String::from));
+        let exe = entry.path().join(field("program")?);
+        (Path::new(&field("source")?) == source && exe.is_file()).then(|| (entry.path(), exe, field("name").unwrap_or_else(|| game.name.clone())))
+    });
+    if record_path(game).exists() {
+        undo(game)?;
+    }
+    let mut done = Vec::new();
+    let mut not_fixed = Vec::new();
+    let (prefix, exe, name) = match earlier {
+        Some(found) => found,
+        None => {
+            let umu = program_path("umu-run").ok_or("umu-run (umu-launcher) is needed to run the installer with Proton.")?;
+            let free = |base: &str| (1..).map(|n| games.join(if n == 1 { base.to_string() } else { format!("{base}-{n}") })).find(|d| !d.exists()).unwrap();
+            let prefix = free(&slug(&game.name));
+            fs::create_dir_all(&prefix).map_err(|e| e.to_string())?;
+            let (setup, unpacked) = match &installer {
+                Installer::Disc { iso, inside } => {
+                    let dir = std::env::temp_dir().join(format!("gamefix-disc-{}", std::process::id()));
+                    crate::disc::unpack(iso, &dir)?;
+                    (dir.join(inside), Some(dir))
+                }
+                Installer::File(file) => (file.clone(), None),
+            };
+            let status = std::process::Command::new(&umu)
+                .arg(&setup)
+                .current_dir(setup.parent().unwrap_or(Path::new("/")))
+                .env("WINEPREFIX", &prefix)
+                .env("PROTONPATH", &tool_dir)
+                .env("GAMEID", "umu-0")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            crate::disc::wait_for_prefix(&prefix);
+            if let Some(dir) = unpacked {
+                let _ = fs::remove_dir_all(dir);
+            }
+            status.map_err(|e| format!("Couldn't start the installer with umu-run: {e}"))?;
+            let Some((rel, name)) = crate::disc::installed_program(&prefix.join("pfx"), &game.name) else {
+                // Only Wine's own files: the prefix was made just now, for this.
+                let _ = fs::remove_dir_all(&prefix);
+                return Err("The installer finished, but it installed no game (was it cancelled?). Nothing was changed.".into());
+            };
+            // Named after the game now that its name is known (Bookworm Deluxe, not the download's).
+            let named = free(&slug(&name));
+            let prefix = if fs::rename(&prefix, &named).is_ok() { named } else { prefix };
+            let note = format!("source\t{}\nprogram\t{}\nname\t{name}\n", source.display(), rel.display());
+            fs::write(prefix.join(INSTALL_NOTE), note).map_err(|e| e.to_string())?;
+            done.push(format!("Installed it with {tool} into {}.", prefix.display()));
+            (prefix.clone(), prefix.join(rel), name)
+        }
+    };
+    let record_file = record_path(game);
+    fs::create_dir_all(record_file.parent().unwrap()).map_err(|e| e.to_string())?;
+    let mut record = vec![format!("installed-game\t{}\t{}\t{name}", prefix.display(), exe.display())];
+    fs::write(&record_file, record.join("\n") + "\n").map_err(|e| e.to_string())?;
+    if steam.running() {
+        return Err(format!("Steam was opened while it installed. Close Steam and set it up again: the installed game in {} is used, not installed twice.", prefix.display()));
+    }
+    let own = proton::ignored_dlls(&exe);
+    let mut env = vec![("STEAM_COMPAT_DATA_PATH", prefix.display().to_string())];
+    add_overrides(&mut env, &own);
+    let line = launch_options(&env, &[], false, "");
+    let shortcuts = steam.shortcuts();
+    let workdir = exe.parent().unwrap_or(&prefix);
+    let shortcut = steam::Shortcut { name: &name, exe: &exe, start_dir: workdir, icon: "", launch_options: &line };
+    let appid = steam::add_shortcut(&shortcuts, &shortcut)?;
+    record.push(format!("steam-shortcut\t{appid}\t{}", shortcuts.display()));
+    let config = steam.config();
+    let previous = steam::compat_tool(&config, appid)?;
+    steam::set_compat_tool(&config, appid, Some(&tool))?;
+    record.push(format!("steam-compat\t{appid}\t{}\t{}", config.display(), previous.map_or("-".to_string(), |p| format!("={p}"))));
+    fs::write(&record_file, record.join("\n") + "\n").map_err(|e| e.to_string())?;
+    done.push(format!("Added \"{name}\" to Steam as a non-Steam game, run with {tool} in that folder's Wine prefix."));
+    if !own.is_empty() {
+        done.push(format!("Wine uses the game's own {} instead of its built-in copy, as Windows would.", dll_files(&own)));
+    }
+    if targets.menu {
+        not_fixed.push("App-menu entries for Windows games aren't supported yet; start it from Steam.".into());
+    }
+    Ok(Outcome { done, not_fixed })
 }
 
 /// JOGL's 64-bit native jars for the version an export carries (from its jars' manifests),
@@ -900,6 +1023,7 @@ pub fn undo(game: &Game) -> Result<Vec<String>, String> {
                     }
                 }
             }
+            ["installed-game", prefix, ..] => undone.push(format!("Left the installed game in {prefix}: delete that folder to remove it.")),
             ["steam-shortcut", appid, file] => {
                 if let Ok(appid) = appid.parse() {
                     if steam::remove_shortcut(Path::new(file), appid)? {

@@ -23,6 +23,8 @@ pub enum Binary {
     Flash,
     /// A DOS program (.exe or .com), which Wine won't run; DOSBox does.
     Dos,
+    /// A CD or DVD image (.iso): usually a Windows game's disc, to install from.
+    Disc,
     /// A distribution package (.deb or .rpm): meant to be installed into /usr.
     Package(&'static str),
     /// A Linux program whose bytes above 0x7F were each replaced with U+FFFD's UTF-8 (EF BF BD):
@@ -82,6 +84,9 @@ pub fn identify(path: &Path) -> Option<Binary> {
             None if ext == "exe" && dos(&mut f, head) => Some(Binary::Dos),
             None => None,
         }
+    } else if ext == "iso" && matches!(read_at(&mut f, 0x8001, 5).as_deref(), Some(b"CD001" | b"BEA01")) {
+        // ISO 9660 (or UDF) volume descriptors start at sector 16.
+        Some(Binary::Disc)
     } else if ext == "com" && n > 0 && !head.starts_with(b"#!") && !head.is_ascii() {
         // .COM programs have no header: just code, loaded at 0x100.
         Some(Binary::Dos)

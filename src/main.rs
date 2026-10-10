@@ -1,5 +1,6 @@
 mod binary;
 mod check;
+mod disc;
 mod fetch;
 mod love;
 mod proton;

@@ -30,6 +30,9 @@ pub enum Problem {
     Damaged(PathBuf),
     /// A Flash game (.swf); `ruffle` is how to start an installed Ruffle.
     Flash { file: PathBuf, ruffle: Option<Vec<String>> },
+    /// A disc image (.iso) and the installer on it, if one was found; None in `files` when it
+    /// couldn't be read (no 7-Zip).
+    Disc { file: PathBuf, files: Option<usize>, installer: Option<String> },
     /// A DOS game; `dosbox` is how to start an installed DOSBox.
     Dos { file: PathBuf, dosbox: Option<Vec<String>> },
     /// Only a .deb or .rpm package, which Bazzite can't simply install.
@@ -281,6 +284,13 @@ pub fn check(game: &Game, system: &System) -> Report {
                 let web = if game.windows.is_none() { web_export(&game.root) } else { None };
                 problems.push(match (damaged, game.archive, package) {
                     (Some(f), _, _) => Problem::Damaged(f.path.clone()),
+                    _ if game.disc.is_some() => {
+                        let file = game.files[game.disc.unwrap()].path.clone();
+                        let files = crate::disc::files(&game.root.join(&file));
+                        let installer = files.as_ref().and_then(|f| crate::disc::installer(&game.root.join(&file), f, &game.name));
+                        let files = files.map(|f| f.iter().filter(|f| f.to_lowercase().ends_with(".exe")).count());
+                        Problem::Disc { file, files, installer }
+                    }
                     _ if source.is_some() => {
                         let (file, kind) = source.unwrap();
                         Problem::Source(file, kind)
@@ -1050,7 +1060,8 @@ impl Report {
                             let _ = writeln!(out, "  If it won't start or can't go online, nothing on this side can change that.");
                         }
                     } else if !self.installers.is_empty() {
-                        let _ = writeln!(out, "    It's an installer: run it with Proton first, then check the folder it installs to.");
+                        let _ = writeln!(out, "    It's an installer: gamefix setup --steam runs it with Proton (you click through it");
+                        let _ = writeln!(out, "    once) and adds the game it installs to Steam.");
                     }
                 }
                 Problem::Flash { file, ruffle: Some(ruffle) } => {
@@ -1062,6 +1073,21 @@ impl Report {
                     let _ = writeln!(out, "✗ This is a Flash game ({}): Flash Player was retired in 2020.", file.display());
                     let _ = writeln!(out, "    Fix: install Ruffle from Flathub (rs.ruffle.Ruffle), which plays most Flash games; then");
                     let _ = writeln!(out, "    gamefix setup adds it to the app menu.");
+                }
+                Problem::Disc { file, installer: Some(installer), .. } => {
+                    let _ = writeln!(out, "• This is a Windows game's disc image ({}); its installer is {installer}.", file.display());
+                    let _ = writeln!(out, "  gamefix setup --steam installs it with Proton (you click through the installer once)");
+                    let _ = writeln!(out, "  and adds the installed game to Steam.");
+                }
+                Problem::Disc { file, files: None, .. } => {
+                    let _ = writeln!(out, "✗ This is a disc image ({}), and 7-Zip (7z) is needed to look inside it.", file.display());
+                }
+                Problem::Disc { file, files: Some(0), .. } => {
+                    let _ = writeln!(out, "✗ This disc image ({}) holds no Windows programs: it may be for another machine", file.display());
+                    let _ = writeln!(out, "  (a console, or an old Japanese computer), which needs an emulator.");
+                }
+                Problem::Disc { file, .. } => {
+                    let _ = writeln!(out, "✗ This disc image ({}) holds Windows programs, but none that looks like its installer.", file.display());
                 }
                 Problem::Dos { file, dosbox: Some(dosbox) } => {
                     let _ = writeln!(out, "• This is a DOS game. Proton can't run DOS programs, but DOSBox (installed) can:");

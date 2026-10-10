@@ -33,6 +33,9 @@ pub struct Game {
     /// Index into `files` of a game another program runs (a .love file, Python code), when
     /// there's no Linux program.
     pub portable: Option<usize>,
+    /// Index into `files` of a disc image to install the game from, when there's nothing else
+    /// to run.
+    pub disc: Option<usize>,
     /// Index into `files` of an archive the game may still be packed in, when there's nothing
     /// else to run.
     pub archive: Option<usize>,
@@ -115,7 +118,9 @@ pub fn scan(path: &Path) -> Option<Game> {
         // A DOS program only when nothing else runs: Windows games may carry DOS tools.
         None => pick_portable(&root, &files).or_else(|| if windows.is_none() { pick_dos(&root, &files) } else { None }),
     };
-    let archive = (main.is_none() && windows.is_none() && portable.is_none())
+    let nothing = main.is_none() && windows.is_none() && portable.is_none();
+    let disc = nothing.then(|| files.iter().enumerate().filter(|(_, f)| matches!(f.binary, Binary::Disc)).min_by_key(|(_, f)| f.path.components().count()).map(|(i, _)| i)).flatten();
+    let archive = (nothing && disc.is_none())
         .then(|| files.iter().enumerate().filter(|(_, f)| matches!(f.binary, Binary::Archive)).min_by_key(|(_, f)| f.path.components().count()).map(|(i, _)| i))
         .flatten();
     let program = main.or(windows);
@@ -128,7 +133,7 @@ pub fn scan(path: &Path) -> Option<Game> {
         .or_else(|| chosen.as_ref().filter(|_| shared_folder(&root)).map(|c| stem(c)))
         .or_else(|| root.file_name().map(|n| n.to_string_lossy().into_owned()))
         .unwrap_or_else(|| root.display().to_string());
-    Some(Game { root, name, files, main, windows, portable, archive, engine })
+    Some(Game { root, name, files, main, windows, portable, disc, archive, engine })
 }
 
 /// Folders that hold unrelated downloads rather than one game.
@@ -169,6 +174,7 @@ fn walk(root: &Path, rel: &Path, depth: usize, out: &mut Vec<Found>) {
                 Binary::Script => depth <= 2,
                 Binary::Love | Binary::Jar | Binary::Flash | Binary::Python(_) | Binary::Archive | Binary::Package(_) => depth <= 1,
                 Binary::Dos => depth <= 2,
+                Binary::Disc => depth <= 1,
                 Binary::Elf(_) | Binary::Damaged => true,
             };
             if keep {
