@@ -5,7 +5,7 @@ use crate::binary::{self, Binary, EM_386, EM_X86_64};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const MAX_DEPTH: usize = 5;
+const MAX_DEPTH: usize = 8;
 const MAX_FILES: usize = 50_000;
 
 /// Programs that ship next to games but aren't the game.

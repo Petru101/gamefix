@@ -1,12 +1,48 @@
-//! What the host has installed: its libraries (from ld.so's cache) and its glibc version.
+//! What the host has installed: its libraries (from ld.so's cache), its glibc version, and
+//! Steam's runtime for older games.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::process::Command;
 
 pub struct System {
     /// Library file name → bit 1 for 32-bit, bit 2 for 64-bit x86.
     libs: HashMap<String, u8>,
     pub glibc: Option<(u32, u32)>,
+    pub old_runtime: Option<OldRuntime>,
+}
+
+/// Steam's first runtime ("scout", Ubuntu 12.04 libraries), which every Steam install keeps for
+/// native games that need libraries newer systems dropped (libssl 1.0, libgconf, GTK 2). Steam
+/// starts native games with it by itself; elsewhere its run.sh does the same: the host's
+/// libraries first, the runtime's filling the gaps.
+pub struct OldRuntime {
+    pub run: PathBuf,
+    libs: HashMap<String, u8>,
+}
+
+impl OldRuntime {
+    fn find() -> Option<OldRuntime> {
+        let home = PathBuf::from(std::env::var_os("HOME")?);
+        // Not the Flatpak Steam's: its runtime only works inside its sandbox.
+        let dir = [".local/share/Steam", ".steam/steam"].iter().map(|p| home.join(p).join("ubuntu12_32/steam-runtime")).find(|d| d.join("run.sh").is_file())?;
+        let mut libs = HashMap::new();
+        for (sub, bit) in [("lib/i386-linux-gnu", 1), ("usr/lib/i386-linux-gnu", 1), ("lib/x86_64-linux-gnu", 2), ("usr/lib/x86_64-linux-gnu", 2)] {
+            for entry in std::fs::read_dir(dir.join(sub)).into_iter().flatten().flatten() {
+                *libs.entry(entry.file_name().to_string_lossy().into_owned()).or_insert(0) |= bit;
+            }
+        }
+        Some(OldRuntime { run: dir.join("run.sh"), libs })
+    }
+
+    pub fn has(&self, name: &str, bits: u8) -> bool {
+        has(&self.libs, name, bits)
+    }
+}
+
+fn has(libs: &HashMap<String, u8>, name: &str, bits: u8) -> bool {
+    let bit = if bits == 64 { 2 } else { 1 };
+    libs.get(name).is_some_and(|b| b & bit != 0)
 }
 
 fn run(candidates: &[&str], args: &[&str]) -> Option<String> {
@@ -37,12 +73,11 @@ impl System {
             let (major, minor) = version.split_once('.')?;
             Some((major.parse().ok()?, minor.parse().ok()?))
         });
-        System { libs, glibc }
+        System { libs, glibc, old_runtime: OldRuntime::find() }
     }
 
     pub fn has(&self, name: &str, bits: u8) -> bool {
-        let bit = if bits == 64 { 2 } else { 1 };
-        self.libs.get(name).is_some_and(|b| b & bit != 0)
+        has(&self.libs, name, bits)
     }
 
     pub fn refuses_exec_stack(&self) -> bool {

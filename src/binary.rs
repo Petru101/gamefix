@@ -20,6 +20,10 @@ pub struct Elf {
     /// Has an interpreter (ld.so), so it is a program rather than a library.
     pub program: bool,
     pub needed: Vec<String>,
+    /// Where it tells ld.so to look for those first (DT_RPATH, or DT_RUNPATH which replaces
+    /// it), as written: usually relative to its own folder through $ORIGIN.
+    pub rpath: Vec<String>,
+    pub runpath: Vec<String>,
     /// Asks for an executable stack: glibc 2.41+ refuses to dlopen such libraries.
     /// A missing PT_GNU_STACK counts, as x86 defaults to executable.
     pub exec_stack: bool,
@@ -190,16 +194,18 @@ fn elf(f: &mut File, h: &[u8]) -> Option<Elf> {
         }
     }
 
-    let mut needed = Vec::new();
+    let (mut needed, mut rpath, mut runpath) = (Vec::new(), Vec::new(), Vec::new());
     if let Some((offset, size)) = dynamic {
         let entry = if wide { 16 } else { 8 };
         let dynsec = read_at(f, offset, size.min(1 << 20) as usize)?;
-        let (mut strtab, mut strsz, mut names) = (0, 0, Vec::new());
+        let (mut strtab, mut strsz, mut names, mut rpaths, mut runpaths) = (0, 0, Vec::new(), Vec::new(), Vec::new());
         for d in dynsec.chunks_exact(entry) {
             let (tag, val) = if wide { (u64le(d, 0), u64le(d, 8)) } else { (u32le(d, 0) as u64, u32le(d, 4) as u64) };
             match tag {
                 0 => break,
                 1 => names.push(val),
+                15 => rpaths.push(val),
+                29 => runpaths.push(val),
                 5 => strtab = val,
                 10 => strsz = val,
                 _ => {}
@@ -209,17 +215,21 @@ fn elf(f: &mut File, h: &[u8]) -> Option<Elf> {
         let file_off = loads.iter().find(|(va, _, sz)| strtab >= *va && strtab < va + sz).map(|(va, off, _)| strtab - va + off);
         if let Some(off) = file_off {
             let strings = read_at(f, off, strsz.min(1 << 20) as usize)?;
-            for n in names {
+            let string = |n: u64| {
                 let start = n as usize;
-                if start < strings.len() {
+                (start < strings.len()).then(|| {
                     let end = strings[start..].iter().position(|&c| c == 0).map_or(strings.len(), |e| start + e);
-                    needed.push(String::from_utf8_lossy(&strings[start..end]).into_owned());
-                }
-            }
+                    String::from_utf8_lossy(&strings[start..end]).into_owned()
+                })
+            };
+            needed = names.into_iter().filter_map(string).collect();
+            let split = |list: Vec<u64>| list.into_iter().filter_map(string).flat_map(|s| s.split(':').filter(|d| !d.is_empty()).map(String::from).collect::<Vec<_>>()).collect();
+            rpath = split(rpaths);
+            runpath = split(runpaths);
         }
     }
 
-    Some(Elf { bits, machine, program, needed, exec_stack })
+    Some(Elf { bits, machine, program, needed, rpath, runpath, exec_stack })
 }
 
 fn pe(f: &mut File, h: &[u8]) -> Option<Pe> {

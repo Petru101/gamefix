@@ -3,7 +3,7 @@
 use crate::binary::{self, Binary, Elf, Symbols, EM_386, EM_X86_64};
 use crate::scan::{self, Game};
 use crate::system::System;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::fmt::Write;
 use std::os::unix::fs::PermissionsExt;
@@ -13,8 +13,9 @@ pub enum Problem {
     NoLinuxBuild,
     WrongMachine(u16),
     NotExecutable(PathBuf),
-    /// Library name → the game's files that need it.
-    MissingLibs { bits: u8, libs: BTreeMap<String, Vec<PathBuf>> },
+    /// Library name → the game's files that need it; and which of them Steam's runtime for
+    /// older games has.
+    MissingLibs { bits: u8, libs: BTreeMap<String, Vec<PathBuf>>, in_old_runtime: BTreeSet<String> },
     ExecStack(Vec<PathBuf>),
     /// Libraries that get another library's functions of the same name instead of the ones
     /// they were built against (Final Shot: Unity's built-in FMOD answering for the game's).
@@ -54,6 +55,8 @@ pub struct Report {
     pub windows: Vec<(PathBuf, u8)>,
     pub installers: Vec<(PathBuf, &'static str)>,
     pub glibc: Option<(u32, u32)>,
+    /// run.sh of Steam's runtime for older games, if installed.
+    pub old_runtime: Option<PathBuf>,
     /// Missing libraries only optional plugins need: what is lost, and the libraries.
     pub harmless: Vec<(&'static str, Vec<String>)>,
 }
@@ -83,7 +86,7 @@ pub fn check(game: &Game, system: &System) -> Report {
         }
     }
     let mut problems = Vec::new();
-    let mut report = Report { problems: Vec::new(), libs_checked: 0, windows, installers, glibc: system.glibc, harmless: Vec::new() };
+    let mut report = Report { problems: Vec::new(), libs_checked: 0, windows, installers, glibc: system.glibc, old_runtime: system.old_runtime.as_ref().map(|r| r.run.clone()), harmless: Vec::new() };
 
     let Some((main, elf)) = game.main() else {
         problems.push(Problem::NoLinuxBuild);
@@ -108,11 +111,16 @@ pub fn check(game: &Game, system: &System) -> Report {
         })
         .collect();
     let bundled: HashSet<&std::ffi::OsStr> = same.iter().filter_map(|(p, _)| p.file_name()).collect();
+    // The program's DT_RPATH also applies to everything it loads that has no DT_RUNPATH.
+    let main_dir = game.root.join(main.path.parent().unwrap_or(Path::new("")));
+    let main_rpath = if elf.runpath.is_empty() { expand(&elf.rpath, &main_dir) } else { Vec::new() };
     let mut missing: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
     let mut optional: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
     for (path, e) in &same {
+        let dir = game.root.join(path.parent().unwrap_or(Path::new("")));
+        let search: Vec<PathBuf> = if e.runpath.is_empty() { expand(&e.rpath, &dir).into_iter().chain(main_rpath.iter().cloned()).collect() } else { expand(&e.runpath, &dir) };
         for lib in &e.needed {
-            if system.has(lib, elf.bits) || bundled.contains(std::ffi::OsStr::new(lib)) {
+            if system.has(lib, elf.bits) || bundled.contains(std::ffi::OsStr::new(lib)) || search.iter().any(|d| d.join(lib).is_file()) {
                 continue;
             }
             match optional_plugin(path) {
@@ -124,7 +132,8 @@ pub fn check(game: &Game, system: &System) -> Report {
     report.libs_checked = same.iter().filter(|(_, e)| !e.program).count();
     report.harmless = optional.into_iter().collect();
     if !missing.is_empty() {
-        problems.push(Problem::MissingLibs { bits: elf.bits, libs: missing });
+        let in_old_runtime = missing.keys().filter(|l| system.old_runtime.as_ref().is_some_and(|r| r.has(l, elf.bits))).cloned().collect();
+        problems.push(Problem::MissingLibs { bits: elf.bits, libs: missing, in_old_runtime });
     }
 
     // glibc only refuses to make the stack executable later; if the program already asks for
@@ -149,6 +158,13 @@ pub fn check(game: &Game, system: &System) -> Report {
 
     report.problems = problems;
     report
+}
+
+/// A DT_RPATH or DT_RUNPATH list as folders, with $ORIGIN standing for the file's own folder.
+/// Relative entries would depend on where the game is started from, so they're left out.
+fn expand(dirs: &[String], origin: &Path) -> Vec<PathBuf> {
+    let origin = origin.to_string_lossy();
+    dirs.iter().map(|d| PathBuf::from(d.replace("${ORIGIN}", &origin).replace("$ORIGIN", &origin))).filter(|d| d.is_absolute()).collect()
 }
 
 /// glibc resolves a library's calls through the global scope first (the program and everything
@@ -278,14 +294,32 @@ impl Report {
                     let _ = writeln!(out, "✗ {} isn't marked as a program, so double-clicking it does nothing.", p.display());
                     let _ = writeln!(out, "    Usually lost when unpacking a zip. Fix (once): chmod +x \"{}\"", p.display());
                 }
-                Problem::MissingLibs { bits, libs } => {
+                Problem::MissingLibs { bits, libs, in_old_runtime } => {
                     let _ = writeln!(out, "✗ {} {bits}-bit librar{} the game needs {} not installed:", libs.len(), if libs.len() == 1 { "y" } else { "ies" }, if libs.len() == 1 { "is" } else { "are" });
+                    let mixed = !in_old_runtime.is_empty() && in_old_runtime.len() < libs.len();
                     for (lib, users) in libs {
-                        let _ = writeln!(out, "    {lib}, needed by:");
+                        let mark = if mixed && in_old_runtime.contains(lib) { " (Steam's runtime has it)" } else { "" };
+                        let _ = writeln!(out, "    {lib}{mark}, needed by:");
                         list(&mut out, users);
                     }
-                    let _ = writeln!(out, "    Fix: run it in the Steam Linux Runtime, which brings its own libraries.");
-                    let _ = writeln!(out, "    If only a plugin needs it, the game may run without it (that feature won't work).");
+                    match &self.old_runtime {
+                        Some(run) if !in_old_runtime.is_empty() => {
+                            let which = if mixed { "Some of them are" } else if libs.len() == 1 { "It's" } else { "They're all" };
+                            let _ = writeln!(out, "  {which} in Steam's runtime for older games, where Steam keeps libraries newer systems dropped.");
+                            let _ = writeln!(out, "    Fix (at launch): start it through {}", run.display());
+                            let _ = writeln!(out, "    Started from Steam it gets them by itself; gamefix setup does it for the app-menu entry.");
+                            if mixed {
+                                let _ = writeln!(out, "  The others aren't there either.");
+                            }
+                        }
+                        Some(_) => {
+                            let _ = writeln!(out, "  Steam's runtime for older games doesn't have {} either.", if libs.len() == 1 { "it" } else { "them" });
+                        }
+                        None => {
+                            let _ = writeln!(out, "  Steam's runtime for older games often has libraries like these, but Steam isn't installed.");
+                        }
+                    }
+                    let _ = writeln!(out, "    If only a plugin needs one, the game may run without it (that feature won't work).");
                 }
                 Problem::ExecStack(paths) => {
                     let (a, b) = self.glibc.unwrap_or_default();
@@ -317,5 +351,17 @@ impl Report {
             let _ = writeln!(out);
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn origin_means_the_files_folder() {
+        let dirs = ["$ORIGIN/../lib".to_string(), "${ORIGIN}".to_string(), "lib".to_string(), "/opt/x".to_string()];
+        let out = expand(&dirs, Path::new("/g/bin"));
+        assert_eq!(out, [PathBuf::from("/g/bin/../lib"), PathBuf::from("/g/bin"), PathBuf::from("/opt/x")]);
     }
 }

@@ -113,6 +113,8 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
     let mut env: Vec<(&str, String)> = Vec::new();
     // Whether to start it through HIDE_HELPERS.
     let mut hide_helpers = false;
+    // Steam's runtime for older games, for the app-menu entry (Steam uses it by itself).
+    let mut old_runtime = None;
     let mut done = Vec::new();
     let mut not_fixed = Vec::new();
     let mut record = Vec::new();
@@ -138,7 +140,16 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
                     done.push("Makes its libraries load first so they get their own functions (at launch).".into());
                 }
             }
-            Problem::MissingLibs { .. } => not_fixed.push("Missing libraries: needs the Steam Linux Runtime, which setup doesn't do yet.".into()),
+            Problem::MissingLibs { libs, in_old_runtime, .. } => {
+                if let Some(run) = report.old_runtime.as_ref().filter(|_| !in_old_runtime.is_empty()) {
+                    old_runtime = Some(run.clone());
+                    done.push("Starts it with Steam's runtime for older games, which has the missing libraries (Steam does that by itself).".into());
+                }
+                let others: Vec<&str> = libs.keys().filter(|l| !in_old_runtime.contains(*l)).map(String::as_str).collect();
+                if !others.is_empty() {
+                    not_fixed.push(format!("Missing libraries nothing here provides: {}.", others.join(", ")));
+                }
+            }
             Problem::UnitySingleInstance => {
                 if Path::new(BWRAP).is_file() {
                     hide_helpers = true;
@@ -158,6 +169,9 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
         if !env.is_empty() {
             exec.push("env".to_string());
             exec.extend(env.iter().map(|(k, v)| exec_arg(&format!("{k}={v}"))));
+        }
+        if let Some(run) = &old_runtime {
+            exec.push(exec_arg(&run.display().to_string()));
         }
         if hide_helpers {
             exec.extend(["sh", "-c", &format!("{HIDE_HELPERS} exec \"$@\" \"$0\"")].map(exec_arg));
