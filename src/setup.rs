@@ -550,9 +550,10 @@ fn setup_windows(game: &Game, exe: &crate::scan::Found, targets: &Targets) -> Re
         fs::create_dir_all(record_file.parent().unwrap()).map_err(|e| e.to_string())?;
         fs::write(&record_file, record).map_err(|e| e.to_string())?;
         done.push(format!("Set it to run with {tool} in Steam: {}.", hint.reason()));
+        // Steam fetches one of Valve's Protons a game is set to by itself (tested: Cookard, 8.0).
         if let Advice::Official(version) = &hint.advice {
             if !steam.tools().contains(&tool) {
-                not_fixed.push(format!("Proton {version} isn't installed yet: if Steam doesn't fetch it when the game starts, install it from the library (Tools)."));
+                done.push(format!("Steam downloads Proton {version} the first time it starts the game."));
             }
         }
         return Ok(Outcome { done, not_fixed });

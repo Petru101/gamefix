@@ -13,7 +13,9 @@ A Proton (GE-Proton, or an older official one) is named only where it was the fi
   twice as many as reports failing on it;
 - Steam's default failing at least as often as it works without changes, and no report in the
   export's last 12 months saying it works that way (games get fixed: From Dust needed a patch
-  plus GE-Proton in 2025 and runs on the default since).
+  plus GE-Proton in 2025 and runs on the default since);
+- the newest of those fixes within the export's last 18 months: Cookard's Proton 8.0 reports
+  are from mid-2024 and it runs on the default now, with nobody reporting since.
 Otherwise "anticheat" when most reports fail and at least 3, and 30% of the failing ones,
 blame anti-cheat.
 """
@@ -22,6 +24,7 @@ import collections, json, re, sys, time
 reports = json.load(open(sys.argv[1]))
 since = time.mktime((int(sys.argv[2]), 1, 1, 0, 0, 0, 0, 0, 0))
 recent = max(r["timestamp"] for r in reports) - 365 * 86400
+fresh = recent - 183 * 86400
 anticheat = re.compile(r"anti.?cheat|\beac\b|easy ?anti|battl[e]?.?eye|vanguard|ricochet|nprotect|gameguard|xigncode|ateam|kernel.level", re.I)
 # Signs in the notes that something besides the Proton was changed.
 other_fix = re.compile(r"patch|\bmods?\b|\.dll|dll override|winetricks|protontricks|launch option|github|nexus|\.ini\b|config|replace|copy|renam|delet|symlink|\blink\b|install(ed|ing)? (the|a|this)|workaround|tweak", re.I)
@@ -67,10 +70,12 @@ for r in reports:
     elif oob_failed and clean:
         g[("fixed", tool)] += 1
         g["default_failed"] += 1
+        if r["timestamp"] >= fresh:
+            g[("fresh", tool)] += 1
 
 rows = []
 for app, g in games.items():
-    fixes = [(k[1], n) for k, n in g.items() if isinstance(k, tuple) and k[0] == "fixed" and n >= 2 and n >= 2 * g[("failed", k[1])]]
+    fixes = [(k[1], n) for k, n in g.items() if isinstance(k, tuple) and k[0] == "fixed" and n >= 2 and n >= 2 * g[("failed", k[1])] and g[("fresh", k[1])]]
     if fixes and g["default_failed"] >= g["default_ok"] and not g["default_ok_recently"]:
         tool, fixed = max(fixes, key=lambda t: (t[1], t[0] == "ge"))
         rows.append((app, tool, fixed, g["default_failed"]))
