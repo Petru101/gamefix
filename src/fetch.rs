@@ -16,8 +16,9 @@ use std::process::{Command, Stdio};
 const DEBIAN_SUITES: [&str; 3] = ["bookworm", "trixie", "bullseye"];
 
 /// Ubuntu releases still in its archive, oldest first. packages.ubuntu.com no longer lists
-/// 18.04, so these are searched through each release's own index files (cached).
-const UBUNTU_SUITES: [&str; 3] = ["bionic", "focal", "jammy"];
+/// 18.04, so these are searched through each release's own index files (cached). 16.04 last,
+/// only for what the newer ones dropped (Allegro 5.0: Mediator); its indexes are 45 MB more.
+const UBUNTU_SUITES: [&str; 4] = ["bionic", "focal", "jammy", "xenial"];
 
 pub struct Fetched {
     /// Files written into the folder (libraries and their links), for undo.

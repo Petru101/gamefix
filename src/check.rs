@@ -354,6 +354,15 @@ pub fn check(game: &Game, system: &System) -> Report {
             (if at_start { &mut missing } else { &mut later }).entry(lib.clone()).or_default().push(path.clone());
         }
     }
+    // .NET Core before 5 loads OpenSSL itself (dlopen, no DT_NEEDED) through its shim, and only
+    // knows 1.0 and 1.1; without one it aborts at the first HTTPS request ("No usable version
+    // of libssl was found": KlSS, .NET Core 2.2, fetching a level). 1.1 is what can be fetched.
+    let shim = main.path.parent().unwrap_or(Path::new("")).join("System.Security.Cryptography.Native.OpenSsl.so");
+    if game.root.join(&shim).is_file() && dotnet_core(&main_dir, &main.path).is_some_and(|v| v < 5) && !["libssl.so.1.1", "libssl.so.1.0.2", "libssl.so.1.0.0", "libssl.so.10"].iter().any(|l| system.has(l, elf.bits)) {
+        for lib in ["libssl.so.1.1", "libcrypto.so.1.1"] {
+            later.entry(lib.to_string()).or_default().push(shim.clone());
+        }
+    }
     // A library missing at start and later is a start problem.
     later.retain(|lib, _| !missing.contains_key(lib));
     report.libs_checked = same.iter().filter(|(_, e)| !e.program).count();
@@ -614,12 +623,26 @@ fn old_dotnet(dir: &Path, main: &Path) -> Option<String> {
     if config.contains("System.Globalization.Invariant\":true") || config.contains("System.Globalization.Invariant\": true") {
         return None;
     }
-    // "runtimeTarget": {"name": ".NETCoreApp,Version=v2.1/linux-x64", ...}
-    let deps = std::fs::read_to_string(dir.join(format!("{stem}.deps.json"))).ok()?;
-    let at = deps.find(".NETCoreApp,Version=v")? + ".NETCoreApp,Version=v".len();
-    let version: String = deps[at..].chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+    let version = dotnet_core_version(dir, main)?;
     let major: u32 = version.split('.').next()?.parse().ok()?;
     (major < 5).then_some(version)
+}
+
+/// A self-contained .NET Core program's framework version, from its deps.json:
+/// "runtimeTarget": {"name": ".NETCoreApp,Version=v2.1/linux-x64", ...}
+fn dotnet_core_version(dir: &Path, main: &Path) -> Option<String> {
+    if !dir.join("libhostfxr.so").is_file() {
+        return None;
+    }
+    let stem = main.file_name()?.to_string_lossy().into_owned();
+    let deps = std::fs::read_to_string(dir.join(format!("{stem}.deps.json"))).ok()?;
+    let at = deps.find(".NETCoreApp,Version=v")? + ".NETCoreApp,Version=v".len();
+    Some(deps[at..].chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect())
+}
+
+/// Its major version.
+fn dotnet_core(dir: &Path, main: &Path) -> Option<u32> {
+    dotnet_core_version(dir, main)?.split('.').next()?.parse().ok()
 }
 
 /// The start of an MP4 file: its "ftyp" box with a common brand.
@@ -760,7 +783,13 @@ impl Report {
                 .unwrap_or_default();
             let _ = writeln!(out, "  Runs:  {} (Linux, {}-bit{engine})", main.path.display(), elf.bits);
             if let Some(l) = game.launcher() {
-                let why = if binary::sets_library_path(&game.full(l)) { "it sets where the game's libraries are" } else { "it tells the program which game file to run" };
+                let why = if binary::sets_library_path(&game.full(l)) {
+                    "it sets where the game's libraries are"
+                } else if l.path.parent() == main.path.parent() {
+                    "it tells the program which game file to run"
+                } else {
+                    "it starts the program from the game's folder, with its settings"
+                };
                 let _ = writeln!(out, "  Start: {} (the developer's launcher: {why})", l.path.display());
             }
         } else if let Some(Binary::Pe(pe)) = game.windows.map(|i| &game.files[i].binary) {
@@ -990,7 +1019,7 @@ impl Report {
                     let _ = writeln!(out, "• This is a Processing game; its script {} starts it with Java ({}).", file.display(), java.display());
                     let _ = writeln!(out, "  gamefix setup adds that to the app menu, with Java's own sound sent to PipeWire (it would");
                     let _ = writeln!(out, "  open the sound card directly, which PipeWire already holds, and get none).");
-                    let (applet, only32) = scan::processing_notes(&game.root, file);
+                    let (applet, only32, arm) = scan::processing_notes(&game.root, file);
                     let lts = java.to_string_lossy().contains("/openjdk@");
                     if applet && !lts {
                         let _ = writeln!(out, "  It's built on Processing 2 or older, a Java applet, and Java 26 removed those: it needs");
@@ -1003,6 +1032,11 @@ impl Report {
                     if only32 {
                         let _ = writeln!(out, "  It's a 32-bit export: if it draws with OpenGL, 64-bit Java can't load its 32-bit parts");
                         let _ = writeln!(out, "  (Rainbeats couldn't); a 64-bit or Windows download works then.");
+                    }
+                    if arm {
+                        let _ = writeln!(out, "✗ But it's an export for ARM computers (Raspberry Pi): its OpenGL and sound parts can't");
+                        let _ = writeln!(out, "  load on this PC (Fairy Piano's sound library didn't).");
+                        let _ = writeln!(out, "    Fix: the game's Linux 64-bit or Windows download, if it has one.");
                     }
                 }
                 Problem::OwnHarfbuzz(file, preload, in_program) => {

@@ -76,10 +76,11 @@ pub fn identify(path: &Path) -> Option<Binary> {
         }
     } else if head.starts_with(b"MZ") && n == 64 {
         pe(&mut f, head).map(Binary::Pe)
+    } else if ext == "love" && (head.starts_with(b"PK\x03\x04") || (head.starts_with(b"#!") && head.windows(4).any(|w| w == b"PK\x03\x04"))) {
+        // Some start with "#!/usr/bin/env love" so they run when double-clicked (NEON PHASE).
+        Some(Binary::Love)
     } else if head.starts_with(b"#!") && ext != "py" {
         Some(Binary::Script)
-    } else if ext == "love" && head.starts_with(b"PK\x03\x04") {
-        Some(Binary::Love)
     } else if ext == "jar" && head.starts_with(b"PK\x03\x04") {
         Some(Binary::Jar)
     } else if ext == "swf" && [&b"FWS"[..], b"CWS", b"ZWS"].iter().any(|m| head.starts_with(m)) {
