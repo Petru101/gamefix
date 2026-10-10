@@ -30,6 +30,11 @@ pub enum Problem {
     Damaged(PathBuf),
     /// A Flash game (.swf); `ruffle` is how to start an installed Ruffle.
     Flash { file: PathBuf, ruffle: Option<Vec<String>> },
+    /// A CD's files, with the installer among them.
+    CdFiles { installer: PathBuf },
+    /// Disc copy protection (SafeDisc, SecuROM) around the game's program, which Wine can't
+    /// run; `others` are copies of the program with that name in the download without it.
+    Protected { what: &'static str, file: PathBuf, others: Vec<PathBuf> },
     /// A disc image (.iso) and the installer on it, if one was found; None in `files` when it
     /// couldn't be read (no 7-Zip).
     Disc { file: PathBuf, files: Option<usize>, installer: Option<String> },
@@ -284,6 +289,7 @@ pub fn check(game: &Game, system: &System) -> Report {
                 let web = if game.windows.is_none() { web_export(&game.root) } else { None };
                 problems.push(match (damaged, game.archive, package) {
                     (Some(f), _, _) => Problem::Damaged(f.path.clone()),
+                    _ if game.cd_installer.is_some() => Problem::CdFiles { installer: game.files[game.cd_installer.unwrap()].path.clone() },
                     _ if game.disc.is_some() => {
                         let file = game.files[game.disc.unwrap()].path.clone();
                         let files = crate::disc::files(&game.root.join(&file));
@@ -301,6 +307,16 @@ pub fn check(game: &Game, system: &System) -> Report {
                     (None, None, None) => Problem::NoLinuxBuild,
                 });
             }
+        }
+        // The game's program, run or installed from the CD, with copy protection Wine can't run.
+        let protected = game.files.iter().find_map(|f| match &f.binary {
+            Binary::Pe(pe) if pe.installer.is_none() && (game.windows.is_some_and(|i| game.files[i].path == f.path) || game.cd_installer.is_some()) => pe.protection.map(|what| (what, f)),
+            _ => None,
+        });
+        if let Some((what, f)) = protected {
+            let name = f.path.file_name().map(|n| n.to_string_lossy().to_lowercase());
+            let others = game.files.iter().filter(|o| o.path != f.path && o.path.file_name().map(|n| n.to_string_lossy().to_lowercase()) == name && matches!(&o.binary, Binary::Pe(pe) if pe.protection.is_none())).map(|o| o.path.clone()).collect();
+            problems.push(Problem::Protected { what, file: f.path.clone(), others });
         }
         if let Some(i) = game.windows {
             let dlls = crate::proton::ignored_dlls(&game.full(&game.files[i]));
@@ -914,7 +930,7 @@ impl Report {
             };
             let _ = writeln!(out, "  Runs:  {} ({what})", f.path.display());
         }
-        if !self.windows.is_empty() && game.windows.is_none() {
+        if !self.windows.is_empty() && game.windows.is_none() && game.cd_installer.is_none() {
             let _ = writeln!(out, "  {}: {}", if game.main().is_some() { "Also has a Windows build" } else { "Windows build" }, self.windows.iter().map(|(p, bits)| format!("{} ({bits}-bit)", p.display())).collect::<Vec<_>>().join(", "));
         }
         for (p, kind) in &self.installers {
@@ -1073,6 +1089,19 @@ impl Report {
                     let _ = writeln!(out, "✗ This is a Flash game ({}): Flash Player was retired in 2020.", file.display());
                     let _ = writeln!(out, "    Fix: install Ruffle from Flathub (rs.ruffle.Ruffle), which plays most Flash games; then");
                     let _ = writeln!(out, "    gamefix setup adds it to the app menu.");
+                }
+                Problem::CdFiles { installer } => {
+                    let _ = writeln!(out, "• These are a Windows game CD's files; its installer is {}.", installer.display());
+                    let _ = writeln!(out, "  gamefix setup --steam installs it with Proton (you click through the installer once)");
+                    let _ = writeln!(out, "  and adds the installed game to Steam.");
+                }
+                Problem::Protected { what, file, others } => {
+                    let _ = writeln!(out, "✗ Its program ({}) is protected by {what}, whose driver Windows 10 and later", file.display());
+                    let _ = writeln!(out, "  and Wine/Proton don't run: the game won't start, installed or not.");
+                    if !others.is_empty() {
+                        let list: Vec<String> = others.iter().map(|o| o.display().to_string()).collect();
+                        let _ = writeln!(out, "  The download also has a copy of the program without it: {}.", list.join(", "));
+                    }
                 }
                 Problem::Disc { file, installer: Some(installer), .. } => {
                     let _ = writeln!(out, "• This is a Windows game's disc image ({}); its installer is {installer}.", file.display());

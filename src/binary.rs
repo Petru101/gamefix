@@ -64,6 +64,9 @@ pub struct Pe {
     /// A .NET program (it has a CLR header): Mono runs these on Linux too, so next to a Linux
     /// program it's usually part of the Linux build, not a Windows one (Terraria).
     pub dotnet: bool,
+    /// Disc copy protection wrapped around it, known by its sections: SafeDisc 2+ ("stxt774",
+    /// "stxt371"), SecuROM (".securom", ".cms_t").
+    pub protection: Option<&'static str>,
 }
 
 pub fn identify(path: &Path) -> Option<Binary> {
@@ -574,6 +577,17 @@ fn pe(f: &mut File, h: &[u8]) -> Option<Pe> {
     };
     let count = u32le(&nt, dirs - 4) as usize;
     let dotnet = count > 14 && u32le(&nt, dirs + 14 * 8) != 0;
+    let sections = u16le(&nt, 6) as usize;
+    let table = read_at(f, lfanew + 24 + u16le(&nt, 20) as u64, sections.min(96) * 40).unwrap_or_default();
+    let names: Vec<&[u8]> = table.chunks_exact(40).map(|s| &s[..8]).collect();
+    let named = |n: &[u8]| names.iter().any(|s| s.starts_with(n));
+    let protection = if named(b"stxt774") || named(b"stxt371") {
+        Some("SafeDisc")
+    } else if named(b".securom") || named(b".cms_t") {
+        Some("SecuROM")
+    } else {
+        None
+    };
     // Installer stubs name themselves in their resources, near the start of the file.
     let mut stub = Vec::new();
     f.seek(SeekFrom::Start(0)).ok()?;
@@ -582,7 +596,7 @@ fn pe(f: &mut File, h: &[u8]) -> Option<Pe> {
         .into_iter()
         .find(|(marker, _)| stub.windows(marker.len()).any(|w| w == marker.as_bytes()))
         .map(|(_, name)| name);
-    Some(Pe { bits, installer, dotnet })
+    Some(Pe { bits, installer, dotnet, protection })
 }
 
 #[cfg(test)]

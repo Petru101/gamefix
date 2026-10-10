@@ -143,6 +143,7 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
                 outcome.done.splice(0..0, note);
                 Ok(outcome)
             }
+            None if game.cd_installer.is_some() => setup_install(game, Installer::File(game.full(&game.files[game.cd_installer.unwrap()])), targets),
             None if disc.is_some() => setup_install(game, disc.unwrap(), targets),
             None if !report.installers.is_empty() => setup_install(game, Installer::File(game.root.join(&report.installers[0].0)), targets),
             None if report.problems.iter().any(|p| matches!(p, Problem::Disc { .. })) => Err("No installer was found on the disc image (see gamefix check).".into()),
@@ -354,7 +355,7 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
             Problem::Alsa32(None) => not_fixed.push("Its 32-bit ALSA sound: needs Steam's runtime (install Steam), which has a plugin that works.".into()),
             Problem::KickFiles(files) => not_fixed.push(format!("Its missing Mono files ({}): only the developer can add them; the .exe with Proton works.", files.join(", "))),
             Problem::FnaLibs(libs) => not_fixed.push(format!("Its missing native libraries ({}): get FNA's fnalibs, or use the Windows download with Proton.", libs.join(", "))),
-            Problem::NoLinuxBuild | Problem::OwnWindowsDlls(_) | Problem::MissingWindowsParts(_) | Problem::Source(..) | Problem::Web(_) | Problem::Damaged(_) | Problem::Package(..) | Problem::Flash { .. } | Problem::Dos { .. } | Problem::Disc { .. } | Problem::Archive(_) | Problem::WrongMachine(_) | Problem::Love { .. } | Problem::Python { .. } | Problem::Java { .. } => {}
+            Problem::NoLinuxBuild | Problem::OwnWindowsDlls(_) | Problem::MissingWindowsParts(_) | Problem::Source(..) | Problem::Web(_) | Problem::Damaged(_) | Problem::Package(..) | Problem::Flash { .. } | Problem::Dos { .. } | Problem::Disc { .. } | Problem::CdFiles { .. } | Problem::Protected { .. } | Problem::Archive(_) | Problem::WrongMachine(_) | Problem::Love { .. } | Problem::Python { .. } | Problem::Java { .. } => {}
         }
     }
     if !preload.is_empty() {
@@ -705,6 +706,11 @@ fn setup_install(game: &Game, installer: Installer, targets: &Targets) -> Result
     fs::write(&record_file, record.join("\n") + "\n").map_err(|e| e.to_string())?;
     if steam.running() {
         return Err(format!("Steam was opened while it installed. Close Steam and set it up again: the installed game in {} is used, not installed twice.", prefix.display()));
+    }
+    if let Some(crate::binary::Binary::Pe(pe)) = crate::binary::identify(&exe) {
+        if let Some(what) = pe.protection {
+            not_fixed.push(format!("The installed program is protected by {what}, which Wine/Proton can't run: it won't start from Steam as it is."));
+        }
     }
     let own = proton::ignored_dlls(&exe);
     let mut env = vec![("STEAM_COMPAT_DATA_PATH", prefix.display().to_string())];

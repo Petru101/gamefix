@@ -33,6 +33,9 @@ pub struct Game {
     /// Index into `files` of a game another program runs (a .love file, Python code), when
     /// there's no Linux program.
     pub portable: Option<usize>,
+    /// Index into `files` of the installer on a CD's files (an autorun.inf in its folder or
+    /// above): the game is installed from there, not run from the CD.
+    pub cd_installer: Option<usize>,
     /// Index into `files` of a disc image to install the game from, when there's nothing else
     /// to run.
     pub disc: Option<usize>,
@@ -112,13 +115,15 @@ pub fn scan(path: &Path) -> Option<Game> {
         None if chosen.is_some() => picked(false),
         None => pick_windows(&root, &files),
     };
+    let cd_installer = if main.is_none() { cd_installer(&root, &files) } else { None };
+    let windows = if cd_installer.is_some() { None } else { windows };
     let portable = match main {
         Some(_) => None,
         None if chosen.is_some() => chosen.as_ref().and_then(|c| files.iter().position(|f| &f.path == c && matches!(f.binary, Binary::Love | Binary::Jar | Binary::Flash | Binary::Python(_) | Binary::Dos))),
         // A DOS program only when nothing else runs: Windows games may carry DOS tools.
         None => pick_portable(&root, &files).or_else(|| if windows.is_none() { pick_dos(&root, &files) } else { None }),
     };
-    let nothing = main.is_none() && windows.is_none() && portable.is_none();
+    let nothing = main.is_none() && windows.is_none() && portable.is_none() && cd_installer.is_none();
     let disc = nothing.then(|| files.iter().enumerate().filter(|(_, f)| matches!(f.binary, Binary::Disc)).min_by_key(|(_, f)| f.path.components().count()).map(|(i, _)| i)).flatten();
     let archive = (nothing && disc.is_none())
         .then(|| files.iter().enumerate().filter(|(_, f)| matches!(f.binary, Binary::Archive)).min_by_key(|(_, f)| f.path.components().count()).map(|(i, _)| i))
@@ -133,7 +138,7 @@ pub fn scan(path: &Path) -> Option<Game> {
         .or_else(|| chosen.as_ref().filter(|_| shared_folder(&root)).map(|c| stem(c)))
         .or_else(|| root.file_name().map(|n| n.to_string_lossy().into_owned()))
         .unwrap_or_else(|| root.display().to_string());
-    Some(Game { root, name, files, main, windows, portable, disc, archive, engine })
+    Some(Game { root, name, files, main, windows, portable, cd_installer, disc, archive, engine })
 }
 
 /// Folders that hold unrelated downloads rather than one game.
@@ -346,6 +351,20 @@ fn pick_portable(root: &Path, files: &[Found]) -> Option<usize> {
         })
         .max_by_key(|&(score, i)| (score, std::cmp::Reverse(i)))
         .map(|(_, i)| i)
+}
+
+/// The installer among a CD's files: one with an autorun.inf in its folder or a folder above
+/// it (Harry Potter: HARRY_POTTER/AUTORUN.INF, HARRY_POTTER/setup/Setup.exe), nearest the top.
+fn cd_installer(root: &Path, files: &[Found]) -> Option<usize> {
+    files
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| matches!(&f.binary, Binary::Pe(pe) if pe.installer.is_some()))
+        .filter(|(_, f)| {
+            f.path.ancestors().skip(1).any(|dir| fs::read_dir(root.join(dir)).into_iter().flatten().flatten().any(|e| e.file_name().to_string_lossy().eq_ignore_ascii_case("autorun.inf")))
+        })
+        .min_by_key(|(_, f)| f.path.components().count())
+        .map(|(i, _)| i)
 }
 
 /// Names of the programs DOS games came with besides the game: installers, sound and graphics
