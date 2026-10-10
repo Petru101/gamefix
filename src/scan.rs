@@ -56,6 +56,9 @@ impl Game {
                 && main.path.starts_with(dir)
                 && ((binary::sets_library_path(&self.full(f)) && binary::contains(&self.full(f), name.as_bytes()))
                     || binary::passes_file(&self.full(f), &name)
+                    // Ren'Py's <name>.sh, which starts lib/<platform>/<name> with `-EO <name>.py`:
+                    // started alone, Ren'Py 6 and 7 quit ("No module named site": Tunnel Vision).
+                    || (f.path.file_stem().is_some_and(|s| s.to_string_lossy() == name) && self.root.join(dir).join(format!("{name}.py")).is_file())
                     || (dir != main_dir && binary::runs_path(&self.full(f), &name) && !f.path.to_string_lossy().to_lowercase().contains("install")))
                 // Not one starting it through a bundled ld.so (Exodus: Liberation Circuit), which
                 // setup bypasses on purpose.
@@ -202,6 +205,11 @@ fn pick_main(root: &Path, files: &[Found]) -> Option<usize> {
             let s = stem(&f.path);
             let mut score = 0;
             if dir.join(format!("{s}_Data")).is_dir() || dir.join(format!("{s}.pck")).is_file() || dir.join("data.pck").is_file() || dir.join("package.nw").exists() {
+                score += 10;
+            }
+            // Ren'Py's lib/linux-x86_64/<name>, a copy of its python that runs <name>.py two
+            // folders up by its own name; the `python` beside it (identical) doesn't (Tunnel Vision).
+            if dir.parent().and_then(Path::parent).is_some_and(|b| b.join(format!("{s}.py")).is_file()) {
                 score += 10;
             }
             if f.path.components().count() == 1 {

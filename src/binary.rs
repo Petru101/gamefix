@@ -311,6 +311,11 @@ pub fn passes_file(script: &Path, program: &str) -> bool {
     })
 }
 
+/// Whether a script has Windows line endings (CR LF).
+pub fn crlf(path: &Path) -> bool {
+    std::fs::read(path).is_ok_and(|t| t.windows(2).any(|w| w == b"\r\n"))
+}
+
 /// Whether a script that sets LD_LIBRARY_PATH keeps what was there ("$LD_LIBRARY_PATH"),
 /// rather than replacing it (labb.sh: `LD_LIBRARY_PATH=. ./labb`).
 pub fn keeps_library_path(path: &Path) -> bool {

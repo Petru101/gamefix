@@ -197,6 +197,22 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
                 env.push(("GLIBC_TUNABLES", "glibc.rtld.execstack=2".into()));
                 done.push("Lets its libraries that ask for an executable stack load (at launch).".into());
             }
+            Problem::WindowsLineEndings(p) => {
+                // The original goes outside the game's folder, where it would count as a script.
+                let script = game.root.join(p);
+                let text = fs::read(&script).map_err(|e| e.to_string())?;
+                let backups = data_home().join("gamefix/backups").join(slug(&game.name));
+                if !backups.is_dir() {
+                    fs::create_dir_all(&backups).map_err(|e| e.to_string())?;
+                    record.push(format!("created-dir\t{}", backups.display()));
+                }
+                let backup = backups.join(p.file_name().unwrap_or_default());
+                fs::copy(&script, &backup).map_err(|e| e.to_string())?;
+                let fixed: Vec<u8> = text.iter().enumerate().filter(|&(i, &b)| !(b == b'\r' && text.get(i + 1) == Some(&b'\n'))).map(|(_, &b)| b).collect();
+                fs::write(&script, fixed).map_err(|e| e.to_string())?;
+                record.push(format!("replaced\t{}\t{}", backup.display(), script.display()));
+                done.push(format!("Converted {} to Linux line endings (the original is kept in ~/.local/share/gamefix/backups).", p.display()));
+            }
             Problem::SymbolClash(clashes) => {
                 let paths: Vec<String> = Problem::preload(clashes).iter().map(|p| game.root.join(p).display().to_string()).collect();
                 // LD_PRELOAD splits on spaces and colons, so such paths can't be listed in it.
@@ -350,12 +366,22 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
     }
     // The developer's launcher script (see Game::launcher); else the program.
     let mut start = game.launcher().map(|l| game.full(l)).unwrap_or_else(|| program.clone());
-    // A launcher that replaces LD_LIBRARY_PATH would drop the folder set here: start the
-    // program itself then, with the game's libraries the launcher pointed it to linked into that
-    // folder, only those the system lacks; its whole folder first would hide newer system ones
-    // (Because's old libogg broke the system's libsndfile).
-    if start != program && crate::binary::sets_library_path(&start) && !crate::binary::keeps_library_path(&start) && env.iter().any(|(k, _)| *k == "LD_LIBRARY_PATH") {
+    // A launcher that replaces LD_LIBRARY_PATH would drop the folder set here, or Steam's
+    // runtime's (The Fate of Marcus' `run`: `LD_LIBRARY_PATH=:./lib64`, libFLAC.so.8 then not
+    // found): start the program itself then, from the launcher's folder, with the game's
+    // libraries the launcher pointed it to linked into that folder, only those the system lacks;
+    // its whole folder first would hide newer system ones (Because's old libogg broke the
+    // system's libsndfile).
+    let mut launcher_dir = None;
+    if start != program && crate::binary::sets_library_path(&start) && !crate::binary::keeps_library_path(&start) && (env.iter().any(|(k, _)| *k == "LD_LIBRARY_PATH") || old_runtime.is_some()) {
         let links = data_home().join("gamefix/libs").join(slug(&game.name));
+        if !report.launcher_libs.is_empty() && !env.iter().any(|(k, _)| *k == "LD_LIBRARY_PATH") {
+            if !links.is_dir() {
+                fs::create_dir_all(&links).map_err(|e| e.to_string())?;
+                record.push(format!("created-dir\t{}", links.display()));
+            }
+            env.push(("LD_LIBRARY_PATH", links.display().to_string()));
+        }
         for (lib, dir) in &report.launcher_libs {
             let link = links.join(lib);
             if link.symlink_metadata().is_err() {
@@ -363,6 +389,7 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
                 record.push(format!("created\t{}", link.display()));
             }
         }
+        launcher_dir = start.parent().map(Path::to_path_buf);
         start = program.clone();
     }
     if start != program {
@@ -376,7 +403,7 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
     // An Exodus bundle's program sits deep inside it; the launcher link at its top is meant to
     // be started from there, next to the game's data (Liberation Circuit).
     let exodus_top = start.ancestors().find(|d| d.join("exodus/bundles").is_dir() && start.starts_with(d.join("exodus")));
-    let workdir = exodus_top.or(start.parent()).unwrap_or(&game.root);
+    let workdir = exodus_top.or(launcher_dir.as_deref()).or(start.parent()).unwrap_or(&game.root);
     let icon = icon(game, &main.path);
 
     if targets.menu {
@@ -859,6 +886,11 @@ pub fn undo(game: &Game) -> Result<Vec<String>, String> {
             ["created-dir", path] => {
                 if fs::remove_dir(path).is_ok() {
                     undone.push(format!("Removed {path}"));
+                }
+            }
+            ["replaced", backup, path] => {
+                if fs::copy(backup, path).is_ok() && fs::remove_file(backup).is_ok() {
+                    undone.push(format!("Restored {path}"));
                 }
             }
             ["mode", mode, path] => {

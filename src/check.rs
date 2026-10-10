@@ -42,6 +42,9 @@ pub enum Problem {
     Java { file: PathBuf, java: Option<PathBuf> },
     WrongMachine(u16),
     NotExecutable(PathBuf),
+    /// The developer's launcher script saved with Windows line endings: Linux takes
+    /// "/bin/bash\r" for the shell's name and won't start it (Curse of the Arrow's run.sh).
+    WindowsLineEndings(PathBuf),
     /// Library name → the game's files that need it: `libs` at start (the game can't start
     /// without them), `later` only by plugins loaded later, if at all. Which of all those Steam's
     /// runtime for older games has, and which the game ships in a folder ld.so doesn't look in.
@@ -303,13 +306,19 @@ pub fn check(game: &Game, system: &System) -> Report {
         return report;
     };
     if elf.machine != EM_X86_64 && elf.machine != EM_386 {
+        // Nothing else matters: it can't run here, and its libraries (down to ld.so) are ARM's too.
         problems.push(Problem::WrongMachine(elf.machine));
+        report.problems = problems;
+        return report;
     }
     report.packed = elf.packed;
     report.pyinstaller = elf.pyinstaller && system.refuses_exec_stack();
     let mode = std::fs::metadata(game.full(main)).map(|m| m.permissions().mode()).unwrap_or(0);
     if mode & 0o100 == 0 {
         problems.push(Problem::NotExecutable(main.path.clone()));
+    }
+    if let Some(l) = game.launcher().filter(|l| binary::crlf(&game.full(l))) {
+        problems.push(Problem::WindowsLineEndings(l.path.clone()));
     }
 
     // Everything built for the same machine as the program: its libraries and plugins.
@@ -866,7 +875,10 @@ impl Report {
                 .unwrap_or_default();
             let _ = writeln!(out, "  Runs:  {} (Linux, {}-bit{engine})", main.path.display(), elf.bits);
             if let Some(l) = game.launcher() {
-                let why = if binary::sets_library_path(&game.full(l)) {
+                let renpy = l.path.file_stem().is_some_and(|s| game.full(l).with_file_name(format!("{}.py", s.to_string_lossy())).is_file());
+                let why = if renpy {
+                    "it tells the program which game file to run"
+                } else if binary::sets_library_path(&game.full(l)) {
                     "it sets where the game's libraries are"
                 } else if l.path.parent() == main.path.parent() {
                     "it tells the program which game file to run"
@@ -1137,7 +1149,21 @@ impl Report {
                     }
                 }
                 Problem::WrongMachine(m) => {
-                    let _ = writeln!(out, "✗ The program is built for a different processor (ELF machine {m}), not a PC.");
+                    let cpu = match m {
+                        183 => "64-bit ARM (aarch64: Raspberry Pi, ARM laptops, handhelds)".to_string(),
+                        40 => "32-bit ARM (Raspberry Pi)".to_string(),
+                        243 => "RISC-V".to_string(),
+                        20 | 21 => "PowerPC".to_string(),
+                        8 => "MIPS".to_string(),
+                        _ => format!("another processor (ELF machine {m})"),
+                    };
+                    let _ = writeln!(out, "✗ The program is built for {cpu}, not a PC's x86 processor, so it can't run here.");
+                    let _ = writeln!(out, "    Fix: get the game's download for x86_64 (\"Linux\", \"amd64\" or \"64-bit\"), or its Windows one with Proton.");
+                }
+                Problem::WindowsLineEndings(p) => {
+                    let _ = writeln!(out, "✗ {} was saved with Windows line endings, so Linux can't run it", p.display());
+                    let _ = writeln!(out, "  (\"bad interpreter\", or \"No such file or directory\" for a file that's there).");
+                    let _ = writeln!(out, "    Fix (once): convert it to Linux line endings (gamefix setup does that, keeping the original).");
                 }
                 Problem::NotExecutable(p) => {
                     let _ = writeln!(out, "✗ {} isn't marked as a program, so double-clicking it does nothing.", p.display());
