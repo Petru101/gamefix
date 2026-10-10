@@ -21,6 +21,8 @@ pub enum Binary {
     Python(Python),
     /// A Flash movie or game (.swf), which Flash Player ran; Ruffle does now.
     Flash,
+    /// A DOS program (.exe or .com), which Wine won't run; DOSBox does.
+    Dos,
     /// A distribution package (.deb or .rpm): meant to be installed into /usr.
     Package(&'static str),
     /// A Linux program whose bytes above 0x7F were each replaced with U+FFFD's UTF-8 (EF BF BD):
@@ -75,7 +77,14 @@ pub fn identify(path: &Path) -> Option<Binary> {
             None => None,
         }
     } else if head.starts_with(b"MZ") && n == 64 {
-        pe(&mut f, head).map(Binary::Pe)
+        match pe(&mut f, head) {
+            Some(pe) => Some(Binary::Pe(pe)),
+            None if ext == "exe" && dos(&mut f, head) => Some(Binary::Dos),
+            None => None,
+        }
+    } else if ext == "com" && n > 0 && !head.starts_with(b"#!") && !head.is_ascii() {
+        // .COM programs have no header: just code, loaded at 0x100.
+        Some(Binary::Dos)
     } else if ext == "love" && (head.starts_with(b"PK\x03\x04") || (head.starts_with(b"#!") && head.windows(4).any(|w| w == b"PK\x03\x04"))) {
         // Some start with "#!/usr/bin/env love" so they run when double-clicked (NEON PHASE).
         Some(Binary::Love)
@@ -529,6 +538,17 @@ pub fn company(path: &Path) -> Option<String> {
     (!name.is_empty()).then_some(name)
 }
 
+/// An MZ program with no Windows header after the DOS one. Programs for DOS keep their
+/// relocations at 0x1c-0x3f, where Windows ones point to their header (e_lfanew at 0x3c), so
+/// that field only counts when the relocations start past it. A DOS extender's (DOS/4GW: "LE")
+/// is still DOS; Windows 3.x's ("NE") isn't.
+fn dos(f: &mut File, h: &[u8]) -> bool {
+    if u16le(h, 0x18) < 0x40 {
+        return true;
+    }
+    !matches!(read_at(f, u32le(h, 0x3c) as u64, 2).as_deref(), Some(b"NE" | b"PE"))
+}
+
 fn pe(f: &mut File, h: &[u8]) -> Option<Pe> {
     let lfanew = u32le(h, 0x3c) as u64;
     let nt = read_at(f, lfanew, 24 + 240)?;
@@ -592,6 +612,28 @@ mod tests {
         f[0x500..0x503].copy_from_slice(b"\xc3\xa9h");
         std::fs::write(&path, &f).unwrap();
         assert!(super::imports(&path).is_none());
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// MZ programs: DOS ones (relocations before 0x40, or a DOS extender's LE header) and
+    /// Windows 3.x ones (NE), which aren't DOS.
+    #[test]
+    fn dos_programs() {
+        let path = std::env::temp_dir().join(format!("gamefix-dos-{}.exe", std::process::id()));
+        let mut f = vec![0u8; 0x100];
+        f[..2].copy_from_slice(b"MZ");
+        f[0x18] = 0x1e;
+        f[0x3c..0x40].copy_from_slice(&0x0e63u32.to_le_bytes());
+        std::fs::write(&path, &f).unwrap();
+        assert!(matches!(identify(&path), Some(Binary::Dos)));
+        f[0x18] = 0x40;
+        f[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        f[0x80..0x82].copy_from_slice(b"LE");
+        std::fs::write(&path, &f).unwrap();
+        assert!(matches!(identify(&path), Some(Binary::Dos)));
+        f[0x80..0x82].copy_from_slice(b"NE");
+        std::fs::write(&path, &f).unwrap();
+        assert!(identify(&path).is_none());
         std::fs::remove_file(&path).unwrap();
     }
 

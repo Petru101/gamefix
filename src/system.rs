@@ -161,6 +161,18 @@ impl System {
         std::env::split_paths(&path).map(|d| d.join("ruffle")).find(|l| l.is_file()).map(|l| vec![l.display().to_string()])
     }
 
+    /// How to start DOSBox: Flathub's DOSBox Staging (it can read the home folder only, so
+    /// setup adds the game's folder), else a `dosbox` on the PATH (Staging or the original).
+    pub fn dosbox(&self) -> Option<Vec<String>> {
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+        let flatpak = [PathBuf::from("/var/lib/flatpak"), home.join(".local/share/flatpak")].iter().any(|d| d.join("app/io.github.dosbox-staging/current").exists());
+        if flatpak {
+            return Some(vec!["flatpak".into(), "run".into(), "io.github.dosbox-staging".into()]);
+        }
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        std::env::split_paths(&path).map(|d| d.join("dosbox")).find(|l| l.is_file()).map(|l| vec![l.display().to_string()])
+    }
+
     /// PipeWire's ALSA plugin for this many bits, when ALSA's default goes to PipeWire. Java's
     /// own sound needs it named by path: it opens the card itself (hw/plughw, which PipeWire
     /// holds), and Homebrew's Java brings an ALSA library that only looks in Homebrew's folder.

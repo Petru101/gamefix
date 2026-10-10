@@ -30,6 +30,8 @@ pub enum Problem {
     Damaged(PathBuf),
     /// A Flash game (.swf); `ruffle` is how to start an installed Ruffle.
     Flash { file: PathBuf, ruffle: Option<Vec<String>> },
+    /// A DOS game; `dosbox` is how to start an installed DOSBox.
+    Dos { file: PathBuf, dosbox: Option<Vec<String>> },
     /// Only a .deb or .rpm package, which Bazzite can't simply install.
     Package(PathBuf, &'static str),
     /// A .love file: needs the LÖVE version it was made for; `love` is how to start an installed one.
@@ -257,6 +259,7 @@ pub fn check(game: &Game, system: &System) -> Report {
                 problems.push(Problem::Java { file: f.path.clone(), java });
             }
             Some(f) if matches!(f.binary, Binary::Flash) => problems.push(Problem::Flash { file: f.path.clone(), ruffle: system.ruffle() }),
+            Some(f) if matches!(f.binary, Binary::Dos) => problems.push(Problem::Dos { file: f.path.clone(), dosbox: system.dosbox() }),
             Some(f) => {
                 let python = game.files.iter().filter_map(|f| match &f.binary {
                     Binary::Python(p) => Some(p),
@@ -882,6 +885,7 @@ impl Report {
                 (Binary::Python(p), _) if p.v2 => "Python 2 game".into(),
                 (Binary::Jar, _) => "Java game".into(),
                 (Binary::Flash, _) => "Flash game".into(),
+                (Binary::Dos, _) => "DOS game".into(),
                 (Binary::Script, _) if scan::install4j_script(&game.root, &f.path) => "Java game, install4j launcher".into(),
                 (Binary::Script, _) => "Processing game, runs with Java".into(),
                 _ => "Python game".into(),
@@ -1046,6 +1050,16 @@ impl Report {
                     let _ = writeln!(out, "✗ This is a Flash game ({}): Flash Player was retired in 2020.", file.display());
                     let _ = writeln!(out, "    Fix: install Ruffle from Flathub (rs.ruffle.Ruffle), which plays most Flash games; then");
                     let _ = writeln!(out, "    gamefix setup adds it to the app menu.");
+                }
+                Problem::Dos { file, dosbox: Some(dosbox) } => {
+                    let _ = writeln!(out, "• This is a DOS game. Proton can't run DOS programs, but DOSBox (installed) can:");
+                    let _ = writeln!(out, "  {} \"{}\"", dosbox.join(" "), file.display());
+                    let _ = writeln!(out, "  gamefix setup adds that to the app menu or Steam.");
+                }
+                Problem::Dos { file, dosbox: None } => {
+                    let _ = writeln!(out, "✗ This is a DOS game ({}): Proton can't run DOS programs.", file.display());
+                    let _ = writeln!(out, "    Fix: install DOSBox Staging from Flathub (io.github.dosbox-staging); then gamefix");
+                    let _ = writeln!(out, "    setup adds it to the app menu or Steam.");
                 }
                 Problem::Package(file, "apk") => {
                     let _ = writeln!(out, "✗ This download is an Android app ({}), not a game for PCs.", file.display());

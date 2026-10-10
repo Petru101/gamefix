@@ -108,8 +108,9 @@ pub fn scan(path: &Path) -> Option<Game> {
     };
     let portable = match main {
         Some(_) => None,
-        None if chosen.is_some() => chosen.as_ref().and_then(|c| files.iter().position(|f| &f.path == c && matches!(f.binary, Binary::Love | Binary::Jar | Binary::Flash | Binary::Python(_)))),
-        None => pick_portable(&root, &files),
+        None if chosen.is_some() => chosen.as_ref().and_then(|c| files.iter().position(|f| &f.path == c && matches!(f.binary, Binary::Love | Binary::Jar | Binary::Flash | Binary::Python(_) | Binary::Dos))),
+        // A DOS program only when nothing else runs: Windows games may carry DOS tools.
+        None => pick_portable(&root, &files).or_else(|| if windows.is_none() { pick_dos(&root, &files) } else { None }),
     };
     let archive = (main.is_none() && windows.is_none() && portable.is_none())
         .then(|| files.iter().enumerate().filter(|(_, f)| matches!(f.binary, Binary::Archive)).min_by_key(|(_, f)| f.path.components().count()).map(|(i, _)| i))
@@ -164,6 +165,7 @@ fn walk(root: &Path, rel: &Path, depth: usize, out: &mut Vec<Found>) {
                 Binary::Pe(_) => is_exe,
                 Binary::Script => depth <= 2,
                 Binary::Love | Binary::Jar | Binary::Flash | Binary::Python(_) | Binary::Archive | Binary::Package(_) => depth <= 1,
+                Binary::Dos => depth <= 2,
                 Binary::Elf(_) | Binary::Damaged => true,
             };
             if keep {
@@ -330,6 +332,38 @@ fn pick_portable(root: &Path, files: &[Found]) -> Option<usize> {
         })
         .max_by_key(|&(score, i)| (score, std::cmp::Reverse(i)))
         .map(|(_, i)| i)
+}
+
+/// Names of the programs DOS games came with besides the game: installers, sound and graphics
+/// setup, readers for the readme, DOS extenders.
+const DOS_TOOLS: &[&str] = &["install", "setup", "config", "setsound", "sndsetup", "soundset", "info", "readme", "read", "uninst", "dos4gw", "dos32a", "cwsdpmi", "pmodew", "pkunzip", "lha", "arj", "patch", "catalog", "order"];
+
+/// The DOS program that starts the game: not one of the tools, near the top, named like the
+/// folder; on a tie the biggest (SIMANT.EXE, not INFO.EXE).
+fn pick_dos(root: &Path, files: &[Found]) -> Option<usize> {
+    let folder: String = root.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default().chars().filter(|c| c.is_alphanumeric()).collect();
+    files
+        .iter()
+        .enumerate()
+        .filter_map(|(i, f)| {
+            if !matches!(f.binary, Binary::Dos) {
+                return None;
+            }
+            let s = stem(&f.path).to_lowercase();
+            if DOS_TOOLS.contains(&s.as_str()) {
+                return None;
+            }
+            let mut score = 0;
+            if f.path.components().count() == 1 {
+                score += 3;
+            }
+            if !s.is_empty() && folder.contains(&s) {
+                score += 2;
+            }
+            Some((score, fs::metadata(root.join(&f.path)).map_or(0, |m| m.len()), i))
+        })
+        .max_by_key(|&(score, size, i)| (score, size, std::cmp::Reverse(i)))
+        .map(|(_, _, i)| i)
 }
 
 /// The LÖVE version the game says it was made for: `t.version = "0.10.1"` in its conf.lua.

@@ -108,6 +108,17 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
                 }
                 Some((command, file, "Ruffle"))
             }
+            // Flathub's DOSBox likewise, writable: DOS games keep their settings and saves in
+            // their folder. Staging quits with the game; the original DOSBox needs -exit for that.
+            Problem::Dos { file, dosbox: Some(dosbox) } => {
+                let mut command = dosbox.clone();
+                if command[0] == "flatpak" {
+                    let dir = game.root.join(file).parent().map(|d| d.display().to_string()).unwrap_or_default();
+                    command.insert(2, format!("--filesystem={dir}"));
+                }
+                command.push("-exit".into());
+                Some((command, file, "DOSBox"))
+            }
             _ => None,
         });
         // A game made for LÖVE 0.9 or 0.10: LÖVE's own build of that series, set up once.
@@ -123,9 +134,6 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
             }
             None if old_love.is_some() => {
                 let (file, build) = old_love.unwrap();
-                if !targets.menu {
-                    return Err(format!("LÖVE {build} games can only be set up in the app menu for now: add --menu."));
-                }
                 let (command, note) = crate::love::runtime(build)?;
                 let mut outcome = setup_runner(game, command, file, &format!("LÖVE {build}"), targets)?;
                 outcome.done.splice(0..0, note);
@@ -136,7 +144,7 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
             None if report.problems.iter().any(|p| matches!(p, Problem::Source(..))) => Err("This is the game's source code: it has to be built first.".into()),
             None if report.problems.iter().any(|p| matches!(p, Problem::Package(_, "apk"))) => Err("It's an Android app; get the game's Linux or Windows download instead.".into()),
             None if report.problems.iter().any(|p| matches!(p, Problem::Package(..))) => Err("It's a package to install into the system; get the game's .tar.gz, .zip or AppImage download instead.".into()),
-            None if report.problems.iter().any(|p| matches!(p, Problem::Love { .. } | Problem::Python { .. } | Problem::Java { .. } | Problem::Flash { .. })) => {
+            None if report.problems.iter().any(|p| matches!(p, Problem::Love { .. } | Problem::Python { .. } | Problem::Java { .. } | Problem::Flash { .. } | Problem::Dos { .. })) => {
                 Err("This game needs another program to run it (see gamefix check); setting it up isn't supported yet.".into())
             }
             None => Err("No game program in this folder. If it's an installer, install the game first and set up the folder it installs to.".into()),
@@ -323,7 +331,7 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
             Problem::Alsa32(None) => not_fixed.push("Its 32-bit ALSA sound: needs Steam's runtime (install Steam), which has a plugin that works.".into()),
             Problem::KickFiles(files) => not_fixed.push(format!("Its missing Mono files ({}): only the developer can add them; the .exe with Proton works.", files.join(", "))),
             Problem::FnaLibs(libs) => not_fixed.push(format!("Its missing native libraries ({}): get FNA's fnalibs, or use the Windows download with Proton.", libs.join(", "))),
-            Problem::NoLinuxBuild | Problem::OwnWindowsDlls(_) | Problem::MissingWindowsParts(_) | Problem::Source(..) | Problem::Web(_) | Problem::Damaged(_) | Problem::Package(..) | Problem::Flash { .. } | Problem::Archive(_) | Problem::WrongMachine(_) | Problem::Love { .. } | Problem::Python { .. } | Problem::Java { .. } => {}
+            Problem::NoLinuxBuild | Problem::OwnWindowsDlls(_) | Problem::MissingWindowsParts(_) | Problem::Source(..) | Problem::Web(_) | Problem::Damaged(_) | Problem::Package(..) | Problem::Flash { .. } | Problem::Dos { .. } | Problem::Archive(_) | Problem::WrongMachine(_) | Problem::Love { .. } | Problem::Python { .. } | Problem::Java { .. } => {}
         }
     }
     if !preload.is_empty() {
@@ -503,9 +511,15 @@ fn write_entry(game: &Game, exec: &[String], workdir: &Path, icon: &str) -> Resu
 
 /// A game another program runs (`java -jar`, LÖVE): an app-menu entry running it on the file.
 fn setup_runner(game: &Game, command: Vec<String>, file: &Path, name: &str, targets: &Targets) -> Result<Outcome, String> {
-    if !targets.menu {
-        return Err(format!("{name} games can only be set up in the app menu for now: add --menu."));
-    }
+    let steam = if targets.steam {
+        let steam = Steam::find().ok_or("Steam isn't installed, or nobody has logged in to it yet.")?;
+        if steam.running() {
+            return Err(STEAM_OPEN.into());
+        }
+        Some(steam)
+    } else {
+        None
+    };
     if record_path(game).exists() {
         undo(game)?;
     }
@@ -526,19 +540,42 @@ fn setup_runner(game: &Game, command: Vec<String>, file: &Path, name: &str, targ
         }
     }
     let file = game.root.join(file);
-    let exec: Vec<String> = command.iter().chain([&file.display().to_string()]).map(|a| exec_arg(a)).collect();
-    let entry = write_entry(game, &exec, file.parent().unwrap_or(&game.root), "applications-games")?;
-    // Undo goes backwards: the entry first in the file is removed last.
-    record.insert(0, format!("created\t{}", entry.display()));
+    let workdir = file.parent().unwrap_or(&game.root);
+    if targets.menu {
+        let exec: Vec<String> = command.iter().chain([&file.display().to_string()]).map(|a| exec_arg(a)).collect();
+        let entry = write_entry(game, &exec, workdir, "applications-games")?;
+        // Undo goes backwards: the entry first in the file is removed last.
+        record.insert(0, format!("created\t{}", entry.display()));
+        done.insert(0, format!("Added \"{}\" to the app menu, under Games (run with {name}).", game.name));
+    }
+    // A non-Steam shortcut to the runner itself, with the rest after Steam's %command%.
+    if let Some(steam) = &steam {
+        let exe = program_path(&command[0]).ok_or(format!("{} isn't on the PATH, so Steam couldn't start it.", command[0]))?;
+        let quote = |v: &str| if v.chars().all(|c| c.is_ascii_alphanumeric() || "/-_.=+:,".contains(c)) { v.to_string() } else { format!("'{}'", v.replace('\'', "'\\''")) };
+        let args: Vec<String> = command[1..].iter().chain([&file.display().to_string()]).map(|a| quote(a)).collect();
+        let line = format!("%command% {}", args.join(" "));
+        let shortcuts = steam.shortcuts();
+        let shortcut = steam::Shortcut { name: &game.name, exe: &exe, start_dir: workdir, icon: "", launch_options: &line };
+        let appid = steam::add_shortcut(&shortcuts, &shortcut)?;
+        record.push(format!("steam-shortcut\t{appid}\t{}", shortcuts.display()));
+        done.push(format!("Added \"{}\" to Steam as a non-Steam game (run with {name}).", game.name));
+    }
     let record_file = record_path(game);
     fs::create_dir_all(record_file.parent().unwrap()).map_err(|e| e.to_string())?;
     fs::write(&record_file, record.iter().map(|l| format!("{l}\n")).collect::<String>()).map_err(|e| e.to_string())?;
-    refresh_menu();
-    if targets.steam {
-        not_fixed.push(format!("Steam shortcuts for {name} games aren't supported yet; start it from the app menu."));
+    if targets.menu {
+        refresh_menu();
     }
-    done.insert(0, format!("Added \"{}\" to the app menu, under Games (run with {name}).", game.name));
     Ok(Outcome { done, not_fixed })
+}
+
+/// A program's full path: as given when it has a slash, else the first match on the PATH.
+fn program_path(name: &str) -> Option<PathBuf> {
+    if name.contains('/') {
+        return Some(PathBuf::from(name));
+    }
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    std::env::split_paths(&path).map(|d| d.join(name)).find(|p| p.is_file())
 }
 
 /// JOGL's 64-bit native jars for the version an export carries (from its jars' manifests),
