@@ -548,12 +548,14 @@ fn setup_runner(game: &Game, command: Vec<String>, file: &Path, name: &str, targ
         record.insert(0, format!("created\t{}", entry.display()));
         done.insert(0, format!("Added \"{}\" to the app menu, under Games (run with {name}).", game.name));
     }
-    // A non-Steam shortcut to the runner itself, with the rest after Steam's %command%.
+    // A non-Steam shortcut to the runner itself, the rest as its launch options: Steam puts
+    // those after the program. Not `%command% ...`: Steam drops %command% and appends its
+    // launch chain and the program, so `run ...` came first and the shell failed on it.
     if let Some(steam) = &steam {
         let exe = program_path(&command[0]).ok_or(format!("{} isn't on the PATH, so Steam couldn't start it.", command[0]))?;
         let quote = |v: &str| if v.chars().all(|c| c.is_ascii_alphanumeric() || "/-_.=+:,".contains(c)) { v.to_string() } else { format!("'{}'", v.replace('\'', "'\\''")) };
         let args: Vec<String> = command[1..].iter().chain([&file.display().to_string()]).map(|a| quote(a)).collect();
-        let line = format!("%command% {}", args.join(" "));
+        let line = args.join(" ");
         let shortcuts = steam.shortcuts();
         let shortcut = steam::Shortcut { name: &game.name, exe: &exe, start_dir: workdir, icon: "", launch_options: &line };
         let appid = steam::add_shortcut(&shortcuts, &shortcut)?;
