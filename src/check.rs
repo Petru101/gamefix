@@ -915,7 +915,7 @@ impl Report {
                     if !unfixable.is_empty() {
                         let _ = writeln!(out, "  Neither the system{} nor the game has {}.", if self.old_runtime.is_some() { ", Steam's runtime" } else { "" }, unfixable.join(", "));
                         let _ = writeln!(out, "    Fix: gamefix setup looks for them in Fedora's packages (the release this system is built");
-                        let _ = writeln!(out, "    on), then Debian's, and downloads them into ~/.local/share/gamefix/libs for this game.");
+                        let _ = writeln!(out, "    on), then Debian's and older Ubuntu releases', and downloads them into ~/.local/share/gamefix/libs.");
                     }
                 }
                 Problem::Java { file, java: None } => {

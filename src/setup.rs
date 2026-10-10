@@ -243,7 +243,13 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
                             done.push(format!("Fetched libraries the system lacks into ~/.local/share/gamefix/libs, from {} (at launch).", fetched.sources.join(", ")));
                         }
                         if !fetched.missing.is_empty() {
-                            not_fixed.push(format!("Missing libraries no Fedora or Debian package has: {}.", fetched.missing.join(", ")));
+                            not_fixed.push(format!("Missing libraries no Fedora, Debian or Ubuntu package has: {}.", fetched.missing.join(", ")));
+                        }
+                        if fetched.needs_runtime && old_runtime.is_none() {
+                            if let Some(run) = &report.old_runtime {
+                                old_runtime = Some(run.clone());
+                                done.push("Starts it with Steam's runtime for older games, which has libraries the fetched ones need (Steam does that by itself).".into());
+                            }
                         }
                     }
                     if fs::read_dir(&links).map(|mut d| d.next().is_some()).unwrap_or(false) {

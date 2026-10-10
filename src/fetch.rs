@@ -1,6 +1,7 @@
 //! Libraries neither the system nor Steam's runtime has, taken from a distribution's packages:
 //! Fedora's first (the release Bazzite is built on, so they match the system), then Debian's
-//! for names Fedora doesn't have (Debian-only names like liblua5.2.so.0, or older versions).
+//! for names Fedora doesn't have (Debian-only names like liblua5.2.so.0, or older versions),
+//! then older Ubuntu releases' for versions only those still have (SFML 2.4: Excessum).
 //! Unpacked into gamefix's own folder for the game, never installed into the system.
 
 use crate::binary::{self, Binary};
@@ -14,6 +15,10 @@ use std::process::{Command, Stdio};
 /// against, the surer it runs on this one.
 const DEBIAN_SUITES: [&str; 3] = ["bookworm", "trixie", "bullseye"];
 
+/// Ubuntu releases still in its archive, oldest first. packages.ubuntu.com no longer lists
+/// 18.04, so these are searched through each release's own index files (cached).
+const UBUNTU_SUITES: [&str; 3] = ["bionic", "focal", "jammy"];
+
 pub struct Fetched {
     /// Files written into the folder (libraries and their links), for undo.
     pub files: Vec<PathBuf>,
@@ -21,6 +26,9 @@ pub struct Fetched {
     pub sources: Vec<String>,
     /// Libraries still found nowhere, the asked-for ones or what the fetched ones need.
     pub missing: Vec<String>,
+    /// The fetched libraries need some that only Steam's old runtime has (Ubuntu's SFML 2.4
+    /// needs libjpeg.so.8 and libFLAC.so.8): start the game through it.
+    pub needs_runtime: bool,
 }
 
 /// Fetches `libs` (and what they need that the system lacks) into `dest`.
@@ -28,7 +36,7 @@ pub fn fetch(libs: &[String], bits: u8, dest: &Path) -> Fetched {
     let system = System::load();
     let tmp = std::env::temp_dir().join(format!("gamefix-fetch-{}", std::process::id()));
     let root = tmp.join("root");
-    let mut out = Fetched { files: Vec::new(), sources: Vec::new(), missing: Vec::new() };
+    let mut out = Fetched { files: Vec::new(), sources: Vec::new(), missing: Vec::new(), needs_runtime: false };
     let mut want: Vec<String> = libs.to_vec();
     let mut tried: BTreeSet<String> = BTreeSet::new();
     // A few rounds: a fetched library may need another one the system lacks.
@@ -55,11 +63,12 @@ pub fn fetch(libs: &[String], bits: u8, dest: &Path) -> Fetched {
                     continue;
                 }
             }
-            match debian_package(&lib, bits) {
-                Some((suite, pkg, url)) => {
+            let found = debian_package(&lib, bits).map(|(suite, pkg, url)| (format!("Debian {suite}'s {pkg}"), pkg, url)).or_else(|| ubuntu_package(&lib, bits).map(|(suite, pkg, url)| (format!("Ubuntu {suite}'s {pkg}"), pkg, url)));
+            match found {
+                Some((source, pkg, url)) => {
                     let deb = tmp.join(format!("{pkg}.deb"));
                     if download(&url, &deb) && extract_deb(&deb, &root, &tmp.join(&pkg)) {
-                        out.sources.push(format!("Debian {suite}'s {pkg}"));
+                        out.sources.push(source);
                     }
                 }
                 None => out.missing.push(lib),
@@ -67,7 +76,7 @@ pub fn fetch(libs: &[String], bits: u8, dest: &Path) -> Fetched {
         }
         copy_libs(&root, bits, dest, &mut out.files);
         // What the copied libraries need that's nowhere yet.
-        want = needs(dest, bits, &system);
+        want = needs(dest, bits, &system, &mut out.needs_runtime);
     }
     let _ = fs::remove_dir_all(&tmp);
     // Asked for but not there after all (a package that didn't download or unpack).
@@ -170,15 +179,58 @@ fn copy_libs(root: &Path, bits: u8, dest: &Path, files: &mut Vec<PathBuf>) {
     }
 }
 
-/// Libraries the ones in `dest` need that neither the system nor `dest` has.
-fn needs(dest: &Path, bits: u8, system: &System) -> Vec<String> {
+/// Libraries the ones in `dest` need that neither the system nor `dest` has; ones only Steam's
+/// runtime has set `runtime` instead.
+fn needs(dest: &Path, bits: u8, system: &System, runtime: &mut bool) -> Vec<String> {
     let mut out = BTreeSet::new();
     for entry in fs::read_dir(dest).into_iter().flatten().flatten() {
         if let Some(Binary::Elf(elf)) = binary::identify(&entry.path()) {
             for lib in elf.needed.iter().filter(|l| elf.bits == bits && !system.has(l, bits) && !dest.join(l).exists()) {
-                out.insert(lib.clone());
+                if system.old_runtime.as_ref().is_some_and(|r| r.has(lib, bits)) {
+                    *runtime = true;
+                } else {
+                    out.insert(lib.clone());
+                }
             }
         }
     }
     out.into_iter().collect()
+}
+
+/// The package in an older Ubuntu release with a file of that name, from the release's
+/// Contents index ("usr/lib/x86_64-linux-gnu/libsfml-graphics.so.2.4   universe/libs/
+/// libsfml-graphics2.4"), and its download from the Packages index.
+fn ubuntu_package(lib: &str, bits: u8) -> Option<(&'static str, String, String)> {
+    let arch = if bits == 64 { "amd64" } else { "i386" };
+    let cache = std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?.join("gamefix/ubuntu");
+    let escaped: String = lib.chars().flat_map(|c| if ".+[]()*?^$|\\".contains(c) { vec!['\\', c] } else { vec![c] }).collect();
+    UBUNTU_SUITES.iter().find_map(|&suite| {
+        let contents = cached(&format!("https://archive.ubuntu.com/ubuntu/dists/{suite}/Contents-{arch}.gz"), &cache.join(format!("{suite}-Contents-{arch}.gz")))?;
+        let out = Command::new("zgrep").args(["-m1", "-E", &format!("^\\S*/{escaped}[[:space:]]")]).arg(&contents).output().ok()?;
+        let line = String::from_utf8_lossy(&out.stdout).into_owned();
+        // The last field: "section/package", several separated by commas.
+        let pkg = line.split_whitespace().last()?.split(',').next()?.rsplit('/').next()?.to_string();
+        ["main", "universe"].iter().find_map(|component| {
+            let index = cached(&format!("https://archive.ubuntu.com/ubuntu/dists/{suite}/{component}/binary-{arch}/Packages.gz"), &cache.join(format!("{suite}-{component}-{arch}-Packages.gz")))?;
+            let text = Command::new("zcat").arg(&index).output().ok()?.stdout;
+            let text = String::from_utf8_lossy(&text);
+            let stanza = text.split("\n\n").find(|s| s.lines().next() == Some(&format!("Package: {pkg}")))?;
+            let file = stanza.lines().find_map(|l| l.strip_prefix("Filename: "))?;
+            Some((suite, pkg.clone(), format!("https://archive.ubuntu.com/ubuntu/{file}")))
+        })
+    })
+}
+
+/// A file kept in the cache, downloaded the first time.
+fn cached(url: &str, path: &Path) -> Option<PathBuf> {
+    if !path.is_file() {
+        fs::create_dir_all(path.parent()?).ok()?;
+        let part = path.with_extension("part");
+        if !download(url, &part) {
+            let _ = fs::remove_file(&part);
+            return None;
+        }
+        fs::rename(&part, path).ok()?;
+    }
+    Some(path.to_path_buf())
 }
