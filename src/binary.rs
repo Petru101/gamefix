@@ -91,6 +91,9 @@ pub fn identify(path: &Path) -> Option<Binary> {
         Some(Binary::Package("deb"))
     } else if ext == "rpm" && head.starts_with(b"\xed\xab\xee\xdb") {
         Some(Binary::Package("rpm"))
+    } else if ext == "snap" && head.starts_with(b"hsqs") {
+        // A Snap package is a squashfs image (Fantasim).
+        Some(Binary::Package("snap"))
     } else if ["zip", "gz", "tgz", "xz", "bz2", "7z", "rar"].contains(&ext.as_str())
         && [&b"PK\x03\x04"[..], b"\x1f\x8b", b"BZh", b"\xfd7zXZ\0", b"7z\xbc\xaf\x27\x1c", b"Rar!"].iter().any(|m| head.starts_with(m))
     {
@@ -181,6 +184,69 @@ pub fn symbols(path: &Path) -> Option<Symbols> {
 /// Whether the file holds these bytes anywhere.
 pub fn contains(path: &Path, needle: &[u8]) -> bool {
     contains_groups(path, &[&[needle]])
+}
+
+/// Whether the first `limit` bytes of a file hold `needle` (a .NET single-file program's
+/// launcher, at the start, names libhostfxr.so; the bundle follows).
+pub fn head_contains(path: &Path, needle: &[u8], limit: u64) -> bool {
+    let Ok(f) = File::open(path) else { return false };
+    let mut head = Vec::new();
+    f.take(limit).read_to_end(&mut head).is_ok() && head.windows(needle.len()).any(|w| w == needle)
+}
+
+/// The `len` bytes after the first `needle` in a file, read in chunks (large files: .NET
+/// single-file bundles are ~90 MB).
+pub fn find_after(path: &Path, needle: &[u8], len: usize) -> Option<Vec<u8>> {
+    let mut f = File::open(path).ok()?;
+    let mut buf = vec![0u8; 1 << 20];
+    let mut window: Vec<u8> = Vec::new();
+    loop {
+        let n = f.read(&mut buf).ok()?;
+        window.extend_from_slice(&buf[..n]);
+        if let Some(at) = window.windows(needle.len()).position(|w| w == needle) {
+            let start = at + needle.len();
+            while window.len() < start + len {
+                let n = f.read(&mut buf).ok()?;
+                if n == 0 {
+                    break;
+                }
+                window.extend_from_slice(&buf[..n]);
+            }
+            return Some(window[start..(start + len).min(window.len())].to_vec());
+        }
+        if n == 0 {
+            return None;
+        }
+        window.drain(..window.len().saturating_sub(needle.len() + len));
+    }
+}
+
+/// Whether a zip ends with its central directory (the end record, "PK\x05\x06", in the last
+/// 64 KB + 22 bytes). Without it the upload was cut off or damaged, and unpackers refuse it
+/// (Flyer Kid: "End-of-central-directory signature not found").
+pub fn zip_complete(path: &Path) -> bool {
+    let Ok(mut f) = File::open(path) else { return true };
+    let Ok(size) = f.seek(SeekFrom::End(0)) else { return true };
+    let start = size.saturating_sub(65_557);
+    let Some(tail) = read_at(&mut f, start, (size - start) as usize) else { return true };
+    tail.windows(4).any(|w| w == b"PK\x05\x06")
+}
+
+/// Whether a script runs `path` (a path ending in /<program name>) on some line, rather than
+/// only preparing it: Alcarys Complex's install script `chmod`s Alcarys_Complex/runner and
+/// writes a desktop shortcut, and doesn't start the game.
+pub fn runs_path(script: &Path, name: &str) -> bool {
+    let Ok(text) = std::fs::read(script) else { return false };
+    let needle = format!("/{name}");
+    String::from_utf8_lossy(&text).lines().any(|line| {
+        let l = line.trim();
+        if l.starts_with('#') || !l.contains(&needle) {
+            return false;
+        }
+        // The command on the line, after any VAR=value settings and `exec`.
+        let first = l.split_whitespace().find(|w| !(w.contains('=') && !w.starts_with(['"', '\'', '$', '/', '.'])) && *w != "exec").unwrap_or("");
+        !["chmod", "chown", "cp", "mv", "ln", "rm", "sed", "echo", "printf", "[", "[[", "test", "if", "cat", "mkdir", "ls", "touch", "install", "file", "readlink", "basename", "dirname"].contains(&first)
+    })
 }
 
 /// Whether a jar's own classes use java.applet, which Java 26 removed (Sheep Farm Simulator:

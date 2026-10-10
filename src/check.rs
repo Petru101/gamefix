@@ -376,8 +376,19 @@ pub fn check(game: &Game, system: &System) -> Report {
     // .NET Core before 5 loads OpenSSL itself (dlopen, no DT_NEEDED) through its shim, and only
     // knows 1.0 and 1.1; without one it aborts at the first HTTPS request ("No usable version
     // of libssl was found": KlSS, .NET Core 2.2, fetching a level). 1.1 is what can be fetched.
-    let shim = main.path.parent().unwrap_or(Path::new("")).join("System.Security.Cryptography.Native.OpenSsl.so");
-    if game.root.join(&shim).is_file() && dotnet_core(&main_dir, &main.path).is_some_and(|v| v < 5) && !["libssl.so.1.1", "libssl.so.1.0.2", "libssl.so.1.0.0", "libssl.so.10"].iter().any(|l| system.has(l, elf.bits)) {
+    let shim_name = "System.Security.Cryptography.Native.OpenSsl.so";
+    let shim_file = main.path.parent().unwrap_or(Path::new("")).join(shim_name);
+    // A single-file bundle carries the shim inside the program.
+    let shim = if dotnet_core(&main_dir, &main.path).is_some_and(|v| v < 5) && !["libssl.so.1.1", "libssl.so.1.0.2", "libssl.so.1.0.0", "libssl.so.10"].iter().any(|l| system.has(l, elf.bits)) {
+        if game.root.join(&shim_file).is_file() {
+            Some(shim_file)
+        } else {
+            binary::contains(&game.full(main), shim_name.as_bytes()).then(|| main.path.clone())
+        }
+    } else {
+        None
+    };
+    if let Some(shim) = shim {
         for lib in ["libssl.so.1.1", "libcrypto.so.1.1"] {
             later.entry(lib.to_string()).or_default().push(shim.clone());
         }
@@ -634,12 +645,13 @@ pub fn old_love(version: Option<&str>) -> bool {
 }
 
 fn old_dotnet(dir: &Path, main: &Path) -> Option<String> {
-    if !dir.join("libhostfxr.so").is_file() {
-        return None;
-    }
     let stem = main.file_name()?.to_string_lossy().into_owned();
-    let config = std::fs::read_to_string(dir.join(format!("{stem}.runtimeconfig.json"))).unwrap_or_default();
-    if config.contains("System.Globalization.Invariant\":true") || config.contains("System.Globalization.Invariant\": true") {
+    if dir.join("libhostfxr.so").is_file() {
+        let config = std::fs::read_to_string(dir.join(format!("{stem}.runtimeconfig.json"))).unwrap_or_default();
+        if config.contains("System.Globalization.Invariant\":true") || config.contains("System.Globalization.Invariant\": true") {
+            return None;
+        }
+    } else if !binary::head_contains(&dir.join(&stem), b"libhostfxr.so", 2 << 20) || binary::contains_groups(&dir.join(&stem), &[&[b"System.Globalization.Invariant\": true", b"System.Globalization.Invariant\":true"]]) {
         return None;
     }
     let version = dotnet_core_version(dir, main)?;
@@ -648,13 +660,20 @@ fn old_dotnet(dir: &Path, main: &Path) -> Option<String> {
 }
 
 /// A self-contained .NET Core program's framework version, from its deps.json:
-/// "runtimeTarget": {"name": ".NETCoreApp,Version=v2.1/linux-x64", ...}
+/// "runtimeTarget": {"name": ".NETCoreApp,Version=v2.1/linux-x64", ...}. A single-file
+/// bundle (no libhostfxr.so beside it) carries deps.json inside the program (Asciipocalypse,
+/// .NET Core 3.1: ICU abort like The Heart's Illumination).
 fn dotnet_core_version(dir: &Path, main: &Path) -> Option<String> {
-    if !dir.join("libhostfxr.so").is_file() {
-        return None;
-    }
     let stem = main.file_name()?.to_string_lossy().into_owned();
-    let deps = std::fs::read_to_string(dir.join(format!("{stem}.deps.json"))).ok()?;
+    let deps = if dir.join("libhostfxr.so").is_file() {
+        std::fs::read_to_string(dir.join(format!("{stem}.deps.json"))).ok()?
+    } else {
+        let program = dir.join(&stem);
+        if !binary::head_contains(&program, b"libhostfxr.so", 2 << 20) || !binary::contains(&program, format!("{stem}.deps.json").as_bytes()) {
+            return None;
+        }
+        format!(".NETCoreApp,Version=v{}", String::from_utf8_lossy(&binary::find_after(&program, b".NETCoreApp,Version=v", 8)?))
+    };
     let at = deps.find(".NETCoreApp,Version=v")? + ".NETCoreApp,Version=v".len();
     Some(deps[at..].chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect())
 }
@@ -873,6 +892,13 @@ impl Report {
         }
         for problem in &self.problems {
             match problem {
+                Problem::Archive(path) if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("zip")) && !binary::zip_complete(&game.root.join(path)) => {
+                    let _ = writeln!(out, "✗ There's no program to run here, and the archive the game is in is incomplete:");
+                    let _ = writeln!(out, "      {}", path.display());
+                    let _ = writeln!(out, "  It has no table of contents at its end, so it can't be unpacked: the download was cut off,");
+                    let _ = writeln!(out, "  or the file on the game's page is damaged.");
+                    let _ = writeln!(out, "    Fix: download it again; if it's the same, only the developer can fix it.");
+                }
                 Problem::Archive(path) => {
                     let _ = writeln!(out, "✗ There's no program to run here, but there's an archive the game may still be packed in:");
                     let _ = writeln!(out, "      {}", path.display());
@@ -980,6 +1006,11 @@ impl Report {
                 Problem::Package(file, "deb") => {
                     let _ = writeln!(out, "✗ This download is a Debian/Ubuntu package ({}). Bazzite can't install those,", file.display());
                     let _ = writeln!(out, "  and the game inside expects to be installed into the system's folders.");
+                    let _ = writeln!(out, "    Fix: look on the game's page for a .tar.gz, .zip, AppImage or Flatpak download instead.");
+                }
+                Problem::Package(file, "snap") => {
+                    let _ = writeln!(out, "✗ This download is a Snap package ({}). Bazzite has no Snap support, and the", file.display());
+                    let _ = writeln!(out, "  game inside expects Snap's own runtime around it.");
                     let _ = writeln!(out, "    Fix: look on the game's page for a .tar.gz, .zip, AppImage or Flatpak download instead.");
                 }
                 Problem::Package(file, _) => {

@@ -56,7 +56,7 @@ impl Game {
                 && main.path.starts_with(dir)
                 && ((binary::sets_library_path(&self.full(f)) && binary::contains(&self.full(f), name.as_bytes()))
                     || binary::passes_file(&self.full(f), &name)
-                    || (dir != main_dir && binary::contains(&self.full(f), format!("/{name}").as_bytes())))
+                    || (dir != main_dir && binary::runs_path(&self.full(f), &name) && !f.path.to_string_lossy().to_lowercase().contains("install")))
                 // Not one starting it through a bundled ld.so (Exodus: Liberation Circuit), which
                 // setup bypasses on purpose.
                 && !binary::contains(&self.full(f), b"--library-path")
