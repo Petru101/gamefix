@@ -155,7 +155,7 @@ fn download(url: &str, to: &Path) -> bool {
 }
 
 /// A .deb is an `ar` archive holding data.tar.*: unpack that into `root`.
-fn extract_deb(deb: &Path, root: &Path, work: &Path) -> bool {
+pub fn extract_deb(deb: &Path, root: &Path, work: &Path) -> bool {
     if fs::create_dir_all(work).is_err() || !Command::new("ar").arg("x").arg(deb).current_dir(work).status().is_ok_and(|s| s.success()) {
         return false;
     }

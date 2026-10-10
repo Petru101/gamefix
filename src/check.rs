@@ -1046,7 +1046,19 @@ impl Report {
                             let _ = writeln!(out, "  It was made for LÖVE {}, and the LÖVE you can install (11, on Flathub) can't run", version.as_deref().unwrap_or_default());
                             let _ = writeln!(out, "  games made for 0.10 or older.");
                         }
-                        let _ = writeln!(out, "    Fix: if the game has a Windows download, use that with Proton (it brings its own LÖVE).");
+                        match version.as_deref().and_then(crate::love::build_for) {
+                            Some(build) if crate::love::installed(build) => {
+                                let _ = writeln!(out, "    Fix: LÖVE {build} (LÖVE's own Linux build) is set up here; gamefix setup adds the game to the");
+                                let _ = writeln!(out, "    app menu running on it.");
+                            }
+                            Some(build) => {
+                                let _ = writeln!(out, "    Fix: LÖVE {build}, LÖVE's own Linux build: gamefix setup downloads it once (under 1 MB, plus");
+                                let _ = writeln!(out, "    the libraries it needs that the system lacks) and adds the game to the app menu on it.");
+                            }
+                            None => {
+                                let _ = writeln!(out, "    Fix: if the game has a Windows download, use that with Proton (it brings its own LÖVE).");
+                            }
+                        }
                     } else {
                         let _ = writeln!(out, "    Fix: install LÖVE from Flathub (org.love2d.love2d); then gamefix setup adds it to the app menu.");
                     }

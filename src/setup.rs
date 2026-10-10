@@ -110,11 +110,26 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
             }
             _ => None,
         });
+        // A game made for LÖVE 0.9 or 0.10: LÖVE's own build of that series, set up once.
+        let old_love = report.problems.iter().find_map(|p| match p {
+            Problem::Love { file, version: Some(v), .. } if crate::check::old_love(Some(v)) => crate::love::build_for(v).map(|b| (file, b)),
+            _ => None,
+        });
         return match game.windows {
             Some(i) => setup_windows(game, report, &game.files[i], targets),
             None if runner.is_some() => {
                 let (command, file, name) = runner.unwrap();
                 setup_runner(game, command, file, name, targets)
+            }
+            None if old_love.is_some() => {
+                let (file, build) = old_love.unwrap();
+                if !targets.menu {
+                    return Err(format!("LÖVE {build} games can only be set up in the app menu for now: add --menu."));
+                }
+                let (command, note) = crate::love::runtime(build)?;
+                let mut outcome = setup_runner(game, command, file, &format!("LÖVE {build}"), targets)?;
+                outcome.done.splice(0..0, note);
+                Ok(outcome)
             }
             None if report.problems.iter().any(|p| matches!(p, Problem::Archive(_))) => Err("The game is still packed in an archive: unpack it, then set up the folder it makes.".into()),
             None if report.problems.iter().any(|p| matches!(p, Problem::Source(..))) => Err("This is the game's source code: it has to be built first.".into()),
