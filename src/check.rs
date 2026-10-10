@@ -14,8 +14,8 @@ pub enum Problem {
     /// Nothing to run, but an archive the game may still be packed in (C-Dogs SDL: a .tar.gz
     /// inside the .zip).
     Archive(PathBuf),
-    /// A .love file: needs the LÖVE version it was made for.
-    Love { file: PathBuf, version: Option<String> },
+    /// A .love file: needs the LÖVE version it was made for; `love` is how to start an installed one.
+    Love { file: PathBuf, version: Option<String>, love: Option<Vec<String>> },
     /// Python code: needs Python (2 is gone from current systems) and maybe pygame.
     Python { file: PathBuf, v2: bool, pygame: bool },
     /// A .jar: needs Java; `java` is where one was found.
@@ -135,7 +135,7 @@ pub fn check(game: &Game, system: &System) -> Report {
 
     let Some((main, elf)) = game.main() else {
         match game.portable.map(|i| &game.files[i]) {
-            Some(f) if matches!(f.binary, Binary::Love) => problems.push(Problem::Love { file: f.path.clone(), version: game.engine.as_ref().and_then(|e| e.version.clone()) }),
+            Some(f) if matches!(f.binary, Binary::Love) => problems.push(Problem::Love { file: f.path.clone(), version: game.engine.as_ref().and_then(|e| e.version.clone()), love: system.love() }),
             Some(f) if matches!(f.binary, Binary::Jar) => problems.push(Problem::Java { file: f.path.clone(), java: system.java() }),
             Some(f) => {
                 let python = game.files.iter().filter_map(|f| match &f.binary {
@@ -338,6 +338,11 @@ fn fna_libs(dir: &Path, bits: u8) -> Vec<String> {
 
 /// The .NET Core version a self-contained .NET program next to `dir` ships, if older than 5 and
 /// not already set to work without ICU.
+/// LÖVE 0.x, which today's LÖVE 11 can't run.
+pub fn old_love(version: Option<&str>) -> bool {
+    version.is_some_and(|v| v.starts_with("0."))
+}
+
 fn old_dotnet(dir: &Path, main: &Path) -> Option<String> {
     if !dir.join("libhostfxr.so").is_file() {
         return None;
@@ -551,15 +556,28 @@ impl Report {
                         let _ = writeln!(out, "    It's an installer: run it with Proton first, then check the folder it installs to.");
                     }
                 }
-                Problem::Love { file, version } => {
-                    let _ = writeln!(out, "✗ This is a LÖVE game: {} is run by the LÖVE program, which isn't part of the system.", file.display());
+                Problem::Love { file, version, love } => {
                     // LÖVE 11 changed its API; 0.x games mostly fail on it (0.10.1: crashes loading sounds).
-                    if version.as_deref().is_some_and(|v| v.starts_with("0.")) {
-                        let _ = writeln!(out, "  It was made for LÖVE {}, and the LÖVE you can install (11, on Flathub) can't run", version.as_deref().unwrap_or_default());
-                        let _ = writeln!(out, "  games made for 0.10 or older.");
+                    let old = old_love(version.as_deref());
+                    if let (Some(love), false) = (love, old) {
+                        let _ = writeln!(out, "• This is a LÖVE game; LÖVE is installed, so it runs with: {} \"{}\"", love.join(" "), file.display());
+                        let _ = writeln!(out, "  gamefix setup adds that to the app menu.");
+                        continue;
+                    }
+                    if love.is_some() {
+                        let _ = writeln!(out, "✗ This is a LÖVE game ({}), made for LÖVE {}. The LÖVE installed here", file.display(), version.as_deref().unwrap_or_default());
+                        let _ = writeln!(out, "  is 11 (the only one on Flathub), which can't run games made for 0.10 or older.");
+                    } else {
+                        let _ = writeln!(out, "✗ This is a LÖVE game: {} is run by the LÖVE program, which isn't part of the system.", file.display());
+                    }
+                    if old {
+                        if love.is_none() {
+                            let _ = writeln!(out, "  It was made for LÖVE {}, and the LÖVE you can install (11, on Flathub) can't run", version.as_deref().unwrap_or_default());
+                            let _ = writeln!(out, "  games made for 0.10 or older.");
+                        }
                         let _ = writeln!(out, "    Fix: if the game has a Windows download, use that with Proton (it brings its own LÖVE).");
                     } else {
-                        let _ = writeln!(out, "    Fix: install LÖVE from Flathub (org.love2d.love2d) and open the .love file with it.");
+                        let _ = writeln!(out, "    Fix: install LÖVE from Flathub (org.love2d.love2d); then gamefix setup adds it to the app menu.");
                     }
                 }
                 Problem::Python { file, v2: true, .. } => {

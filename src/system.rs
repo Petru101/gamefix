@@ -104,6 +104,18 @@ impl System {
         std::env::split_paths(&path).chain([PathBuf::from("/home/linuxbrew/.linuxbrew/bin")]).map(|d| d.join("java")).find(|j| j.is_file())
     }
 
+    /// How to start LÖVE: Flathub's (Bazzite's way to install it; its sandbox can read the whole
+    /// system) or one on the PATH.
+    pub fn love(&self) -> Option<Vec<String>> {
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+        let flatpak = [PathBuf::from("/var/lib/flatpak"), home.join(".local/share/flatpak")].iter().any(|d| d.join("app/org.love2d.love2d/current").exists());
+        if flatpak {
+            return Some(vec!["flatpak".into(), "run".into(), "org.love2d.love2d".into()]);
+        }
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        std::env::split_paths(&path).map(|d| d.join("love")).find(|l| l.is_file()).map(|l| vec![l.display().to_string()])
+    }
+
     pub fn refuses_exec_stack(&self) -> bool {
         self.glibc.is_some_and(|v| v >= (2, 41))
     }

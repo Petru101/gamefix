@@ -87,15 +87,17 @@ fn icon(game: &Game, main: &Path) -> String {
 
 pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome, String> {
     let Some((main, _)) = game.main() else {
-        let java = report.problems.iter().find_map(|p| match p {
-            Problem::Java { file, java: Some(java) } => Some((file, java)),
+        // A game another program runs: that program and the file to give it.
+        let runner = report.problems.iter().find_map(|p| match p {
+            Problem::Java { file, java: Some(java) } => Some((vec![java.display().to_string(), "-jar".into()], file, "Java")),
+            Problem::Love { file, version, love: Some(love) } if !crate::check::old_love(version.as_deref()) => Some((love.clone(), file, "LÖVE")),
             _ => None,
         });
         return match game.windows {
             Some(i) => setup_windows(game, &game.files[i], targets),
-            None if java.is_some() => {
-                let (file, java) = java.unwrap();
-                setup_java(game, file, java, targets)
+            None if runner.is_some() => {
+                let (command, file, name) = runner.unwrap();
+                setup_runner(game, command, file, name, targets)
             }
             None if report.problems.iter().any(|p| matches!(p, Problem::Archive(_))) => Err("The game is still packed in an archive: unpack it, then set up the folder it makes.".into()),
             None if report.problems.iter().any(|p| matches!(p, Problem::Love { .. } | Problem::Python { .. } | Problem::Java { .. })) => {
@@ -301,23 +303,23 @@ fn write_entry(game: &Game, exec: &[String], workdir: &Path, icon: &str) -> Resu
     Ok(entry)
 }
 
-/// A Java game: an app-menu entry running `java -jar`.
-fn setup_java(game: &Game, jar: &Path, java: &Path, targets: &Targets) -> Result<Outcome, String> {
+/// A game another program runs (`java -jar`, LÖVE): an app-menu entry running it on the file.
+fn setup_runner(game: &Game, command: Vec<String>, file: &Path, name: &str, targets: &Targets) -> Result<Outcome, String> {
     if !targets.menu {
-        return Err("Java games can only be set up in the app menu for now: add --menu.".into());
+        return Err(format!("{name} games can only be set up in the app menu for now: add --menu."));
     }
     if record_path(game).exists() {
         undo(game)?;
     }
-    let jar = game.root.join(jar);
-    let exec: Vec<String> = [java.display().to_string(), "-jar".into(), jar.display().to_string()].iter().map(|a| exec_arg(a)).collect();
-    let entry = write_entry(game, &exec, jar.parent().unwrap_or(&game.root), "applications-games")?;
+    let file = game.root.join(file);
+    let exec: Vec<String> = command.iter().chain([&file.display().to_string()]).map(|a| exec_arg(a)).collect();
+    let entry = write_entry(game, &exec, file.parent().unwrap_or(&game.root), "applications-games")?;
     let record_file = record_path(game);
     fs::create_dir_all(record_file.parent().unwrap()).map_err(|e| e.to_string())?;
     fs::write(&record_file, format!("created\t{}\n", entry.display())).map_err(|e| e.to_string())?;
     refresh_menu();
-    let not_fixed = if targets.steam { vec!["Steam shortcuts for Java games aren't supported yet; start it from the app menu.".into()] } else { Vec::new() };
-    Ok(Outcome { done: vec![format!("Added \"{}\" to the app menu, under Games (run with Java).", game.name)], not_fixed })
+    let not_fixed = if targets.steam { vec![format!("Steam shortcuts for {name} games aren't supported yet; start it from the app menu.")] } else { Vec::new() };
+    Ok(Outcome { done: vec![format!("Added \"{}\" to the app menu, under Games (run with {name}).", game.name)], not_fixed })
 }
 
 /// A Windows-only game: a non-Steam shortcut forced to Proton, like ticking "Force the use of a
