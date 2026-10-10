@@ -11,6 +11,9 @@ use std::path::{Path, PathBuf};
 
 pub enum Problem {
     NoLinuxBuild,
+    /// Nothing to run, but an archive the game may still be packed in (C-Dogs SDL: a .tar.gz
+    /// inside the .zip).
+    Archive(PathBuf),
     /// A .love file: needs the LÖVE version it was made for.
     Love { file: PathBuf, version: Option<String> },
     /// Python code: needs Python (2 is gone from current systems) and maybe pygame.
@@ -41,6 +44,16 @@ pub enum Problem {
     /// loaded later by the graphics driver, then gets the old functions and crashes (2:22AM).
     /// The system's libstdc++ to preload, if found.
     OwnLibstdcxx(Option<String>),
+    /// NW.js on Chromium 56-90 quits at start with "Could not find the default font" under
+    /// current fontconfig rules (lilac & her light, 65; 38-55 are fine). The Chromium version.
+    NwjsFonts(String),
+    /// Native libraries FNA.dll.config maps to that are neither shipped nor installed
+    /// (Shipwreck's download has empty lib/ and lib64/).
+    FnaLibs(Vec<String>),
+    /// SDL2 add-ons (mixer, image, ...) come from Steam's runtime, built for the real SDL2, while
+    /// the system's SDL2 is sdl2-compat on top of SDL3: C-Dogs SDL crashed with that mix and
+    /// runs with the runtime's own SDL2 preloaded. That library's path.
+    Sdl2Mix(String),
     /// .NET Core before 5 only looks for older ICU versions than current systems have, and
     /// quits at start (The Heart's Illumination, 2.1).
     DotnetIcu(String),
@@ -132,7 +145,10 @@ pub fn check(game: &Game, system: &System) -> Report {
                 let (v2, pygame) = python.fold((false, false), |(v2, pg), p| (v2 || p.v2, pg || p.pygame));
                 problems.push(Problem::Python { file: f.path.clone(), v2, pygame });
             }
-            None => problems.push(Problem::NoLinuxBuild),
+            None => problems.push(match game.archive {
+                Some(i) => Problem::Archive(game.files[i].path.clone()),
+                None => Problem::NoLinuxBuild,
+            }),
         }
         report.problems = problems;
         return report;
@@ -168,10 +184,19 @@ pub fn check(game: &Game, system: &System) -> Report {
         let dir = game.root.join(path.parent().unwrap_or(Path::new("")));
         if e.runpath.is_empty() { expand(&e.rpath, &dir).into_iter().chain(main_rpath.iter().cloned()).collect() } else { expand(&e.runpath, &dir) }
     };
-    // A launcher script may point LD_LIBRARY_PATH anywhere in the folder; it isn't evaluated.
-    let launcher_path = game.files.iter().any(|f| matches!(f.binary, Binary::Script) && binary::contains(&game.full(f), b"LD_LIBRARY_PATH"));
+    // A launcher script next to the program or above it may point LD_LIBRARY_PATH anywhere in
+    // the folder; it isn't evaluated.
+    let launcher_path = game.files.iter().any(|f| {
+        matches!(f.binary, Binary::Script) && f.path.parent().is_some_and(|d| main.path.starts_with(d)) && binary::contains(&game.full(f), b"LD_LIBRARY_PATH")
+    });
     let reachable = |path: &Path, e: &Elf, lib: &str| system.has(lib, elf.bits) || search(path, e).iter().any(|d| d.join(lib).is_file());
 
+    // A bundled library the system or Steam's runtime also has may be loaded from there instead
+    // (Gravitus Minus' launcher puts its own folder last), so what its copy misses isn't certain.
+    let replaceable = |p: &PathBuf| {
+        p != &main.path
+            && p.file_name().map(|n| n.to_string_lossy().into_owned()).is_some_and(|n| system.has(&n, elf.bits) || system.old_runtime.as_ref().is_some_and(|r| r.has(&n, elf.bits)))
+    };
     // What ld.so loads at start: the program, then what each needs, found where it looks. Only
     // these have to be found that way; plugins loaded later may find theirs among what's
     // already loaded, or by a path the game passes, so any copy in the folder counts for them.
@@ -182,7 +207,7 @@ pub fn check(game: &Game, system: &System) -> Report {
             let Some(&(p, dep)) = by_name.get(OsStr::new(lib)) else { continue };
             // ld.so gets the game's copy through the search path or a launcher's LD_LIBRARY_PATH.
             let loads_copy = launcher_path || search(path, e).iter().any(|d| d.join(lib).is_file());
-            if loads_copy && startup.insert(p) {
+            if loads_copy && !replaceable(p) && startup.insert(p) {
                 queue.push_back((p, dep));
             }
         }
@@ -219,9 +244,17 @@ pub fn check(game: &Game, system: &System) -> Report {
             (what, libs)
         })
         .collect();
+    let sdl2_addons = ["libSDL2_mixer-2.0.so.0", "libSDL2_image-2.0.so.0", "libSDL2_ttf-2.0.so.0", "libSDL2_net-2.0.so.0"];
+    let addon_from_runtime = missing.keys().chain(later.keys()).any(|l| sdl2_addons.contains(&l.as_str()) && system.old_runtime.as_ref().is_some_and(|r| r.has(l, elf.bits)));
+    // sdl2-compat loads SDL3 itself (dlopen), so it's known by its own settings' names.
+    let compat = system.path("libSDL2-2.0.so.0", elf.bits).is_some_and(|p| binary::contains(Path::new(p), b"SDL2COMPAT_"));
+    let sdl2_mix = (addon_from_runtime && compat).then(|| system.old_runtime.as_ref().and_then(|r| r.path("libSDL2-2.0.so.0", elf.bits))).flatten();
     if !missing.is_empty() || !later.is_empty() {
         let in_old_runtime = missing.keys().chain(later.keys()).filter(|l| system.old_runtime.as_ref().is_some_and(|r| r.has(l, elf.bits))).cloned().collect();
         problems.push(Problem::MissingLibs { bits: elf.bits, libs: missing, later, in_old_runtime, misplaced });
+    }
+    if let Some(sdl2) = sdl2_mix {
+        problems.push(Problem::Sdl2Mix(sdl2.display().to_string()));
     }
 
     // glibc only refuses to make the stack executable for libraries loaded later; if the program
@@ -241,6 +274,16 @@ pub fn check(game: &Game, system: &System) -> Report {
     if let Some(version) = old_dotnet(&main_dir, &main.path) {
         problems.push(Problem::DotnetIcu(version));
     }
+    if game.engine.as_ref().is_some_and(|e| e.name == "NW.js") {
+        let lib = [main_dir.join("lib/libnw.so"), game.full(main)].into_iter().find(|p| p.is_file());
+        if let Some(version) = lib.and_then(|l| chromium_version(&l)).filter(|v| v.split('.').next().and_then(|m| m.parse::<u32>().ok()).is_some_and(|m| (56..=90).contains(&m))) {
+            problems.push(Problem::NwjsFonts(version));
+        }
+    }
+    let fna_missing = fna_libs(&main_dir, elf.bits).into_iter().filter(|l| !system.has(l, elf.bits)).collect::<Vec<_>>();
+    if !fna_missing.is_empty() {
+        problems.push(Problem::FnaLibs(fna_missing));
+    }
 
     let old_unity = game.engine.as_ref().filter(|e| e.name == "Unity").and_then(|e| e.version.as_deref()).and_then(|v| {
         let mut parts = v.split('.');
@@ -258,6 +301,39 @@ pub fn check(game: &Game, system: &System) -> Report {
 
     report.problems = problems;
     report
+}
+
+/// The Chromium version built into NW.js: the "65.0.3325.146" that appears most in the library.
+fn chromium_version(path: &Path) -> Option<String> {
+    let data = std::fs::read(path).ok()?;
+    let mut counts: HashMap<&[u8], usize> = HashMap::new();
+    for (i, w) in data.windows(4).enumerate() {
+        // "NN.0." followed by a 4-digit build and a patch number.
+        if w[2..] == *b".0" && w[0].is_ascii_digit() && w[1].is_ascii_digit() && (i == 0 || !data[i - 1].is_ascii_digit()) {
+            let end = data[i..].iter().take(20).position(|c| !c.is_ascii_digit() && *c != b'.').map_or(i, |e| i + e);
+            let s = &data[i..end];
+            if s.iter().filter(|&&c| c == b'.').count() == 3 && s.split(|&c| c == b'.').nth(2).is_some_and(|b| b.len() == 4) {
+                *counts.entry(s).or_default() += 1;
+            }
+        }
+    }
+    counts.into_iter().max_by_key(|&(_, n)| n).map(|(s, _)| String::from_utf8_lossy(s).into_owned())
+}
+
+/// Native libraries an FNA game maps to in FNA.dll.config (os="linux") that aren't in its lib64/
+/// (64-bit) or lib/ folder.
+fn fna_libs(dir: &Path, bits: u8) -> Vec<String> {
+    let Ok(config) = std::fs::read_to_string(dir.join("FNA.dll.config")) else { return Vec::new() };
+    let libdir = dir.join(if bits == 64 { "lib64" } else { "lib" });
+    let mut out: Vec<String> = config
+        .lines()
+        .filter(|l| l.contains("os=\"linux\""))
+        .filter_map(|l| l.split("target=\"").nth(1)?.split('"').next().map(String::from))
+        .filter(|t| !libdir.join(t).exists())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// The .NET Core version a self-contained .NET program next to `dir` ships, if older than 5 and
@@ -451,6 +527,22 @@ impl Report {
         }
         for problem in &self.problems {
             match problem {
+                Problem::Archive(path) => {
+                    let _ = writeln!(out, "✗ There's no program to run here, but there's an archive the game may still be packed in:");
+                    let _ = writeln!(out, "      {}", path.display());
+                    let _ = writeln!(out, "    Fix: unpack it (right-click → Extract), then check the folder it makes.");
+                }
+                Problem::NwjsFonts(version) => {
+                    let _ = writeln!(out, "✗ Its NW.js (Chromium {version}) may quit at start with \"Could not find the default font\":");
+                    let _ = writeln!(out, "  that Chromium can't handle this system's font settings.");
+                    let _ = writeln!(out, "    Fix (at launch): FONTCONFIG_FILE pointing to a plain font list (gamefix setup writes one).");
+                }
+                Problem::FnaLibs(libs) => {
+                    let _ = writeln!(out, "✗ The game's own native libraries are missing (its download left them out): {}.", libs.join(", "));
+                    let _ = writeln!(out, "  It quits at start without them.");
+                    let _ = writeln!(out, "    Fix: FNA's \"fnalibs\" archive (fna.flibitijibibo.com) has them; put its lib64 files in the");
+                    let _ = writeln!(out, "    game's lib64 folder. Or use the Windows download with Proton, if there is one.");
+                }
                 Problem::NoLinuxBuild => {
                     let _ = writeln!(out, "✗ There is no Linux version of this game.");
                     if let Some(i) = game.windows {
@@ -551,6 +643,11 @@ impl Report {
                             let _ = writeln!(out, "    Fix (at launch): preload the system's libstdc++.so.6 (not found here).");
                         }
                     }
+                }
+                Problem::Sdl2Mix(path) => {
+                    let _ = writeln!(out, "✗ SDL2 add-ons from Steam's runtime were built for the real SDL2, but this system's SDL2");
+                    let _ = writeln!(out, "  is sdl2-compat (SDL3 underneath); some games crash with that mix (C-Dogs SDL did).");
+                    let _ = writeln!(out, "    Fix (at launch): LD_PRELOAD={path} (the runtime's own SDL2)");
                 }
                 Problem::DotnetIcu(version) => {
                     let _ = writeln!(out, "✗ It's built on .NET Core {version}, which only looks for older versions of the ICU library");

@@ -33,10 +33,26 @@ pub struct Game {
     /// Index into `files` of a game another program runs (a .love file, Python code), when
     /// there's no Linux program.
     pub portable: Option<usize>,
+    /// Index into `files` of an archive the game may still be packed in, when there's nothing
+    /// else to run.
+    pub archive: Option<usize>,
     pub engine: Option<Engine>,
 }
 
 impl Game {
+    /// A script next to the program or in a folder above it that starts it and sets
+    /// LD_LIBRARY_PATH, the way the developer meant it to be started (Gravitus Minus).
+    pub fn launcher(&self) -> Option<&Found> {
+        let (main, _) = self.main()?;
+        let name = main.path.file_name()?.to_string_lossy().into_owned();
+        self.files.iter().find(|f| {
+            matches!(f.binary, Binary::Script)
+                && f.path.parent().is_some_and(|d| main.path.starts_with(d))
+                && binary::contains(&self.full(f), b"LD_LIBRARY_PATH")
+                && binary::contains(&self.full(f), name.as_bytes())
+        })
+    }
+
     pub fn main(&self) -> Option<(&Found, &binary::Elf)> {
         let found = &self.files[self.main?];
         match &found.binary {
@@ -85,6 +101,9 @@ pub fn scan(path: &Path) -> Option<Game> {
         None if chosen.is_some() => chosen.as_ref().and_then(|c| files.iter().position(|f| &f.path == c && matches!(f.binary, Binary::Love | Binary::Jar | Binary::Python(_)))),
         None => pick_portable(&root, &files),
     };
+    let archive = (main.is_none() && windows.is_none() && portable.is_none())
+        .then(|| files.iter().enumerate().filter(|(_, f)| matches!(f.binary, Binary::Archive)).min_by_key(|(_, f)| f.path.components().count()).map(|(i, _)| i))
+        .flatten();
     let program = main.or(windows);
     let engine = match portable {
         Some(i) if matches!(files[i].binary, Binary::Love) => Some(Engine { name: "LÖVE", version: love_version(&root.join(&files[i].path)) }),
@@ -95,7 +114,7 @@ pub fn scan(path: &Path) -> Option<Game> {
         .or_else(|| chosen.as_ref().filter(|_| shared_folder(&root)).map(|c| stem(c)))
         .or_else(|| root.file_name().map(|n| n.to_string_lossy().into_owned()))
         .unwrap_or_else(|| root.display().to_string());
-    Some(Game { root, name, files, main, windows, portable, engine })
+    Some(Game { root, name, files, main, windows, portable, archive, engine })
 }
 
 /// Folders that hold unrelated downloads rather than one game.
@@ -121,11 +140,11 @@ fn walk(root: &Path, rel: &Path, depth: usize, out: &mut Vec<Found>) {
             }
         } else if let Some(binary) = binary::identify(&root.join(&path)) {
             let is_exe = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe"));
-            // Windows DLLs aren't interesting, and scripts only at the top, where launchers live.
+            // Windows DLLs aren't interesting, and scripts only near the top, where launchers live.
             let keep = match &binary {
                 Binary::Pe(_) => is_exe,
-                Binary::Script => depth == 0,
-                Binary::Love | Binary::Jar | Binary::Python(_) => depth <= 1,
+                Binary::Script => depth <= 2,
+                Binary::Love | Binary::Jar | Binary::Python(_) | Binary::Archive => depth <= 1,
                 Binary::Elf(_) => true,
             };
             if keep {

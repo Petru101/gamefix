@@ -97,6 +97,7 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
                 let (file, java) = java.unwrap();
                 setup_java(game, file, java, targets)
             }
+            None if report.problems.iter().any(|p| matches!(p, Problem::Archive(_))) => Err("The game is still packed in an archive: unpack it, then set up the folder it makes.".into()),
             None if report.problems.iter().any(|p| matches!(p, Problem::Love { .. } | Problem::Python { .. } | Problem::Java { .. })) => {
                 Err("This game needs another program to run it (see gamefix check); setting it up isn't supported yet.".into())
             }
@@ -158,6 +159,10 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
                 done.push("Loads the system's C++ library first, so the graphics driver doesn't crash the game (at launch).".into());
             }
             Problem::OwnLibstdcxx(None) => not_fixed.push("Its built-in C++ library: the system's libstdc++.so.6 to preload wasn't found.".into()),
+            Problem::Sdl2Mix(path) => {
+                preload.push(path.clone());
+                done.push("Loads the runtime's own SDL2, to match its SDL2 add-ons (at launch).".into());
+            }
             Problem::DotnetIcu(_) => {
                 env.push(("DOTNET_SYSTEM_GLOBALIZATION_INVARIANT", "1".into()));
                 done.push("Lets its old .NET start without the ICU library (at launch).".into());
@@ -189,7 +194,12 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
                 }
             }
             Problem::UnityH264(_) => not_fixed.push("Its H.264 videos: Unity's Linux player can't play them; the Windows download with Proton can.".into()),
-            Problem::NoLinuxBuild | Problem::WrongMachine(_) | Problem::Love { .. } | Problem::Python { .. } | Problem::Java { .. } => {}
+            Problem::NwjsFonts(_) => {
+                env.push(("FONTCONFIG_FILE", plain_fonts()?.display().to_string()));
+                done.push("Gives its NW.js a plain font list it can read (at launch; the first start takes longer).".into());
+            }
+            Problem::FnaLibs(libs) => not_fixed.push(format!("Its missing native libraries ({}): get FNA's fnalibs, or use the Windows download with Proton.", libs.join(", "))),
+            Problem::NoLinuxBuild | Problem::Archive(_) | Problem::WrongMachine(_) | Problem::Love { .. } | Problem::Python { .. } | Problem::Java { .. } => {}
         }
     }
     if !preload.is_empty() {
@@ -202,7 +212,12 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
             done.push("Starts it with Steam's runtime for older games, in case it needs libraries this system dropped (it's packed, so they can't be read).".into());
         }
     }
-    let workdir = program.parent().unwrap_or(&game.root);
+    // The developer's launcher script, when it sets up where the libraries are; else the program.
+    let start = game.launcher().map(|l| game.full(l)).unwrap_or_else(|| program.clone());
+    if start != program {
+        done.push(format!("Starts it through its own launcher script, {}.", start.file_name().unwrap_or_default().to_string_lossy()));
+    }
+    let workdir = start.parent().unwrap_or(&game.root);
     let icon = icon(game, &main.path);
 
     if targets.menu {
@@ -217,7 +232,7 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
         if hide_helpers {
             exec.extend(["sh", "-c", &format!("{HIDE_HELPERS} exec \"$@\" \"$0\"")].map(exec_arg));
         }
-        exec.push(exec_arg(&program.display().to_string()));
+        exec.push(exec_arg(&start.display().to_string()));
         let entry = write_entry(game, &exec, workdir, &icon)?;
         record.push(format!("created\t{}", entry.display()));
         done.push(format!("Added \"{}\" to the app menu, under Games.", game.name));
@@ -238,7 +253,7 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
         let file = steam.shortcuts();
         let shortcut = steam::Shortcut {
             name: &game.name,
-            exe: &program,
+            exe: &start,
             start_dir: workdir,
             icon: if icon.starts_with('/') { &icon } else { "" },
             launch_options: &launch_options(&env, hide_helpers, ""),
@@ -255,6 +270,18 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
         refresh_menu();
     }
     Ok(Outcome { done, not_fixed })
+}
+
+/// A font list for old Chromium (NW.js) that can't handle the system's font rules: just the font
+/// folders, with its own cache. Shared by every game that needs it, so undo leaves it.
+fn plain_fonts() -> Result<PathBuf, String> {
+    let file = data_home().join("gamefix/fonts.conf");
+    if !file.exists() {
+        fs::create_dir_all(file.parent().unwrap()).map_err(|e| e.to_string())?;
+        let text = "<?xml version=\"1.0\"?>\n<!DOCTYPE fontconfig SYSTEM \"fonts.dtd\">\n<!-- Written by gamefix for old NW.js games: the font folders without the system's rules. -->\n<fontconfig>\n  <dir>/usr/share/fonts</dir>\n  <dir>/usr/local/share/fonts</dir>\n  <dir prefix=\"xdg\">fonts</dir>\n  <cachedir prefix=\"xdg\">gamefix-fontconfig</cachedir>\n</fontconfig>\n";
+        fs::write(&file, text).map_err(|e| e.to_string())?;
+    }
+    Ok(file)
 }
 
 /// Writes the game's app-menu entry running `exec` (already quoted) in `workdir`.

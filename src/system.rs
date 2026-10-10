@@ -20,6 +20,7 @@ pub struct System {
 /// libraries first, the runtime's filling the gaps.
 pub struct OldRuntime {
     pub run: PathBuf,
+    dir: PathBuf,
     libs: HashMap<String, u8>,
 }
 
@@ -34,11 +35,17 @@ impl OldRuntime {
                 *libs.entry(entry.file_name().to_string_lossy().into_owned()).or_insert(0) |= bit;
             }
         }
-        Some(OldRuntime { run: dir.join("run.sh"), libs })
+        Some(OldRuntime { run: dir.join("run.sh"), dir, libs })
     }
 
     pub fn has(&self, name: &str, bits: u8) -> bool {
         has(&self.libs, name, bits)
+    }
+
+    /// Where the runtime keeps a library, for preloading it.
+    pub fn path(&self, name: &str, bits: u8) -> Option<PathBuf> {
+        let arch = if bits == 64 { "x86_64-linux-gnu" } else { "i386-linux-gnu" };
+        [format!("lib/{arch}"), format!("usr/lib/{arch}")].iter().map(|d| self.dir.join(d).join(name)).find(|p| p.exists())
     }
 }
 

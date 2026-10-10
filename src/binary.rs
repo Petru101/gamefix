@@ -16,6 +16,8 @@ pub enum Binary {
     Love,
     /// A Java program, which `java -jar` runs.
     Jar,
+    /// A zip, tar or 7z archive: the game may still be packed inside.
+    Archive,
     Python(Python),
 }
 
@@ -66,6 +68,10 @@ pub fn identify(path: &Path) -> Option<Binary> {
         Some(Binary::Love)
     } else if ext == "jar" && head.starts_with(b"PK\x03\x04") {
         Some(Binary::Jar)
+    } else if ["zip", "gz", "tgz", "xz", "bz2", "7z", "rar"].contains(&ext.as_str())
+        && [&b"PK\x03\x04"[..], b"\x1f\x8b", b"BZh", b"\xfd7zXZ\0", b"7z\xbc\xaf\x27\x1c", b"Rar!"].iter().any(|m| head.starts_with(m))
+    {
+        Some(Binary::Archive)
     } else if ext == "pyc" && n >= 4 && head[2..4] == *b"\r\n" {
         // The first two bytes number the bytecode format: Python 2 used 20121-62211 (2.7),
         // Python 3 started again at 3000.
@@ -258,7 +264,8 @@ fn elf(f: &mut File, h: &[u8]) -> Option<Elf> {
         // DT_STRTAB is an address; find the file offset through the segment that holds it.
         let file_off = loads.iter().find(|(va, _, sz)| strtab >= *va && strtab < va + sz).map(|(va, off, _)| strtab - va + off);
         if let Some(off) = file_off {
-            let strings = read_at(f, off, strsz.min(1 << 20) as usize)?;
+            // Programs exporting many symbols (NW.js) have string tables of several MB.
+            let strings = read_at(f, off, strsz.min(64 << 20) as usize)?;
             let string = |n: u64| {
                 let start = n as usize;
                 (start < strings.len()).then(|| {
