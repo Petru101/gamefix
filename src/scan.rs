@@ -9,7 +9,7 @@ const MAX_DEPTH: usize = 8;
 const MAX_FILES: usize = 50_000;
 
 /// Programs that ship next to games but aren't the game.
-const NOT_THE_GAME: &[&str] = &["crashhandler", "crashpad", "createdump", "crashreport", "chrome-sandbox", "unins", "redist", "vc_redist", "dxsetup", "steamwebhelper", "quicksfv"];
+const NOT_THE_GAME: &[&str] = &["crashhandler", "crashpad", "createdump", "crashreport", "chrome-sandbox", "unins", "redist", "vc_redist", "dxsetup", "steamwebhelper", "quicksfv", "nacl_helper", "nwjc", "chromedriver", "minidump_stackwalk"];
 
 pub struct Found {
     /// Relative to the game's root.
@@ -82,7 +82,7 @@ pub fn scan(path: &Path) -> Option<Game> {
     };
     let portable = match main {
         Some(_) => None,
-        None if chosen.is_some() => chosen.as_ref().and_then(|c| files.iter().position(|f| &f.path == c && matches!(f.binary, Binary::Love | Binary::Python(_)))),
+        None if chosen.is_some() => chosen.as_ref().and_then(|c| files.iter().position(|f| &f.path == c && matches!(f.binary, Binary::Love | Binary::Jar | Binary::Python(_)))),
         None => pick_portable(&root, &files),
     };
     let program = main.or(windows);
@@ -125,7 +125,7 @@ fn walk(root: &Path, rel: &Path, depth: usize, out: &mut Vec<Found>) {
             let keep = match &binary {
                 Binary::Pe(_) => is_exe,
                 Binary::Script => depth == 0,
-                Binary::Love | Binary::Python(_) => depth <= 1,
+                Binary::Love | Binary::Jar | Binary::Python(_) => depth <= 1,
                 Binary::Elf(_) => true,
             };
             if keep {
@@ -156,7 +156,7 @@ fn pick_main(root: &Path, files: &[Found]) -> Option<usize> {
             let dir = root.join(f.path.parent().unwrap_or(Path::new("")));
             let s = stem(&f.path);
             let mut score = 0;
-            if dir.join(format!("{s}_Data")).is_dir() || dir.join(format!("{s}.pck")).is_file() || dir.join("data.pck").is_file() {
+            if dir.join(format!("{s}_Data")).is_dir() || dir.join(format!("{s}.pck")).is_file() || dir.join("data.pck").is_file() || dir.join("package.nw").exists() {
                 score += 10;
             }
             if f.path.components().count() == 1 {
@@ -205,11 +205,13 @@ fn pick_windows(root: &Path, files: &[Found]) -> Option<usize> {
         .map(|(_, i)| i)
 }
 
-/// A .love file, else the Python file that looks like the game's start: named like the folder
-/// or main/game/run, preferring ones that use pygame.
+/// A .love file, else a .jar, else the Python file that looks like the game's start: named like
+/// the folder or main/game/run, preferring ones that use pygame. Nearest the top first.
 fn pick_portable(root: &Path, files: &[Found]) -> Option<usize> {
-    if let Some(i) = files.iter().position(|f| matches!(f.binary, Binary::Love)) {
-        return Some(i);
+    for kind in [|b: &Binary| matches!(b, Binary::Love), |b: &Binary| matches!(b, Binary::Jar)] {
+        if let Some((i, _)) = files.iter().enumerate().filter(|(_, f)| kind(&f.binary)).min_by_key(|(_, f)| f.path.components().count()) {
+            return Some(i);
+        }
     }
     let folder: String = root.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default().chars().filter(|c| c.is_alphanumeric()).collect();
     files

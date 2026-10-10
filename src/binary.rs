@@ -14,6 +14,8 @@ pub enum Binary {
     Script,
     /// A LÖVE game: a zip of Lua code that the `love` program runs.
     Love,
+    /// A Java program, which `java -jar` runs.
+    Jar,
     Python(Python),
 }
 
@@ -62,6 +64,8 @@ pub fn identify(path: &Path) -> Option<Binary> {
         Some(Binary::Script)
     } else if ext == "love" && head.starts_with(b"PK\x03\x04") {
         Some(Binary::Love)
+    } else if ext == "jar" && head.starts_with(b"PK\x03\x04") {
+        Some(Binary::Jar)
     } else if ext == "pyc" && n >= 4 && head[2..4] == *b"\r\n" {
         // The first two bytes number the bytecode format: Python 2 used 20121-62211 (2.7),
         // Python 3 started again at 3000.

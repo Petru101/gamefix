@@ -15,11 +15,20 @@ pub enum Problem {
     Love { file: PathBuf, version: Option<String> },
     /// Python code: needs Python (2 is gone from current systems) and maybe pygame.
     Python { file: PathBuf, v2: bool, pygame: bool },
+    /// A .jar: needs Java; `java` is where one was found.
+    Java { file: PathBuf, java: Option<PathBuf> },
     WrongMachine(u16),
     NotExecutable(PathBuf),
-    /// Library name → the game's files that need it; and which of them Steam's runtime for
-    /// older games has.
-    MissingLibs { bits: u8, libs: BTreeMap<String, Vec<PathBuf>>, in_old_runtime: BTreeSet<String> },
+    /// Library name → the game's files that need it: `libs` at start (the game can't start
+    /// without them), `later` only by plugins loaded later, if at all. Which of all those Steam's
+    /// runtime for older games has, and which the game ships in a folder ld.so doesn't look in.
+    MissingLibs {
+        bits: u8,
+        libs: BTreeMap<String, Vec<PathBuf>>,
+        later: BTreeMap<String, Vec<PathBuf>>,
+        in_old_runtime: BTreeSet<String>,
+        misplaced: BTreeMap<String, PathBuf>,
+    },
     ExecStack(Vec<PathBuf>),
     /// Libraries that get another library's functions of the same name instead of the ones
     /// they were built against (Final Shot: Unity's built-in FMOD answering for the game's).
@@ -28,6 +37,13 @@ pub enum Problem {
     UnitySingleInstance,
     /// H.264 videos in a Unity Linux build: its player only decodes VP8 there.
     UnityH264(Vec<PathBuf>),
+    /// The program has the C++ standard library built in and exports it; the system's copy,
+    /// loaded later by the graphics driver, then gets the old functions and crashes (2:22AM).
+    /// The system's libstdc++ to preload, if found.
+    OwnLibstdcxx(Option<String>),
+    /// .NET Core before 5 only looks for older ICU versions than current systems have, and
+    /// quits at start (The Heart's Illumination, 2.1).
+    DotnetIcu(String),
 }
 
 pub struct Clash {
@@ -42,6 +58,14 @@ pub struct Clash {
 }
 
 impl Problem {
+    /// The folders, as absolute paths, holding the game's own copies of libraries ld.so misses.
+    pub fn library_path(misplaced: &BTreeMap<String, PathBuf>, root: &Path) -> Vec<String> {
+        let mut dirs: Vec<String> = misplaced.values().map(|d| root.join(d).display().to_string()).collect();
+        dirs.sort();
+        dirs.dedup();
+        dirs
+    }
+
     /// Libraries to put in LD_PRELOAD so the intended ones are found first: providers, then
     /// the victims themselves (the combination tested on Final Shot).
     pub fn preload(clashes: &[Clash]) -> Vec<PathBuf> {
@@ -99,6 +123,7 @@ pub fn check(game: &Game, system: &System) -> Report {
     let Some((main, elf)) = game.main() else {
         match game.portable.map(|i| &game.files[i]) {
             Some(f) if matches!(f.binary, Binary::Love) => problems.push(Problem::Love { file: f.path.clone(), version: game.engine.as_ref().and_then(|e| e.version.clone()) }),
+            Some(f) if matches!(f.binary, Binary::Jar) => problems.push(Problem::Java { file: f.path.clone(), java: system.java() }),
             Some(f) => {
                 let python = game.files.iter().filter_map(|f| match &f.binary {
                     Binary::Python(p) => Some(p),
@@ -130,25 +155,61 @@ pub fn check(game: &Game, system: &System) -> Report {
             _ => None,
         })
         .collect();
-    let bundled: HashSet<&std::ffi::OsStr> = same.iter().filter_map(|(p, _)| p.file_name()).collect();
+    let mut by_name: HashMap<&OsStr, (&PathBuf, &Elf)> = HashMap::new();
+    for &(p, e) in &same {
+        if let Some(n) = p.file_name() {
+            by_name.entry(n).or_insert((p, e));
+        }
+    }
     // The program's DT_RPATH also applies to everything it loads that has no DT_RUNPATH.
     let main_dir = game.root.join(main.path.parent().unwrap_or(Path::new("")));
     let main_rpath = if elf.runpath.is_empty() { expand(&elf.rpath, &main_dir) } else { Vec::new() };
-    let mut missing: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
-    let mut optional: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
-    for (path, e) in &same {
+    let search = |path: &Path, e: &Elf| -> Vec<PathBuf> {
         let dir = game.root.join(path.parent().unwrap_or(Path::new("")));
-        let search: Vec<PathBuf> = if e.runpath.is_empty() { expand(&e.rpath, &dir).into_iter().chain(main_rpath.iter().cloned()).collect() } else { expand(&e.runpath, &dir) };
+        if e.runpath.is_empty() { expand(&e.rpath, &dir).into_iter().chain(main_rpath.iter().cloned()).collect() } else { expand(&e.runpath, &dir) }
+    };
+    // A launcher script may point LD_LIBRARY_PATH anywhere in the folder; it isn't evaluated.
+    let launcher_path = game.files.iter().any(|f| matches!(f.binary, Binary::Script) && binary::contains(&game.full(f), b"LD_LIBRARY_PATH"));
+    let reachable = |path: &Path, e: &Elf, lib: &str| system.has(lib, elf.bits) || search(path, e).iter().any(|d| d.join(lib).is_file());
+
+    // What ld.so loads at start: the program, then what each needs, found where it looks. Only
+    // these have to be found that way; plugins loaded later may find theirs among what's
+    // already loaded, or by a path the game passes, so any copy in the folder counts for them.
+    let mut startup: HashSet<&PathBuf> = HashSet::from([&main.path]);
+    let mut queue: VecDeque<(&PathBuf, &Elf)> = VecDeque::from([(&main.path, elf)]);
+    while let Some((path, e)) = queue.pop_front() {
         for lib in &e.needed {
-            if system.has(lib, elf.bits) || bundled.contains(std::ffi::OsStr::new(lib)) || search.iter().any(|d| d.join(lib).is_file()) {
-                continue;
-            }
-            match optional_plugin(path).or_else(|| java_window_part(path, lib)) {
-                Some(what) => optional.entry(what).or_default().push(lib.clone()),
-                None => missing.entry(lib.clone()).or_default().push((*path).clone()),
+            let Some(&(p, dep)) = by_name.get(OsStr::new(lib)) else { continue };
+            // ld.so gets the game's copy through the search path or a launcher's LD_LIBRARY_PATH.
+            let loads_copy = launcher_path || search(path, e).iter().any(|d| d.join(lib).is_file());
+            if loads_copy && startup.insert(p) {
+                queue.push_back((p, dep));
             }
         }
     }
+    let mut missing: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
+    let mut later: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
+    let mut misplaced: BTreeMap<String, PathBuf> = BTreeMap::new();
+    let mut optional: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
+    for &(path, e) in &same {
+        let at_start = startup.contains(path);
+        for lib in &e.needed {
+            let copy = by_name.get(OsStr::new(lib)).map(|(p, _)| *p);
+            if reachable(path, e, lib) || (copy.is_some() && (!at_start || launcher_path)) {
+                continue;
+            }
+            if let Some(what) = optional_plugin(path).or_else(|| java_window_part(path, lib)) {
+                optional.entry(what).or_default().push(lib.clone());
+                continue;
+            }
+            if let Some(copy) = copy {
+                misplaced.insert(lib.clone(), copy.parent().unwrap_or(Path::new("")).to_path_buf());
+            }
+            (if at_start { &mut missing } else { &mut later }).entry(lib.clone()).or_default().push(path.clone());
+        }
+    }
+    // A library missing at start and later is a start problem.
+    later.retain(|lib, _| !missing.contains_key(lib));
     report.libs_checked = same.iter().filter(|(_, e)| !e.program).count();
     report.harmless = optional
         .into_iter()
@@ -158,14 +219,14 @@ pub fn check(game: &Game, system: &System) -> Report {
             (what, libs)
         })
         .collect();
-    if !missing.is_empty() {
-        let in_old_runtime = missing.keys().filter(|l| system.old_runtime.as_ref().is_some_and(|r| r.has(l, elf.bits))).cloned().collect();
-        problems.push(Problem::MissingLibs { bits: elf.bits, libs: missing, in_old_runtime });
+    if !missing.is_empty() || !later.is_empty() {
+        let in_old_runtime = missing.keys().chain(later.keys()).filter(|l| system.old_runtime.as_ref().is_some_and(|r| r.has(l, elf.bits))).cloned().collect();
+        problems.push(Problem::MissingLibs { bits: elf.bits, libs: missing, later, in_old_runtime, misplaced });
     }
 
-    // glibc only refuses to make the stack executable later; if the program already asks for
-    // one, these libraries load fine.
-    let exec_stack: Vec<PathBuf> = same.iter().filter(|(_, e)| !e.program && e.exec_stack).map(|(p, _)| (*p).clone()).collect();
+    // glibc only refuses to make the stack executable for libraries loaded later; if the program
+    // already asks for one, these load fine too.
+    let exec_stack: Vec<PathBuf> = same.iter().filter(|(p, e)| !e.program && e.exec_stack && !startup.contains(p)).map(|(p, _)| (*p).clone()).collect();
     if !exec_stack.is_empty() && !elf.exec_stack && system.refuses_exec_stack() {
         problems.push(Problem::ExecStack(exec_stack));
     }
@@ -173,6 +234,12 @@ pub fn check(game: &Game, system: &System) -> Report {
     let clashes = symbol_clashes(game, &main.path, &same);
     if !clashes.is_empty() {
         problems.push(Problem::SymbolClash(clashes));
+    }
+    if !elf.needed.iter().any(|l| l == "libstdc++.so.6") && binary::symbols(&game.full(main)).is_some_and(|s| s.defined.iter().any(|d| d.starts_with("_ZNSt8ios_base4Init"))) {
+        problems.push(Problem::OwnLibstdcxx(system.path("libstdc++.so.6", elf.bits).map(String::from)));
+    }
+    if let Some(version) = old_dotnet(&main_dir, &main.path) {
+        problems.push(Problem::DotnetIcu(version));
     }
 
     let old_unity = game.engine.as_ref().filter(|e| e.name == "Unity").and_then(|e| e.version.as_deref()).and_then(|v| {
@@ -191,6 +258,25 @@ pub fn check(game: &Game, system: &System) -> Report {
 
     report.problems = problems;
     report
+}
+
+/// The .NET Core version a self-contained .NET program next to `dir` ships, if older than 5 and
+/// not already set to work without ICU.
+fn old_dotnet(dir: &Path, main: &Path) -> Option<String> {
+    if !dir.join("libhostfxr.so").is_file() {
+        return None;
+    }
+    let stem = main.file_name()?.to_string_lossy().into_owned();
+    let config = std::fs::read_to_string(dir.join(format!("{stem}.runtimeconfig.json"))).unwrap_or_default();
+    if config.contains("System.Globalization.Invariant\":true") || config.contains("System.Globalization.Invariant\": true") {
+        return None;
+    }
+    // "runtimeTarget": {"name": ".NETCoreApp,Version=v2.1/linux-x64", ...}
+    let deps = std::fs::read_to_string(dir.join(format!("{stem}.deps.json"))).ok()?;
+    let at = deps.find(".NETCoreApp,Version=v")? + ".NETCoreApp,Version=v".len();
+    let version: String = deps[at..].chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+    let major: u32 = version.split('.').next()?.parse().ok()?;
+    (major < 5).then_some(version)
 }
 
 /// The start of an MP4 file: its "ftyp" box with a common brand.
@@ -331,6 +417,7 @@ impl Report {
             let what = match (&f.binary, &game.engine) {
                 (Binary::Love, Some(e)) => format!("LÖVE game{}", e.version.as_ref().map(|v| format!(", made for LÖVE {v}")).unwrap_or_default()),
                 (Binary::Python(p), _) if p.v2 => "Python 2 game".into(),
+                (Binary::Jar, _) => "Java game".into(),
                 _ => "Python game".into(),
             };
             let _ = writeln!(out, "  Runs:  {} ({what})", f.path.display());
@@ -401,32 +488,75 @@ impl Report {
                     let _ = writeln!(out, "✗ {} isn't marked as a program, so double-clicking it does nothing.", p.display());
                     let _ = writeln!(out, "    Usually lost when unpacking a zip. Fix (once): chmod +x \"{}\"", p.display());
                 }
-                Problem::MissingLibs { bits, libs, in_old_runtime } => {
-                    let _ = writeln!(out, "✗ {} {bits}-bit librar{} the game needs {} not installed:", libs.len(), if libs.len() == 1 { "y" } else { "ies" }, if libs.len() == 1 { "is" } else { "are" });
-                    let mixed = !in_old_runtime.is_empty() && in_old_runtime.len() < libs.len();
-                    for (lib, users) in libs {
-                        let mark = if mixed && in_old_runtime.contains(lib) { " (Steam's runtime has it)" } else { "" };
-                        let _ = writeln!(out, "    {lib}{mark}, needed by:");
-                        list(&mut out, users);
+                Problem::MissingLibs { bits, libs, later, in_old_runtime, misplaced } => {
+                    let mark = |lib: &String| match (in_old_runtime.contains(lib), misplaced.get(lib)) {
+                        (true, Some(dir)) => format!(" (Steam's runtime has it; the game has it in {}/)", dir.display()),
+                        (true, None) => " (Steam's runtime has it)".to_string(),
+                        (false, Some(dir)) => format!(" (the game has it in {}/)", dir.display()),
+                        (false, None) => String::new(),
+                    };
+                    let plural = |n: usize| if n == 1 { "y" } else { "ies" };
+                    if !libs.is_empty() {
+                        let _ = writeln!(out, "✗ {} {bits}-bit librar{} the game needs to start {} missing:", libs.len(), plural(libs.len()), if libs.len() == 1 { "is" } else { "are" });
+                        for (lib, users) in libs {
+                            let _ = writeln!(out, "    {lib}{}, needed by:", mark(lib));
+                            list(&mut out, users);
+                        }
+                    }
+                    if !later.is_empty() {
+                        let _ = writeln!(out, "{} {} {bits}-bit librar{} only plugins need {} missing; they're loaded later, if at all, so", if libs.is_empty() { "•" } else { " " }, later.len(), plural(later.len()), if later.len() == 1 { "is" } else { "are" });
+                        let _ = writeln!(out, "  the game may start without them (that feature won't work):");
+                        for (lib, users) in later {
+                            let _ = writeln!(out, "    {lib}{}, needed by:", mark(lib));
+                            list(&mut out, users);
+                        }
                     }
                     match &self.old_runtime {
                         Some(run) if !in_old_runtime.is_empty() => {
-                            let which = if mixed { "Some of them are" } else if libs.len() == 1 { "It's" } else { "They're all" };
-                            let _ = writeln!(out, "  {which} in Steam's runtime for older games, where Steam keeps libraries newer systems dropped.");
+                            let _ = writeln!(out, "  Steam's runtime for older games keeps libraries newer systems dropped{}.", if in_old_runtime.len() < libs.len() + later.len() { " (marked)" } else { ", all of these" });
                             let _ = writeln!(out, "    Fix (at launch): start it through {}", run.display());
                             let _ = writeln!(out, "    Started from Steam it gets them by itself; gamefix setup does it for the app-menu entry.");
-                            if mixed {
-                                let _ = writeln!(out, "  The others aren't there either.");
-                            }
                         }
-                        Some(_) => {
-                            let _ = writeln!(out, "  Steam's runtime for older games doesn't have {} either.", if libs.len() == 1 { "it" } else { "them" });
-                        }
+                        Some(_) => {}
                         None => {
                             let _ = writeln!(out, "  Steam's runtime for older games often has libraries like these, but Steam isn't installed.");
                         }
                     }
-                    let _ = writeln!(out, "    If only a plugin needs one, the game may run without it (that feature won't work).");
+                    if !misplaced.is_empty() {
+                        let _ = writeln!(out, "  The game ships some itself (marked), in a folder Linux doesn't look in for them.");
+                        let _ = writeln!(out, "    Fix (at launch): LD_LIBRARY_PATH={}", Problem::library_path(misplaced, &game.root).join(":"));
+                    }
+                    let unfixable: Vec<&str> = libs.keys().filter(|l| !in_old_runtime.contains(*l) && !misplaced.contains_key(*l)).map(String::as_str).collect();
+                    if !unfixable.is_empty() && self.old_runtime.is_some() {
+                        let _ = writeln!(out, "  Nothing here has {}.", unfixable.join(", "));
+                    }
+                }
+                Problem::Java { file, java: None } => {
+                    let _ = writeln!(out, "✗ This is a Java game ({}): it runs with \"java -jar\", and Java isn't installed.", file.display());
+                    let _ = writeln!(out, "    Fix: on Bazzite, run \"brew install openjdk\" in a terminal; then gamefix setup adds it to the app menu.");
+                }
+                Problem::Java { file, java: Some(java) } => {
+                    let _ = writeln!(out, "• This is a Java game; Java is installed, so it runs with: {} -jar \"{}\"", java.display(), file.display());
+                    let _ = writeln!(out, "  gamefix setup adds that to the app menu.");
+                }
+                Problem::OwnLibstdcxx(preload) => {
+                    let _ = writeln!(out, "✗ The program has its own old copy of the C++ standard library built in. When the graphics");
+                    let _ = writeln!(out, "  driver loads the system's copy, that one gets the program's old functions and the game");
+                    let _ = writeln!(out, "  crashes at start (2:22AM, Unity 5.0: in std::ios_base::Init).");
+                    match preload {
+                        Some(p) => {
+                            let _ = writeln!(out, "    Fix (at launch): LD_PRELOAD={p}");
+                        }
+                        None => {
+                            let _ = writeln!(out, "    Fix (at launch): preload the system's libstdc++.so.6 (not found here).");
+                        }
+                    }
+                }
+                Problem::DotnetIcu(version) => {
+                    let _ = writeln!(out, "✗ It's built on .NET Core {version}, which only looks for older versions of the ICU library");
+                    let _ = writeln!(out, "  (language and text rules) than this system has, so it quits at start.");
+                    let _ = writeln!(out, "    Fix (at launch): DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1 (one set of rules for every");
+                    let _ = writeln!(out, "    language, which games don't notice).");
                 }
                 Problem::ExecStack(paths) => {
                     let (a, b) = self.glibc.unwrap_or_default();

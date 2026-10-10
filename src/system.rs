@@ -8,6 +8,8 @@ use std::process::Command;
 pub struct System {
     /// Library file name → bit 1 for 32-bit, bit 2 for 64-bit x86.
     libs: HashMap<String, u8>,
+    /// (library file name, 32 or 64) → where ld.so's cache has it.
+    paths: HashMap<(String, u8), String>,
     pub glibc: Option<(u32, u32)>,
     pub old_runtime: Option<OldRuntime>,
 }
@@ -55,6 +57,7 @@ fn run(candidates: &[&str], args: &[&str]) -> Option<String> {
 impl System {
     pub fn load() -> System {
         let mut libs = HashMap::new();
+        let mut paths = HashMap::new();
         // Lines look like "\tlibGL.so.1 (libc6,x86-64) => /lib64/libGL.so.1"; 32-bit x86 is plain "(libc6)".
         for line in run(&["/usr/sbin/ldconfig", "/sbin/ldconfig", "ldconfig"], &["-p"]).unwrap_or_default().lines().skip(1) {
             let Some((name, rest)) = line.trim().split_once(" (") else { continue };
@@ -66,6 +69,9 @@ impl System {
                 _ => continue,
             };
             *libs.entry(name.to_string()).or_insert(0) |= bit;
+            if let Some((_, path)) = rest.split_once(" => ") {
+                paths.entry((name.to_string(), if bit == 2 { 64 } else { 32 })).or_insert_with(|| path.trim().to_string());
+            }
         }
         // "ldd (GNU libc) 2.43": the host's glibc, which a static build can't ask about directly.
         let glibc = run(&["/usr/bin/ldd", "ldd"], &["--version"]).and_then(|out| {
@@ -73,11 +79,22 @@ impl System {
             let (major, minor) = version.split_once('.')?;
             Some((major.parse().ok()?, minor.parse().ok()?))
         });
-        System { libs, glibc, old_runtime: OldRuntime::find() }
+        System { libs, paths, glibc, old_runtime: OldRuntime::find() }
     }
 
     pub fn has(&self, name: &str, bits: u8) -> bool {
         has(&self.libs, name, bits)
+    }
+
+    /// Where the system's copy of a library is, for preloading it.
+    pub fn path(&self, name: &str, bits: u8) -> Option<&str> {
+        self.paths.get(&(name.to_string(), bits)).map(String::as_str)
+    }
+
+    /// Whether `java` is on the PATH or in Homebrew (Bazzite's way to install it).
+    pub fn java(&self) -> Option<PathBuf> {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        std::env::split_paths(&path).chain([PathBuf::from("/home/linuxbrew/.linuxbrew/bin")]).map(|d| d.join("java")).find(|j| j.is_file())
     }
 
     pub fn refuses_exec_stack(&self) -> bool {

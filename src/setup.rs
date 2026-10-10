@@ -87,9 +87,17 @@ fn icon(game: &Game, main: &Path) -> String {
 
 pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome, String> {
     let Some((main, _)) = game.main() else {
+        let java = report.problems.iter().find_map(|p| match p {
+            Problem::Java { file, java: Some(java) } => Some((file, java)),
+            _ => None,
+        });
         return match game.windows {
             Some(i) => setup_windows(game, &game.files[i], targets),
-            None if report.problems.iter().any(|p| matches!(p, Problem::Love { .. } | Problem::Python { .. })) => {
+            None if java.is_some() => {
+                let (file, java) = java.unwrap();
+                setup_java(game, file, java, targets)
+            }
+            None if report.problems.iter().any(|p| matches!(p, Problem::Love { .. } | Problem::Python { .. } | Problem::Java { .. })) => {
                 Err("This game needs another program to run it (see gamefix check); setting it up isn't supported yet.".into())
             }
             None => Err("No game program in this folder. If it's an installer, install the game first and set up the folder it installs to.".into()),
@@ -118,6 +126,8 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
     let mut hide_helpers = false;
     // Steam's runtime for older games, for the app-menu entry (Steam uses it by itself).
     let mut old_runtime = None;
+    // Libraries to load first, joined into one LD_PRELOAD.
+    let mut preload: Vec<String> = Vec::new();
     let mut done = Vec::new();
     let mut not_fixed = Vec::new();
     let mut record = Vec::new();
@@ -139,16 +149,33 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
                 if paths.iter().any(|p| p.contains([' ', ':'])) {
                     not_fixed.push("Libraries getting the wrong functions: the game's path has a space or colon, which the fix can't handle; move the game to a folder without them.".into());
                 } else {
-                    env.push(("LD_PRELOAD", paths.join(":")));
+                    preload.extend(paths);
                     done.push("Makes its libraries load first so they get their own functions (at launch).".into());
                 }
             }
-            Problem::MissingLibs { libs, in_old_runtime, .. } => {
+            Problem::OwnLibstdcxx(Some(path)) => {
+                preload.push(path.clone());
+                done.push("Loads the system's C++ library first, so the graphics driver doesn't crash the game (at launch).".into());
+            }
+            Problem::OwnLibstdcxx(None) => not_fixed.push("Its built-in C++ library: the system's libstdc++.so.6 to preload wasn't found.".into()),
+            Problem::DotnetIcu(_) => {
+                env.push(("DOTNET_SYSTEM_GLOBALIZATION_INVARIANT", "1".into()));
+                done.push("Lets its old .NET start without the ICU library (at launch).".into());
+            }
+            Problem::MissingLibs { libs, in_old_runtime, misplaced, .. } => {
                 if let Some(run) = report.old_runtime.as_ref().filter(|_| !in_old_runtime.is_empty()) {
                     old_runtime = Some(run.clone());
-                    done.push("Starts it with Steam's runtime for older games, which has the missing libraries (Steam does that by itself).".into());
+                    done.push("Starts it with Steam's runtime for older games, which has missing libraries (Steam does that by itself).".into());
                 }
-                let others: Vec<&str> = libs.keys().filter(|l| !in_old_runtime.contains(*l)).map(String::as_str).collect();
+                let dirs = Problem::library_path(misplaced, &game.root);
+                // LD_LIBRARY_PATH splits on colons.
+                if dirs.iter().any(|d| d.contains(':')) {
+                    not_fixed.push("Libraries the game ships in a folder Linux doesn't look in: its path has a colon, which the fix can't handle.".into());
+                } else if !dirs.is_empty() {
+                    env.push(("LD_LIBRARY_PATH", dirs.join(":")));
+                    done.push("Points Linux to the libraries the game ships itself (at launch).".into());
+                }
+                let others: Vec<&str> = libs.keys().filter(|l| !in_old_runtime.contains(*l) && !misplaced.contains_key(*l)).map(String::as_str).collect();
                 if !others.is_empty() {
                     not_fixed.push(format!("Missing libraries nothing here provides: {}.", others.join(", ")));
                 }
@@ -162,8 +189,11 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
                 }
             }
             Problem::UnityH264(_) => not_fixed.push("Its H.264 videos: Unity's Linux player can't play them; the Windows download with Proton can.".into()),
-            Problem::NoLinuxBuild | Problem::WrongMachine(_) | Problem::Love { .. } | Problem::Python { .. } => {}
+            Problem::NoLinuxBuild | Problem::WrongMachine(_) | Problem::Love { .. } | Problem::Python { .. } | Problem::Java { .. } => {}
         }
+    }
+    if !preload.is_empty() {
+        env.push(("LD_PRELOAD", preload.join(":")));
     }
     // What a packed program needs can't be read; the runtime only fills gaps, so it's safe.
     if report.packed && old_runtime.is_none() {
@@ -188,18 +218,7 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
             exec.extend(["sh", "-c", &format!("{HIDE_HELPERS} exec \"$@\" \"$0\"")].map(exec_arg));
         }
         exec.push(exec_arg(&program.display().to_string()));
-        let entry_text = format!(
-            "[Desktop Entry]\nType=Application\nName={}\nComment=Set up by gamefix\nExec={}\nPath={}\nIcon={}\nCategories=Game;\nTerminal=false\nX-Gamefix-Game={}\n",
-            value(&game.name),
-            exec.join(" "),
-            value(&workdir.display().to_string()),
-            value(&icon),
-            value(&game.root.display().to_string()),
-        );
-        let apps = data_home().join("applications");
-        fs::create_dir_all(&apps).map_err(|e| e.to_string())?;
-        let entry = apps.join(format!("gamefix-{}.desktop", slug(&game.name)));
-        fs::write(&entry, entry_text).map_err(|e| e.to_string())?;
+        let entry = write_entry(game, &exec, workdir, &icon)?;
         record.push(format!("created\t{}", entry.display()));
         done.push(format!("Added \"{}\" to the app menu, under Games.", game.name));
     }
@@ -236,6 +255,42 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
         refresh_menu();
     }
     Ok(Outcome { done, not_fixed })
+}
+
+/// Writes the game's app-menu entry running `exec` (already quoted) in `workdir`.
+fn write_entry(game: &Game, exec: &[String], workdir: &Path, icon: &str) -> Result<PathBuf, String> {
+    let entry_text = format!(
+        "[Desktop Entry]\nType=Application\nName={}\nComment=Set up by gamefix\nExec={}\nPath={}\nIcon={}\nCategories=Game;\nTerminal=false\nX-Gamefix-Game={}\n",
+        value(&game.name),
+        exec.join(" "),
+        value(&workdir.display().to_string()),
+        value(icon),
+        value(&game.root.display().to_string()),
+    );
+    let apps = data_home().join("applications");
+    fs::create_dir_all(&apps).map_err(|e| e.to_string())?;
+    let entry = apps.join(format!("gamefix-{}.desktop", slug(&game.name)));
+    fs::write(&entry, entry_text).map_err(|e| e.to_string())?;
+    Ok(entry)
+}
+
+/// A Java game: an app-menu entry running `java -jar`.
+fn setup_java(game: &Game, jar: &Path, java: &Path, targets: &Targets) -> Result<Outcome, String> {
+    if !targets.menu {
+        return Err("Java games can only be set up in the app menu for now: add --menu.".into());
+    }
+    if record_path(game).exists() {
+        undo(game)?;
+    }
+    let jar = game.root.join(jar);
+    let exec: Vec<String> = [java.display().to_string(), "-jar".into(), jar.display().to_string()].iter().map(|a| exec_arg(a)).collect();
+    let entry = write_entry(game, &exec, jar.parent().unwrap_or(&game.root), "applications-games")?;
+    let record_file = record_path(game);
+    fs::create_dir_all(record_file.parent().unwrap()).map_err(|e| e.to_string())?;
+    fs::write(&record_file, format!("created\t{}\n", entry.display())).map_err(|e| e.to_string())?;
+    refresh_menu();
+    let not_fixed = if targets.steam { vec!["Steam shortcuts for Java games aren't supported yet; start it from the app menu.".into()] } else { Vec::new() };
+    Ok(Outcome { done: vec![format!("Added \"{}\" to the app menu, under Games (run with Java).", game.name)], not_fixed })
 }
 
 /// A Windows-only game: a non-Steam shortcut forced to Proton, like ticking "Force the use of a
@@ -287,7 +342,7 @@ fn launch_options(env: &[(&str, String)], hide_helpers: bool, existing: &str) ->
     let quote = |v: &str| if v.chars().all(|c| c.is_ascii_alphanumeric() || "/-_.=+:,".contains(c)) { v.to_string() } else { format!("'{}'", v.replace('\'', "'\\''")) };
     let settings: Vec<String> = env
         .iter()
-        .map(|(k, v)| if *k == "LD_PRELOAD" { format!("LD_PRELOAD=\"$LD_PRELOAD:{v}\"") } else { format!("{k}={}", quote(v)) })
+        .map(|(k, v)| if matches!(*k, "LD_PRELOAD" | "LD_LIBRARY_PATH") { format!("{k}=\"${k}:{v}\"") } else { format!("{k}={}", quote(v)) })
         .collect();
     let command = if hide_helpers { "\"$@\" %command%" } else { "%command%" };
     let existing = existing.trim();
