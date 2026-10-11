@@ -36,6 +36,8 @@ pub struct Python {
     /// Bytecode or source for Python 2, which current systems no longer have.
     pub v2: bool,
     pub pygame: bool,
+    /// Starts a program when run (`if __name__ == "__main__":`).
+    pub main: bool,
 }
 
 pub struct Elf {
@@ -99,6 +101,11 @@ pub fn identify(path: &Path) -> Option<Binary> {
     } else if ext == "love" && (head.starts_with(b"PK\x03\x04") || (head.starts_with(b"#!") && head.windows(4).any(|w| w == b"PK\x03\x04"))) {
         // Some start with "#!/usr/bin/env love" so they run when double-clicked (NEON PHASE).
         Some(Binary::Love)
+    } else if head.starts_with(b"#!") && ext != "py" && ext != "sh" && head.split(|&b| b == b'\n').next().is_some_and(|l| l.windows(6).any(|w| w == b"python")) {
+        // A Python program named to be run (PPU's OPEN-GAME: `#!/usr/bin/env python`).
+        let mut text = String::new();
+        File::open(path).ok()?.take(1 << 20).read_to_string(&mut text).ok()?;
+        Some(Binary::Python(Python { v2: python2_source(&text), pygame: text.contains("import pygame") || text.contains("from pygame"), main: true }))
     } else if head.starts_with(b"#!") && ext != "py" {
         Some(Binary::Script)
     } else if ext == "jar" && head.starts_with(b"PK\x03\x04") {
@@ -121,11 +128,11 @@ pub fn identify(path: &Path) -> Option<Binary> {
     } else if ext == "pyc" && n >= 4 && head[2..4] == *b"\r\n" {
         // The first two bytes number the bytecode format: Python 2 used 20121-62211 (2.7),
         // Python 3 started again at 3000.
-        Some(Binary::Python(Python { v2: u16le(head, 0) >= 20000, pygame: contains(path, b"pygame") }))
+        Some(Binary::Python(Python { v2: u16le(head, 0) >= 20000, pygame: contains(path, b"pygame"), main: contains(path, b"__main__") }))
     } else if ext == "py" {
         let mut text = String::new();
         File::open(path).ok()?.take(1 << 20).read_to_string(&mut text).ok()?;
-        Some(Binary::Python(Python { v2: python2_source(&text), pygame: text.contains("import pygame") || text.contains("from pygame") }))
+        Some(Binary::Python(Python { v2: python2_source(&text), pygame: text.contains("import pygame") || text.contains("from pygame"), main: text.contains("__name__") && text.contains("__main__") }))
     } else {
         None
     }

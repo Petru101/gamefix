@@ -4,6 +4,7 @@ mod disc;
 mod fetch;
 mod love;
 mod proton;
+mod python;
 mod rightclick;
 mod scan;
 mod setup;

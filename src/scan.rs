@@ -325,8 +325,10 @@ pub fn processing_notes(root: &Path, path: &Path) -> (bool, bool, bool) {
     (applet, only32, arm)
 }
 
-/// A .love file, else a .jar, else the Python file that looks like the game's start: named like
-/// the folder or main/game/run, preferring ones that use pygame. Nearest the top first.
+/// A .love file, else a .jar, else the Python file that looks like the game's start: one a
+/// script of the developer's starts (End User's run.sh: `python3 main.py`, beside a game.py),
+/// named like the folder or main/game/run, one that runs when started (`__main__`), preferring
+/// ones that use pygame; never a build script (setup.py). Nearest the top first.
 fn pick_portable(root: &Path, files: &[Found]) -> Option<usize> {
     // A Processing export: a script starting Java next to lib/core.jar (application.linux64 etc.,
     // the 64-bit one first).
@@ -356,17 +358,30 @@ fn pick_portable(root: &Path, files: &[Found]) -> Option<usize> {
         .filter_map(|(i, f)| {
             let Binary::Python(py) = &f.binary else { return None };
             let s = stem(&f.path).to_lowercase();
+            if s.starts_with("setup") {
+                return None;
+            }
             let mut score = 0;
+            if crate::python::launcher(root, files, &f.path).is_some() {
+                score += 8;
+            }
             if (!s.is_empty() && folder.contains(&s)) || ["main", "game", "run"].contains(&s.as_str()) {
                 score += 3;
+            }
+            if py.main {
+                score += 2;
+            }
+            // A Python program with a `#!` line and no .py name, made to be run (OPEN-GAME).
+            if !f.path.extension().is_some_and(|e| e == "py" || e == "pyc") {
+                score += 4;
             }
             if py.pygame {
                 score += 1;
             }
-            Some((score, i))
+            Some((score, std::cmp::Reverse(f.path.components().count()), i))
         })
-        .max_by_key(|&(score, i)| (score, std::cmp::Reverse(i)))
-        .map(|(_, i)| i)
+        .max_by_key(|&(score, depth, i)| (score, depth, std::cmp::Reverse(i)))
+        .map(|(_, _, i)| i)
 }
 
 /// The installer among a CD's files: one with an autorun.inf in its folder or a folder above

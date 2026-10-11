@@ -54,8 +54,8 @@ pub enum Problem {
     Package(PathBuf, &'static str),
     /// A .love file: needs the LÖVE version it was made for; `love` is how to start an installed one.
     Love { file: PathBuf, version: Option<String>, love: Option<Vec<String>> },
-    /// Python code: needs Python (2 is gone from current systems) and maybe pygame.
-    Python { file: PathBuf, v2: bool, pygame: bool },
+    /// Python code: needs Python 3 (2 is gone from current systems) and what `plan` lists.
+    Python { file: PathBuf, v2: bool, plan: Option<crate::python::Plan> },
     /// A .jar: needs Java; `java` is where one was found.
     Java { file: PathBuf, java: Option<PathBuf> },
     WrongMachine(u16),
@@ -340,8 +340,9 @@ pub fn check(game: &Game, system: &System) -> Report {
                     Binary::Python(p) => Some(p),
                     _ => None,
                 });
-                let (v2, pygame) = python.fold((false, false), |(v2, pg), p| (v2 || p.v2, pg || p.pygame));
-                problems.push(Problem::Python { file: f.path.clone(), v2, pygame });
+                let v2 = python.fold(false, |v2, p| v2 || p.v2);
+                let plan = (!v2).then(|| crate::python::plan(&game.root, &game.files, &f.path));
+                problems.push(Problem::Python { file: f.path.clone(), v2, plan });
             }
             None => {
                 let damaged = game.files.iter().find(|f| matches!(f.binary, Binary::Damaged));
@@ -1363,10 +1364,46 @@ impl Report {
                     let _ = writeln!(out, "  Linux systems don't include it anymore, so it can't run here.");
                     let _ = writeln!(out, "    Fix: if the game has a Windows download, use that with Proton.");
                 }
-                Problem::Python { file, pygame, .. } => {
-                    let _ = writeln!(out, "✗ This is a Python game ({}): it needs Python 3{} to run.", file.display(), if *pygame { " with pygame" } else { "" });
-                    if *pygame {
-                        let _ = writeln!(out, "    pygame isn't part of the system; if the game has a Windows download, that with Proton is simpler.");
+                Problem::Python { file, plan: None, .. } => {
+                    let _ = writeln!(out, "✗ This is a Python game ({}).", file.display());
+                }
+                Problem::Python { file, plan: Some(plan), .. } => {
+                    let start = plan.launcher.as_ref().map(|l| format!(", started by {}", l.display())).unwrap_or_default();
+                    let terminal = if plan.terminal { "\n  It's a text game: it runs in a terminal." } else { "" };
+                    if plan.python.is_none() {
+                        let _ = writeln!(out, "✗ This is a Python 3 game ({}{start}), and Python 3 isn't installed.", file.display());
+                    } else if !plan.compile.is_empty() {
+                        let _ = writeln!(out, "✗ This is a Python 3 game ({}{start}), but part of it ({}) is Cython source that has", file.display(), plan.compile.iter().map(|m| format!("{m}.pyx")).collect::<Vec<_>>().join(", "));
+                        let _ = writeln!(out, "  to be compiled first, which needs a C compiler and its build tools: gamefix can't set it up.");
+                        let _ = writeln!(out, "    Fix: if the game has a Windows download, use that with Proton.");
+                    } else if plan.packages.is_empty() {
+                        let _ = writeln!(out, "• This is a Python 3 game ({}{start}); Python 3 is part of the system.{terminal}", file.display());
+                        let _ = writeln!(out, "  gamefix setup adds it to the app menu.");
+                    } else {
+                        let _ = writeln!(out, "✗ This is a Python 3 game ({}{start}).", file.display());
+                        let _ = writeln!(out, "  Python 3 is part of the system, but it also needs {}, which {}.{terminal}", plan.packages.join(", "), if plan.packages.len() > 1 { "aren't" } else { "isn't" });
+                        let _ = writeln!(out, "    Fix: gamefix setup installs that from PyPI (Python's package index) into a folder of the game's");
+                        let _ = writeln!(out, "    own, ~/.local/share/gamefix/python/, and adds the game to the app menu.");
+                    }
+                    match (&plan.older, plan.system_minor) {
+                        (Some((minor, what)), Some(system)) if crate::python::build_info(*minor).is_some() => {
+                            let (version, size) = crate::python::build_info(*minor).unwrap();
+                            let _ = writeln!(out, "✗ Its code uses {what}; this system has Python 3.{system}.");
+                            let _ = writeln!(out, "    Fix: gamefix setup downloads Python {version} (python-build-standalone, {size} MB) once into");
+                            let _ = writeln!(out, "    ~/.local/share/gamefix/python-builds/ for every game that needs it, and runs the game on it.");
+                        }
+                        (Some((minor, what)), _) => {
+                            let _ = writeln!(out, "✗ Its code uses {what}: it needs Python 3.{minor} or older, and gamefix can get");
+                            let _ = writeln!(out, "  3.8 at the oldest, so it can't set it up.");
+                            let _ = writeln!(out, "    Fix: if the game has a Windows download, use that with Proton.");
+                        }
+                        _ => {}
+                    }
+                    if let Some((wanted, real)) = plan.case_links.first() {
+                        let more = if plan.case_links.len() > 1 { format!(" and {} more", plan.case_links.len() - 1) } else { String::new() };
+                        let _ = writeln!(out, "✗ Its code names files with other upper/lower case than they have ({} is {}{more}):", wanted.display(), real.file_name().unwrap_or_default().to_string_lossy());
+                        let _ = writeln!(out, "  Windows doesn't mind, Linux does, so it stops when it loads one.");
+                        let _ = writeln!(out, "    Fix: gamefix setup adds links under the names the code uses, beside the files.");
                     }
                 }
                 Problem::WrongMachine(m) => {

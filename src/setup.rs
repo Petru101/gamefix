@@ -87,6 +87,17 @@ fn icon(game: &Game, main: &Path) -> String {
 }
 
 pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome, String> {
+    if record_path(game).exists() {
+        if targets.steam && Steam::find().is_some_and(|s| s.running()) {
+            return Err(STEAM_OPEN.into());
+        }
+        undo(game)?;
+        // The report saw the game as the last setup left it: undo takes back the exec bit, the
+        // converted launcher and case links, which this setup must then redo (Brownie Cove, set
+        // up twice, got "Permission denied"). And before anything new is made: a runner's
+        // setup undoing later removed the Python environment it had just installed.
+        return setup(game, &crate::check::check(game, &crate::system::System::load()), targets);
+    }
     if report.problems.iter().any(|p| matches!(p, Problem::UnityDataMissing(_))) {
         return Err("The download lacks the game's data folder (see gamefix check): nothing to set up.".into());
     }
@@ -132,6 +143,10 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
             Problem::Love { file, version: Some(v), .. } if crate::check::old_love(Some(v)) => crate::love::build_for(v).map(|b| (file, b)),
             _ => None,
         });
+        let python = report.problems.iter().find_map(|p| match p {
+            Problem::Python { file, v2: false, plan: Some(plan) } => Some((file, plan)),
+            _ => None,
+        });
         let disc = report.problems.iter().find_map(|p| match p {
             Problem::Disc { file, installer: Some(installer), .. } => Some(Installer::Disc { iso: game.root.join(file), inside: installer.clone() }),
             _ => None,
@@ -141,14 +156,18 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
         return match game.windows {
             _ if runner.is_some() => {
                 let (command, file, name) = runner.unwrap();
-                setup_runner(game, command, file, name, targets)
+                setup_runner(game, command, file, name, targets, Extra::default())
             }
             _ if old_love.is_some() => {
                 let (file, build) = old_love.unwrap();
                 let (command, note) = crate::love::runtime(build)?;
-                let mut outcome = setup_runner(game, command, file, &format!("LÖVE {build}"), targets)?;
+                let mut outcome = setup_runner(game, command, file, &format!("LÖVE {build}"), targets, Extra::default())?;
                 outcome.done.splice(0..0, note);
                 Ok(outcome)
+            }
+            None if python.is_some() => {
+                let (file, plan) = python.unwrap();
+                setup_python(game, file, plan, targets)
             }
             Some(i) => setup_windows(game, report, &game.files[i], targets),
             None if game.cd_installer.is_some() => setup_install(game, Installer::File(game.full(&game.files[game.cd_installer.unwrap()])), targets),
@@ -176,14 +195,6 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
     } else {
         None
     };
-    if record_path(game).exists() {
-        undo(game)?;
-        // The report saw the game as the last setup left it: undo takes back the exec bit and
-        // the converted launcher, which this setup must then redo (Brownie Cove, set up twice,
-        // got "Permission denied").
-        return setup(game, &crate::check::check(game, &crate::system::System::load()), targets);
-    }
-
     let program = game.full(main);
     // Launch-time settings, as (name, value).
     let mut env: Vec<(&str, String)> = Vec::new();
@@ -450,7 +461,7 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
             exec.extend(["sh", "-c", &format!("{HIDE_HELPERS} exec \"$@\" \"$0\"")].map(exec_arg));
         }
         exec.push(exec_arg(&start.display().to_string()));
-        let entry = write_entry(game, &exec, workdir, &icon)?;
+        let entry = write_entry(game, &exec, workdir, &icon, false)?;
         record.push(format!("created\t{}", entry.display()));
         done.push(format!("Added \"{}\" to the app menu, under Games.", game.name));
     }
@@ -528,7 +539,7 @@ fn runner_needed(report: &Report) -> Option<String> {
         Problem::Love { love: None, version, .. } if !crate::check::old_love(version.as_deref()) => Some(format!("This is a LÖVE game, and LÖVE isn't installed. Install LÖVE from Discover (it's on Flathub), {then}")),
         Problem::Flash { ruffle: None, .. } => Some(format!("This is a Flash game; it plays in Ruffle, which isn't installed. Install Ruffle from Discover (it's on Flathub), {then}")),
         Problem::Dos { dosbox: None, .. } => Some(format!("This is a DOS game; it runs in DOSBox Staging, which isn't installed. Install DOSBox Staging from Discover (it's on Flathub), {then}")),
-        Problem::Python { .. } => Some("This is a Python game; gamefix can't set those up yet (see gamefix check).".into()),
+        Problem::Python { v2: true, .. } => Some("This is a Python 2 game; Python 2 is gone from current systems (see gamefix check).".into()),
         Problem::Love { .. } => Some("This LÖVE game needs an older LÖVE than any gamefix can set up (see gamefix check).".into()),
         _ => None,
     })
@@ -630,10 +641,11 @@ fn java_sound_conf(plugin: &Path) -> Result<String, String> {
     Ok(format!("/usr/share/alsa/alsa.conf:{}", file.display()))
 }
 
-/// Writes the game's app-menu entry running `exec` (already quoted) in `workdir`.
-fn write_entry(game: &Game, exec: &[String], workdir: &Path, icon: &str) -> Result<PathBuf, String> {
+/// Writes the game's app-menu entry running `exec` (already quoted) in `workdir`; a text game
+/// gets a terminal (`Terminal=true`: the desktop opens its own, Konsole on KDE).
+fn write_entry(game: &Game, exec: &[String], workdir: &Path, icon: &str, terminal: bool) -> Result<PathBuf, String> {
     let entry_text = format!(
-        "[Desktop Entry]\nType=Application\nName={}\nComment=Set up by gamefix\nExec={}\nPath={}\nIcon={}\nCategories=Game;\nTerminal=false\nX-Gamefix-Game={}\n",
+        "[Desktop Entry]\nType=Application\nName={}\nComment=Set up by gamefix\nExec={}\nPath={}\nIcon={}\nCategories=Game;\nTerminal={terminal}\nX-Gamefix-Game={}\n",
         value(&game.name),
         exec.join(" "),
         value(&workdir.display().to_string()),
@@ -647,8 +659,75 @@ fn write_entry(game: &Game, exec: &[String], workdir: &Path, icon: &str) -> Resu
     Ok(entry)
 }
 
+/// What a runner's setup did before writing the entries: record lines and messages, and
+/// whether the game runs in a terminal.
+#[derive(Default)]
+struct Extra {
+    record: Vec<String>,
+    done: Vec<String>,
+    terminal: bool,
+}
+
+/// A Python 3 game: what it imports that Python lacks installed from PyPI into a virtual
+/// environment of its own (wheels only), then an entry running it with that Python, or
+/// through the developer's script with that Python first on the PATH (End User's run.sh
+/// sets up its bundled SDL first).
+fn setup_python(game: &Game, file: &Path, plan: &crate::python::Plan, targets: &Targets) -> Result<Outcome, String> {
+    let mut python = plan.python.clone().ok_or("Python 3 isn't installed.")?;
+    if !plan.compile.is_empty() {
+        return Err("Part of this Python game is Cython source that has to be compiled first (see gamefix check).".into());
+    }
+    if plan.terminal && targets.steam {
+        return Err("It's a text game that runs in a terminal, which Steam doesn't open: set it up for the app menu.".into());
+    }
+    let mut extra = Extra { terminal: plan.terminal, ..Default::default() };
+    if let Some((minor, _)) = &plan.older {
+        if crate::python::build_info(*minor).is_none() {
+            return Err(format!("This game's code needs Python 3.{minor} or older, which gamefix can't get (see gamefix check)."));
+        }
+        let (older, note) = crate::python::older_python(*minor)?;
+        python = older;
+        extra.done.extend(note);
+    }
+    for (wanted, real) in &plan.case_links {
+        let link = game.root.join(wanted);
+        std::os::unix::fs::symlink(real.file_name().unwrap_or_default(), &link).map_err(|e| format!("Couldn't link {}: {e}", link.display()))?;
+        extra.record.push(format!("created\t{}", link.display()));
+    }
+    if !plan.case_links.is_empty() {
+        extra.done.push(format!("Linked {} files under the upper/lower case its code uses.", plan.case_links.len()));
+    }
+    let mut bin = None;
+    if !plan.packages.is_empty() {
+        let dir = data_home().join("gamefix/python").join(slug(&game.name));
+        // A leftover from a setup that failed half-way; undo has already run.
+        let _ = fs::remove_dir_all(&dir);
+        if let Err(e) = crate::python::install(&python, &dir, &plan.packages) {
+            let _ = fs::remove_dir_all(&dir);
+            return Err(e);
+        }
+        extra.record.push(format!("created-tree\t{}", dir.display()));
+        extra.done.push(format!("Installed {} from PyPI into {}.", plan.packages.join(", "), dir.display()));
+        bin = Some(dir.join("bin"));
+    }
+    match &plan.launcher {
+        Some(script) => {
+            let mut command = Vec::new();
+            if let Some(bin) = &bin {
+                command = vec!["env".into(), format!("PATH={}:/usr/bin:/bin", bin.display())];
+            }
+            command.push(crate::python::interpreter(&game.root.join(script)));
+            setup_runner(game, command, script, "Python 3", targets, extra)
+        }
+        None => {
+            let python = bin.map_or_else(|| python.display().to_string(), |b| b.join("python").display().to_string());
+            setup_runner(game, vec![python], file, "Python 3", targets, extra)
+        }
+    }
+}
+
 /// A game another program runs (`java -jar`, LÖVE): an app-menu entry running it on the file.
-fn setup_runner(game: &Game, command: Vec<String>, file: &Path, name: &str, targets: &Targets) -> Result<Outcome, String> {
+fn setup_runner(game: &Game, command: Vec<String>, file: &Path, name: &str, targets: &Targets, extra: Extra) -> Result<Outcome, String> {
     let steam = if targets.steam {
         let steam = Steam::find().ok_or("Steam isn't installed, or nobody has logged in to it yet.")?;
         if steam.running() {
@@ -661,9 +740,9 @@ fn setup_runner(game: &Game, command: Vec<String>, file: &Path, name: &str, targ
     if record_path(game).exists() {
         undo(game)?;
     }
-    let mut done = Vec::new();
+    let mut done = extra.done;
     let mut not_fixed = Vec::new();
-    let mut record = Vec::new();
+    let mut record = extra.record;
     // A Processing export with only 32-bit OpenGL parts, on 64-bit Java: JOGL also looks for
     // `<jar>-natives-linux-amd64.jar` next to its jars, and Maven Central keeps those.
     if crate::scan::processing_script(&game.root, file) && crate::scan::processing_notes(&game.root, file).1 {
@@ -703,7 +782,7 @@ fn setup_runner(game: &Game, command: Vec<String>, file: &Path, name: &str, targ
     }
     if targets.menu {
         let exec: Vec<String> = command.iter().chain(&tail).map(|a| exec_arg(a)).collect();
-        let entry = write_entry(game, &exec, workdir, "applications-games")?;
+        let entry = write_entry(game, &exec, workdir, "applications-games", extra.terminal)?;
         // Undo goes backwards: the entry first in the file is removed last.
         record.insert(0, format!("created\t{}", entry.display()));
         done.insert(0, format!("Added \"{}\" to the app menu, under Games (run with {name}).", game.name));
@@ -1256,6 +1335,13 @@ pub fn undo(game: &Game) -> Result<Vec<String>, String> {
             }
             ["created-dir", path] => {
                 if fs::remove_dir(path).is_ok() {
+                    undone.push(format!("Removed {path}"));
+                }
+            }
+            // A folder gamefix filled through another program (pip's thousands of files), only
+            // ever inside gamefix's own data folder.
+            ["created-tree", path] if Path::new(path).starts_with(data_home().join("gamefix")) => {
+                if fs::remove_dir_all(path).is_ok() {
                     undone.push(format!("Removed {path}"));
                 }
             }
