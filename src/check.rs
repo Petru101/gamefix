@@ -28,6 +28,12 @@ pub enum Problem {
     Archive(PathBuf),
     /// The Linux program is there but damaged (went through a text conversion): no fixing it.
     Damaged(PathBuf),
+    /// A Linux installer (MojoSetup) with the game packed inside, and no program besides.
+    LinuxInstaller(PathBuf),
+    /// A Unity program without its `<name>_Data` folder: the upload is incomplete (PicoPico's
+    /// is the Linux program alone; ESCAPE's the Windows one; Car Crash's the .exe and a loose
+    /// mainData), and Unity quits with "There is no data folder".
+    UnityDataMissing(PathBuf),
     /// A Flash game (.swf); `ruffle` is how to start an installed Ruffle.
     Flash { file: PathBuf, ruffle: Option<Vec<String>> },
     /// A CD's files, with the installer among them.
@@ -189,6 +195,32 @@ const OPTIONAL_PLUGINS: &[(&str, &str)] = &[
 /// Whether two library files are the same library: their names up to ".so", without the
 /// "-<8 hex>" that auditwheel and PyInstaller add to bundled copies.
 /// Unpacks an AppImage's squashfs into the cache, checks it, and removes it again.
+/// A Unity player whose `<name>_Data` folder isn't next to it. Unity 2017.2+ keeps the engine
+/// in UnityPlayer.dll/.so beside a small program; older players carry it ("UnityPlayer/<version>").
+/// Programs of an engine recognised otherwise, PyInstaller bundles, packed programs and
+/// AppImages aren't read (reading every program whole made checking the VM's games ~40% slower).
+fn unity_data_missing(game: &Game, program: &scan::Found) -> bool {
+    let full = game.full(program);
+    let dir = full.parent().unwrap_or(&game.root);
+    let stem = full.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    if dir.join(format!("{stem}_Data")).is_dir() || game.engine.as_ref().is_some_and(|e| e.name != "Unity") {
+        return false;
+    }
+    if dir.join("UnityPlayer.dll").is_file() || dir.join("UnityPlayer.so").is_file() {
+        return true;
+    }
+    let plain = match &program.binary {
+        Binary::Elf(e) => !e.pyinstaller && !e.packed && !e.mojosetup && binary::appimage_offset(&full).is_none(),
+        _ => true,
+    };
+    plain && std::fs::metadata(&full).is_ok_and(|m| m.len() < 64 << 20) && binary::contains(&full, b"UnityPlayer/")
+}
+
+/// glibc's own libraries, always there.
+fn glibc_part(n: &str) -> bool {
+    ["libc.so", "libm.so", "libdl.so", "libpthread.so", "librt.so", "ld-linux"].iter().any(|g| n.starts_with(g))
+}
+
 fn appimage_inside(file: &Path, offset: u64, system: &System) -> Option<(String, Vec<Problem>)> {
     let cache = std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
     let dir = cache.join(format!("gamefix/appimage-{}", std::process::id()));
@@ -270,7 +302,14 @@ pub fn check(game: &Game, system: &System) -> Report {
         match game.portable.map(|i| &game.files[i]) {
             Some(f) if matches!(f.binary, Binary::Love) => problems.push(Problem::Love { file: f.path.clone(), version: game.engine.as_ref().and_then(|e| e.version.clone()), love: system.love() }),
             Some(f) if matches!(f.binary, Binary::Jar) => {
-                let java = if binary::jar_uses_applet(&game.full(f)) { system.java_lts().or_else(|| system.java()) } else { system.java() };
+                let needs = binary::jar_needs(&game.full(f));
+                let java = if needs.nashorn {
+                    system.java_up_to(14).or_else(|| system.java())
+                } else if needs.applet {
+                    system.java_lts().or_else(|| system.java())
+                } else {
+                    system.java()
+                };
                 problems.push(Problem::Java { file: f.path.clone(), java });
             }
             Some(f) if matches!(f.binary, Binary::Script) => {
@@ -297,6 +336,7 @@ pub fn check(game: &Game, system: &System) -> Report {
                 let web = if game.windows.is_none() { web_export(&game.root) } else { None };
                 problems.push(match (damaged, game.archive, package) {
                     (Some(f), _, _) => Problem::Damaged(f.path.clone()),
+                    _ if game.linux_installer.is_some() => Problem::LinuxInstaller(game.files[game.linux_installer.unwrap()].path.clone()),
                     _ if game.cd_installer.is_some() => Problem::CdFiles { installer: game.files[game.cd_installer.unwrap()].path.clone() },
                     _ if game.disc.is_some() => {
                         let file = game.files[game.disc.unwrap()].path.clone();
@@ -326,6 +366,12 @@ pub fn check(game: &Game, system: &System) -> Report {
             let others = game.files.iter().filter(|o| o.path != f.path && o.path.file_name().map(|n| n.to_string_lossy().to_lowercase()) == name && matches!(&o.binary, Binary::Pe(pe) if pe.protection.is_none())).map(|o| o.path.clone()).collect();
             problems.push(Problem::Protected { what, file: f.path.clone(), others });
         }
+        if let Some(i) = game.windows.filter(|&i| unity_data_missing(game, &game.files[i])) {
+            problems.retain(|p| !matches!(p, Problem::NoLinuxBuild));
+            problems.push(Problem::UnityDataMissing(game.files[i].path.clone()));
+            report.problems = problems;
+            return report;
+        }
         if let Some(i) = game.windows {
             let dlls = crate::proton::ignored_dlls(&game.full(&game.files[i]));
             if !dlls.is_empty() {
@@ -342,6 +388,11 @@ pub fn check(game: &Game, system: &System) -> Report {
     if elf.machine != EM_X86_64 && elf.machine != EM_386 {
         // Nothing else matters: it can't run here, and its libraries (down to ld.so) are ARM's too.
         problems.push(Problem::WrongMachine(elf.machine));
+        report.problems = problems;
+        return report;
+    }
+    if unity_data_missing(game, main) {
+        problems.push(Problem::UnityDataMissing(main.path.clone()));
         report.problems = problems;
         return report;
     }
@@ -449,6 +500,21 @@ pub fn check(game: &Game, system: &System) -> Report {
             (if at_start { &mut missing } else { &mut later }).entry(lib.clone()).or_default().push(path.clone());
         }
     }
+    // A program needing only glibc's parts may load the rest itself, by names it keeps as text
+    // (D's Derelict bindings: Blue Bug Bob quit with "libSDL2_image.so ... cannot open shared
+    // object file"). It needs one of each list at start.
+    let loads_itself = !elf.needed.is_empty() && elf.needed.iter().all(|l| glibc_part(l)) && !elf.pyinstaller && !elf.packed;
+    if loads_itself && binary::appimage_offset(&game.full(main)).is_none() && std::fs::metadata(game.full(main)).is_ok_and(|m| m.len() < 64 << 20) {
+        for names in binary::dlopen_lists(&game.full(main)) {
+            if names.iter().any(|n| !n.contains('/') && system.has(n, elf.bits)) {
+                continue;
+            }
+            // The versioned name, as packages and Steam's runtime carry it.
+            if let Some(name) = names.iter().filter(|n| !n.contains('/')).max_by_key(|n| n.matches('.').count()) {
+                missing.entry(name.clone()).or_default().push(main.path.clone());
+            }
+        }
+    }
     // .NET Core before 5 loads OpenSSL itself (dlopen, no DT_NEEDED) through its shim, and only
     // knows 1.0 and 1.1; without one it aborts at the first HTTPS request ("No usable version
     // of libssl was found": KlSS, .NET Core 2.2, fetching a level). 1.1 is what can be fetched.
@@ -540,7 +606,6 @@ pub fn check(game: &Game, system: &System) -> Report {
     // needs it) is also what the system's libraries loaded alongside get. If one of those needs
     // a function only the system's newer copy has, it fails to load (Darkness Looming's old
     // libgmodule vs the system's libgio: g_module_open_full).
-    let glibc_part = |n: &str| ["libc.so", "libm.so", "libdl.so", "libpthread.so", "librt.so", "ld-linux"].iter().any(|g| n.starts_with(g));
     let first: Vec<(&String, &PathBuf)> = by_name
         .iter()
         .filter_map(|(n, (p, _))| {
@@ -1197,6 +1262,16 @@ impl Report {
                     let _ = writeln!(out, "  layering it into the system (rpm-ostree install, then a restart).");
                     let _ = writeln!(out, "    Fix: a .tar.gz, .zip, AppImage or Flatpak download from the game's page is simpler.");
                 }
+                Problem::LinuxInstaller(file) => {
+                    let _ = writeln!(out, "• {} is an installer (MojoSetup) with the game packed inside it.", file.display());
+                    let _ = writeln!(out, "  gamefix setup unpacks the game into the folder \"{}\" next to it and sets that up.", crate::setup::unpacked_name(file));
+                }
+                Problem::UnityDataMissing(file) => {
+                    let stem = file.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                    let _ = writeln!(out, "✗ {} is a Unity game's program, but its data folder ({stem}_Data) isn't in", file.display());
+                    let _ = writeln!(out, "  the download, so it can't start (\"There is no data folder\"). The upload is incomplete:");
+                    let _ = writeln!(out, "  look for another download of the game on its page, or ask the developer.");
+                }
                 Problem::Damaged(file) => {
                     let _ = writeln!(out, "✗ The Linux program is damaged in the download itself: {}", file.display());
                     let _ = writeln!(out, "  It was saved as text somewhere along the way (every byte above 127 became the \"unknown");
@@ -1331,7 +1406,17 @@ impl Report {
                 Problem::Java { file, java: Some(java) } if file.extension().is_some_and(|e| e == "jar") => {
                     let _ = writeln!(out, "• This is a Java game; Java is installed, so it runs with: {} -jar \"{}\"", java.display(), file.display());
                     let _ = writeln!(out, "  gamefix setup adds that to the app menu.");
-                    if !java.to_string_lossy().contains("/openjdk@") && binary::jar_uses_applet(&game.root.join(file)) {
+                    if binary::jar_in_jar(&game.root.join(file)).is_some() {
+                        let _ = writeln!(out, "  Its libraries are jars packed inside it (Eclipse's jar-in-jar export), and the loader it");
+                        let _ = writeln!(out, "  starts with doesn't find them on current Java (NoClassDefFoundError: Wobble, Art Treachery);");
+                        let _ = writeln!(out, "  setup unpacks them into ~/.local/share/gamefix/jars and starts the game with them.");
+                    }
+                    let needs = binary::jar_needs(&game.root.join(file));
+                    let major = System::java_major(java);
+                    if needs.nashorn && !major.is_some_and(|v| v <= 14) {
+                        let _ = writeln!(out, "  It runs JavaScript through Java's own engine (Nashorn), which Java 15 removed: it needs");
+                        let _ = writeln!(out, "  Java 14 or older (\"brew install openjdk@11\"; gamefix uses that one when it's there).");
+                    } else if needs.applet && major.is_none() {
                         let _ = writeln!(out, "  It uses Java applets, which Java 26 removed: it needs Java 25 or older (\"brew install");
                         let _ = writeln!(out, "  openjdk@21\"; gamefix uses that one when it's there).");
                     }

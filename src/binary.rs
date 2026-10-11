@@ -53,6 +53,9 @@ pub struct Elf {
     /// A PyInstaller one-file bundle: Python and its libraries are packed at the end and
     /// unpacked to /tmp at start, so they can't be read here.
     pub pyinstaller: bool,
+    /// A MojoSetup installer: its program with the game appended as a zip (`data/`, plus
+    /// `scripts/`), which it copies elsewhere when run (Maze Burrow's only Linux download).
+    pub mojosetup: bool,
     /// Asks for an executable stack: glibc 2.41+ refuses to dlopen such libraries.
     /// A missing PT_GNU_STACK counts, as x86 defaults to executable.
     pub exec_stack: bool,
@@ -266,18 +269,82 @@ pub fn runs_path(script: &Path, name: &str) -> bool {
     })
 }
 
-/// Whether a jar's own classes use java.applet, which Java 26 removed (Sheep Farm Simulator:
-/// NoClassDefFoundError java/applet/AppletStub from its obfuscated game code). Libraries it
-/// bundles don't count: libGDX and Slick jars carry LWJGL 2's and Slick's unused applet
-/// containers and run on Java 27.
-pub fn jar_uses_applet(jar: &Path) -> bool {
+/// What a jar's own classes use that newer Java removed. Libraries it bundles don't count:
+/// libGDX and Slick jars carry LWJGL 2's and Slick's unused applet containers and run on Java 27.
+pub struct JarNeeds {
+    /// java.applet, removed in Java 26 (Sheep Farm Simulator: NoClassDefFoundError
+    /// java/applet/AppletStub from its obfuscated game code).
+    pub applet: bool,
+    /// A JavaScript engine through javax.script with none bundled: Java's own (Nashorn) was
+    /// removed in Java 15, and getEngineByName("JavaScript") then gives null (Tikotep:
+    /// NullPointerException in its ScriptSystem).
+    pub nashorn: bool,
+}
+
+pub fn jar_needs(jar: &Path) -> JarNeeds {
     const LIBRARIES: &[&str] = &["org/lwjgl/", "org/newdawn/", "com/badlogic/", "net/java/", "com/jcraft/", "javazoom/", "paulscode/", "de/matthiasmann/", "org/jogamp/", "com/jogamp/", "jogamp/", "javax/", "kotlin/", "org/apache/", "com/google/", "org/json/", "com/esotericsoftware/", "org/ninjacave/"];
-    let Ok(list) = std::process::Command::new("unzip").arg("-Z1").arg(jar).output() else { return false };
-    let names: Vec<String> = String::from_utf8_lossy(&list.stdout).lines().filter(|n| n.ends_with(".class") && !LIBRARIES.iter().any(|l| n.starts_with(l))).map(String::from).collect();
-    names.chunks(500).any(|chunk| {
+    let mut needs = JarNeeds { applet: false, nashorn: false };
+    let Ok(list) = std::process::Command::new("unzip").arg("-Z1").arg(jar).output() else { return needs };
+    let all = String::from_utf8_lossy(&list.stdout);
+    let engine = all.lines().any(|n| n.starts_with("org/mozilla/javascript/") || n.starts_with("org/openjdk/nashorn/"));
+    let names: Vec<&str> = all.lines().filter(|n| n.ends_with(".class") && !LIBRARIES.iter().any(|l| n.starts_with(l))).collect();
+    for chunk in names.chunks(500) {
         let out = std::process::Command::new("unzip").arg("-p").arg(jar).args(chunk).output().map(|o| o.stdout).unwrap_or_default();
-        out.windows(12).any(|w| w == b"java/applet/")
-    })
+        needs.applet |= out.windows(12).any(|w| w == b"java/applet/");
+        needs.nashorn |= !engine && out.windows(32).any(|w| w == b"javax/script/ScriptEngineManager");
+        if needs.applet && (needs.nashorn || engine) {
+            break;
+        }
+    }
+    needs
+}
+
+/// An Eclipse "jar-in-jar" export: the libraries are jars inside the jar, and Eclipse's own
+/// loader (its Main-Class) starts `main_class` with them. That loader doesn't find them on
+/// current Java (Wobble, Art Treachery: NoClassDefFoundError com/badlogic/gdx/ApplicationListener
+/// on Java 21 and 27); unpacked and on the class path, they load.
+pub struct JarInJar {
+    pub main_class: String,
+    pub jars: Vec<String>,
+}
+
+pub fn jar_in_jar(jar: &Path) -> Option<JarInJar> {
+    let out = std::process::Command::new("unzip").arg("-p").arg(jar).arg("META-INF/MANIFEST.MF").output().ok()?;
+    // Long values continue on lines starting with a space.
+    let text = String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n").replace("\n ", "");
+    let value = |key: &str| text.lines().find_map(|l| l.strip_prefix(key)?.strip_prefix(':').map(|v| v.trim().to_string()));
+    if value("Main-Class")? != "org.eclipse.jdt.internal.jarinjarloader.JarRsrcLoader" {
+        return None;
+    }
+    let list = std::process::Command::new("unzip").arg("-Z1").arg(jar).output().ok()?;
+    let inside = String::from_utf8_lossy(&list.stdout).into_owned();
+    let jars: Vec<String> = value("Rsrc-Class-Path")?.split_whitespace().filter(|j| j.ends_with(".jar") && inside.lines().any(|l| l == *j)).map(String::from).collect();
+    // Astro Defend's export keeps its libraries unpacked ("Rsrc-Class-Path: ./") and runs.
+    (!jars.is_empty()).then_some(JarInJar { main_class: value("Rsrc-Main-Class")?, jars })
+}
+
+/// Lists of library names a program tries in turn with dlopen, kept as one text: D's Derelict
+/// bindings load SDL that way ("libSDL2_image.so, libSDL2_image-2.0.so, libSDL2_image-2.0.so.0,
+/// /usr/local/lib/libSDL2_image.so, ...": Blue Bug Bob), so they aren't in DT_NEEDED.
+pub fn dlopen_lists(path: &Path) -> Vec<Vec<String>> {
+    let Ok(data) = std::fs::read(path) else { return Vec::new() };
+    let lib_name = |n: &str| {
+        let base = n.rsplit('/').next().unwrap_or(n);
+        base.starts_with("lib") && base.contains(".so") && base.chars().all(|c| c.is_ascii_alphanumeric() || "._+-".contains(c))
+    };
+    let mut lists: Vec<Vec<String>> = Vec::new();
+    let mut at = 0;
+    while let Some(i) = data[at..].windows(5).position(|w| w == b".so, ").map(|i| at + i) {
+        let start = data[..i].iter().rposition(|b| !(b.is_ascii_graphic() || *b == b' ')).map_or(0, |s| s + 1);
+        let end = data[i..].iter().position(|b| !(b.is_ascii_graphic() || *b == b' ')).map_or(data.len(), |e| i + e);
+        at = end;
+        let text = String::from_utf8_lossy(&data[start..end]);
+        let names: Vec<String> = text.split(", ").map(str::to_string).collect();
+        if names.len() > 1 && names.iter().all(|n| lib_name(n)) && !lists.contains(&names) {
+            lists.push(names);
+        }
+    }
+    lists
 }
 
 /// Where a type-2 AppImage's squashfs image starts: right after its ELF runtime, whose section
@@ -472,7 +539,14 @@ fn elf(f: &mut File, h: &[u8]) -> Option<Elf> {
     f.seek(SeekFrom::Start(size.saturating_sub(4096))).ok()?;
     f.read_to_end(&mut end).ok()?;
     let pyinstaller = end.windows(8).any(|w| w == b"MEI\x0c\x0b\x0a\x0b\x0e");
-    Some(Elf { bits, machine, program, needed, rpath, runpath, packed, pyinstaller, exec_stack })
+    // A zip's end record at the end, and MojoSetup's own messages in the program before it.
+    let mojosetup = end.windows(4).any(|w| w == b"PK\x05\x06") && {
+        let mut head = Vec::new();
+        f.seek(SeekFrom::Start(0)).ok()?;
+        f.take(2 << 20).read_to_end(&mut head).ok()?;
+        head.windows(21).any(|w| w == b"MojoSetup starting up")
+    };
+    Some(Elf { bits, machine, program, needed, rpath, runpath, packed, pyinstaller, mojosetup, exec_stack })
 }
 
 const MEI_COOKIE: &[u8] = b"MEI\x0c\x0b\x0a\x0b\x0e";

@@ -114,6 +114,11 @@ impl System {
     /// Homebrew's newest openjdk@N up to 25: version strings with dots and applets still in,
     /// which old Processing games need (Java 26 removed applets; "27" has no dot).
     pub fn java_lts(&self) -> Option<PathBuf> {
+        self.java_up_to(25)
+    }
+
+    /// Homebrew's newest openjdk@N up to `max`.
+    pub fn java_up_to(&self, max: u32) -> Option<PathBuf> {
         let opt = Path::new("/home/linuxbrew/.linuxbrew/opt");
         let mut found: Vec<(u32, PathBuf)> = std::fs::read_dir(opt)
             .into_iter()
@@ -122,11 +127,16 @@ impl System {
             .filter_map(|e| {
                 let n: u32 = e.file_name().to_string_lossy().strip_prefix("openjdk@")?.parse().ok()?;
                 let java = e.path().join("bin/java");
-                (n <= 25 && java.is_file()).then_some((n, java))
+                (n <= max && java.is_file()).then_some((n, java))
             })
             .collect();
         found.sort();
         found.pop().map(|(_, j)| j)
+    }
+
+    /// The major version of one of Homebrew's openjdk@N (None for its plain, newest `openjdk`).
+    pub fn java_major(java: &Path) -> Option<u32> {
+        java.to_string_lossy().split("/openjdk@").nth(1)?.split('/').next()?.parse().ok()
     }
 
     /// How to start LÖVE: Flathub's (Bazzite's way to install it; its sandbox can read the whole

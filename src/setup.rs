@@ -87,6 +87,12 @@ fn icon(game: &Game, main: &Path) -> String {
 }
 
 pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome, String> {
+    if report.problems.iter().any(|p| matches!(p, Problem::UnityDataMissing(_))) {
+        return Err("The download lacks the game's data folder (see gamefix check): nothing to set up.".into());
+    }
+    if let Some(Problem::LinuxInstaller(file)) = report.problems.iter().find(|p| matches!(p, Problem::LinuxInstaller(_))) {
+        return setup_unpacked(game, file, targets);
+    }
     let Some((main, _)) = game.main() else {
         // A game another program runs: that program and the file to give it.
         let java_audio = crate::check::uses_java_sound(game);
@@ -130,19 +136,21 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
             Problem::Disc { file, installer: Some(installer), .. } => Some(Installer::Disc { iso: game.root.join(file), inside: installer.clone() }),
             _ => None,
         });
+        // A game another program runs comes first, as in the report: Tikotep's download carries
+        // a 35 KB Windows .exe that only starts its jar.
         return match game.windows {
-            Some(i) => setup_windows(game, report, &game.files[i], targets),
-            None if runner.is_some() => {
+            _ if runner.is_some() => {
                 let (command, file, name) = runner.unwrap();
                 setup_runner(game, command, file, name, targets)
             }
-            None if old_love.is_some() => {
+            _ if old_love.is_some() => {
                 let (file, build) = old_love.unwrap();
                 let (command, note) = crate::love::runtime(build)?;
                 let mut outcome = setup_runner(game, command, file, &format!("LÖVE {build}"), targets)?;
                 outcome.done.splice(0..0, note);
                 Ok(outcome)
             }
+            Some(i) => setup_windows(game, report, &game.files[i], targets),
             None if game.cd_installer.is_some() => setup_install(game, Installer::File(game.full(&game.files[game.cd_installer.unwrap()])), targets),
             None if disc.is_some() => setup_install(game, disc.unwrap(), targets),
             None if !report.installers.is_empty() => setup_install(game, Installer::File(game.root.join(&report.installers[0].0)), targets),
@@ -361,7 +369,7 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
             Problem::Alsa32(None) => not_fixed.push("Its 32-bit ALSA sound: needs Steam's runtime (install Steam), which has a plugin that works.".into()),
             Problem::KickFiles(files) => not_fixed.push(format!("Its missing Mono files ({}): only the developer can add them; the .exe with Proton works.", files.join(", "))),
             Problem::FnaLibs(libs) => not_fixed.push(format!("Its missing native libraries ({}): get FNA's fnalibs, or use the Windows download with Proton.", libs.join(", "))),
-            Problem::NoLinuxBuild | Problem::OwnWindowsDlls(_) | Problem::MissingWindowsParts(_) | Problem::Source(..) | Problem::Web(_) | Problem::Damaged(_) | Problem::Package(..) | Problem::Flash { .. } | Problem::Dos { .. } | Problem::Disc { .. } | Problem::CdFiles { .. } | Problem::Protected { .. } | Problem::Archive(_) | Problem::WrongMachine(_) | Problem::Love { .. } | Problem::Python { .. } | Problem::Java { .. } => {}
+            Problem::NoLinuxBuild | Problem::UnityDataMissing(_) | Problem::LinuxInstaller(_) | Problem::OwnWindowsDlls(_) | Problem::MissingWindowsParts(_) | Problem::Source(..) | Problem::Web(_) | Problem::Damaged(_) | Problem::Package(..) | Problem::Flash { .. } | Problem::Dos { .. } | Problem::Disc { .. } | Problem::CdFiles { .. } | Problem::Protected { .. } | Problem::Archive(_) | Problem::WrongMachine(_) | Problem::Love { .. } | Problem::Python { .. } | Problem::Java { .. } => {}
         }
     }
     if !preload.is_empty() {
@@ -582,8 +590,30 @@ fn setup_runner(game: &Game, command: Vec<String>, file: &Path, name: &str, targ
     }
     let file = game.root.join(file);
     let workdir = file.parent().unwrap_or(&game.root);
+    let mut command = command;
+    let mut tail = vec![file.display().to_string()];
+    // An Eclipse jar-in-jar export: its inner jars unpacked, then the game's own main class
+    // started with them on the class path (Java expands `<dir>/*`).
+    if command.last().is_some_and(|a| a == "-jar") {
+        if let Some(inner) = crate::binary::jar_in_jar(&file) {
+            let dir = data_home().join("gamefix/jars").join(slug(&game.name));
+            if !dir.is_dir() {
+                fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+                record.push(format!("created-dir\t{}", dir.display()));
+            }
+            let out = Command::new("unzip").args(["-q", "-o", "-j"]).arg(&file).args(&inner.jars).arg("-d").arg(&dir).output().map_err(|e| format!("unzip: {e}"))?;
+            if !out.status.success() {
+                return Err(format!("Couldn't unpack the jars inside {}: {}", file.display(), String::from_utf8_lossy(&out.stderr).trim()));
+            }
+            record.extend(inner.jars.iter().filter_map(|j| Path::new(j).file_name()).map(|n| format!("created\t{}", dir.join(n).display())));
+            command.pop();
+            command.extend(["-cp".into(), format!("{}:{}/*", file.display(), dir.display())]);
+            tail = vec![inner.main_class];
+            done.push(format!("Unpacked the {} jars packed inside it into ~/.local/share/gamefix/jars, which its own loader doesn't find on current Java.", inner.jars.len()));
+        }
+    }
     if targets.menu {
-        let exec: Vec<String> = command.iter().chain([&file.display().to_string()]).map(|a| exec_arg(a)).collect();
+        let exec: Vec<String> = command.iter().chain(&tail).map(|a| exec_arg(a)).collect();
         let entry = write_entry(game, &exec, workdir, "applications-games")?;
         // Undo goes backwards: the entry first in the file is removed last.
         record.insert(0, format!("created\t{}", entry.display()));
@@ -595,7 +625,7 @@ fn setup_runner(game: &Game, command: Vec<String>, file: &Path, name: &str, targ
     if let Some(steam) = &steam {
         let exe = program_path(&command[0]).ok_or(format!("{} isn't on the PATH, so Steam couldn't start it.", command[0]))?;
         let quote = |v: &str| if v.chars().all(|c| c.is_ascii_alphanumeric() || "/-_.=+:,".contains(c)) { v.to_string() } else { format!("'{}'", v.replace('\'', "'\\''")) };
-        let args: Vec<String> = command[1..].iter().chain([&file.display().to_string()]).map(|a| quote(a)).collect();
+        let args: Vec<String> = command[1..].iter().chain(&tail).map(|a| quote(a)).collect();
         let line = args.join(" ");
         let shortcuts = steam.shortcuts();
         let shortcut = steam::Shortcut { name: &game.name, exe: &exe, start_dir: workdir, icon: "", launch_options: &line };
@@ -610,6 +640,51 @@ fn setup_runner(game: &Game, command: Vec<String>, file: &Path, name: &str, targ
         refresh_menu();
     }
     Ok(Outcome { done, not_fixed })
+}
+
+/// The folder a Linux installer's game is unpacked into: its name without words like
+/// "Linux" and "Installer" ("MazeBurrow_v0_7_LinuxInstaller" → "MazeBurrow_v0_7").
+pub fn unpacked_name(installer: &Path) -> String {
+    let name = installer.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let mut base = name.strip_suffix(".run").or_else(|| name.strip_suffix(".bin")).unwrap_or(&name).to_string();
+    loop {
+        let lower = base.to_lowercase();
+        let Some(word) = ["installer", "install", "setup", "linux64", "linux32", "linux", "x86_64", "x86", "64bit", "32bit"].iter().find(|w| lower.ends_with(*w)) else { break };
+        base.truncate(base.len() - word.len());
+        base = base.trim_end_matches(['_', '-', '.', ' ']).to_string();
+    }
+    if base.is_empty() || base == name { format!("{name} (unpacked)") } else { base }
+}
+
+/// A MojoSetup installer: the game it carries (its zip's `data/`, what the installer would copy)
+/// unpacked into a folder named after it beside it, then that set up. Undo leaves the folder,
+/// like an installed Windows game: the game may keep its saves there.
+fn setup_unpacked(game: &Game, file: &Path, targets: &Targets) -> Result<Outcome, String> {
+    let installer = game.root.join(file);
+    let dir = installer.parent().unwrap_or(&game.root);
+    let dest = dir.join(unpacked_name(&installer));
+    if dest.exists() {
+        return Err(format!("{} is already there but holds no game program: move it away and set up again.", dest.display()));
+    }
+    let tmp = dir.join(format!(".gamefix-unpacking-{}", std::process::id()));
+    // unzip warns (exit 1) about the installer's program before the zip.
+    let out = Command::new("unzip").args(["-q", "-o"]).arg(&installer).arg("data/*").arg("-d").arg(&tmp).output().map_err(|e| format!("unzip: {e}"))?;
+    if out.status.code().is_none_or(|c| c > 1) || !tmp.join("data").is_dir() {
+        let _ = fs::remove_dir_all(&tmp);
+        return Err(format!("Couldn't unpack the game from {}: {}", installer.display(), String::from_utf8_lossy(&out.stderr).trim()));
+    }
+    let moved = fs::rename(tmp.join("data"), &dest);
+    let _ = fs::remove_dir_all(&tmp);
+    moved.map_err(|e| e.to_string())?;
+    let unpacked = crate::scan::scan(&game.root).ok_or("The unpacked game couldn't be read.")?;
+    let report = crate::check::check(&unpacked, &crate::system::System::load());
+    let mut outcome = setup(&unpacked, &report, targets)?;
+    let record = record_path(&unpacked);
+    let mut lines = fs::read_to_string(&record).unwrap_or_default();
+    lines.push_str(&format!("installed-game\t{}\n", dest.display()));
+    fs::write(&record, lines).map_err(|e| e.to_string())?;
+    outcome.done.insert(0, format!("Unpacked the game from its installer, {}, into {}.", file.display(), dest.display()));
+    Ok(outcome)
 }
 
 /// A program's full path: as given when it has a slash, else the first match on the PATH.
@@ -1131,6 +1206,13 @@ fn refresh_menu() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn installer_folder_names() {
+        assert_eq!(unpacked_name(Path::new("/g/MazeBurrow_v0_7_LinuxInstaller")), "MazeBurrow_v0_7");
+        assert_eq!(unpacked_name(Path::new("/g/game-linux-x86_64-setup.run")), "game");
+        assert_eq!(unpacked_name(Path::new("/g/Installer")), "Installer (unpacked)");
+    }
 
     #[test]
     fn slugs_keep_any_alphabet() {

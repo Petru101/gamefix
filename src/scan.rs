@@ -36,6 +36,9 @@ pub struct Game {
     /// Index into `files` of the installer on a CD's files (an autorun.inf in its folder or
     /// above): the game is installed from there, not run from the CD.
     pub cd_installer: Option<usize>,
+    /// Index into `files` of a Linux installer (MojoSetup) the game is packed in, when there's
+    /// no Linux program.
+    pub linux_installer: Option<usize>,
     /// Index into `files` of a disc image to install the game from, when there's nothing else
     /// to run.
     pub disc: Option<usize>,
@@ -119,14 +122,15 @@ pub fn scan(path: &Path) -> Option<Game> {
         None => pick_windows(&root, &files),
     };
     let cd_installer = if main.is_none() { cd_installer(&root, &files) } else { None };
-    let windows = if cd_installer.is_some() { None } else { windows };
+    let linux_installer = if main.is_none() { files.iter().position(|f| matches!(&f.binary, Binary::Elf(e) if e.mojosetup)) } else { None };
+    let windows = if cd_installer.is_some() || linux_installer.is_some() { None } else { windows };
     let portable = match main {
         Some(_) => None,
         None if chosen.is_some() => chosen.as_ref().and_then(|c| files.iter().position(|f| &f.path == c && matches!(f.binary, Binary::Love | Binary::Jar | Binary::Flash | Binary::Python(_) | Binary::Dos))),
         // A DOS program only when nothing else runs: Windows games may carry DOS tools.
         None => pick_portable(&root, &files).or_else(|| if windows.is_none() { pick_dos(&root, &files) } else { None }),
     };
-    let nothing = main.is_none() && windows.is_none() && portable.is_none() && cd_installer.is_none();
+    let nothing = main.is_none() && windows.is_none() && portable.is_none() && cd_installer.is_none() && linux_installer.is_none();
     let disc = nothing.then(|| files.iter().enumerate().filter(|(_, f)| matches!(f.binary, Binary::Disc)).min_by_key(|(_, f)| f.path.components().count()).map(|(i, _)| i)).flatten();
     let archive = (nothing && disc.is_none())
         .then(|| files.iter().enumerate().filter(|(_, f)| matches!(f.binary, Binary::Archive)).min_by_key(|(_, f)| f.path.components().count()).map(|(i, _)| i))
@@ -141,7 +145,7 @@ pub fn scan(path: &Path) -> Option<Game> {
         .or_else(|| chosen.as_ref().filter(|_| shared_folder(&root)).map(|c| stem(c)))
         .or_else(|| root.file_name().map(|n| n.to_string_lossy().into_owned()))
         .unwrap_or_else(|| root.display().to_string());
-    Some(Game { root, name, files, main, windows, portable, cd_installer, disc, archive, engine })
+    Some(Game { root, name, files, main, windows, portable, cd_installer, linux_installer, disc, archive, engine })
 }
 
 /// Folders that hold unrelated downloads rather than one game.
@@ -212,7 +216,7 @@ fn pick_main(root: &Path, files: &[Found]) -> Option<usize> {
             // Nor is a bundled Java (a Processing export's java/bin/java) or anything else in it
             // (Age of Conquest IV's jre/bin/jjs, jre/lib/jexec): a JRE has `release` and bin/java.
             let jre_tool = f.path.ancestors().skip(1).any(|j| root.join(j).join("release").is_file() && root.join(j).join("bin/java").is_file());
-            if !elf.program || not_the_game(&f.path) || (name.starts_with("lib") && name.contains(".so")) || name.starts_with("ld-linux") || (name == "java" && f.path.parent().is_some_and(|d| d.ends_with("bin"))) || jre_tool {
+            if !elf.program || elf.mojosetup || not_the_game(&f.path) || (name.starts_with("lib") && name.contains(".so")) || name.starts_with("ld-linux") || (name == "java" && f.path.parent().is_some_and(|d| d.ends_with("bin"))) || jre_tool {
                 return None;
             }
             let dir = root.join(f.path.parent().unwrap_or(Path::new("")));
