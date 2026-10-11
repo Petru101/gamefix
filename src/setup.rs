@@ -250,6 +250,14 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
                 env.push(("GLIBC_TUNABLES", "glibc.rtld.execstack=2".into()));
                 done.push("Lets its libraries that ask for an executable stack load (at launch).".into());
             }
+            Problem::MissingFolders(_, folders) => {
+                for folder in folders {
+                    let path = game.root.join(folder);
+                    fs::create_dir(&path).map_err(|e| format!("Couldn't create {}: {e}", path.display()))?;
+                    record.push(format!("created-dir\t{}", path.display()));
+                }
+                done.push(format!("Created the folders its config names that the download lacks ({}).", folders.iter().map(|f| f.display().to_string()).collect::<Vec<_>>().join(", ")));
+            }
             Problem::WindowsLineEndings(p) => {
                 // The original goes outside the game's folder, where it would count as a script.
                 let script = game.root.join(p);

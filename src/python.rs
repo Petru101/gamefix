@@ -241,8 +241,11 @@ pub fn plan(root: &Path, files: &[Found], start: &Path) -> Plan {
         let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else { return };
         let stem = name.split('.').next().unwrap_or("").to_string();
         match path.extension().and_then(|e| e.to_str()) {
+            // A package with Windows extension modules (.pyd) is a frozen Windows build's copy
+            // (Postrias' lib/pygame beside its .exe): no use here.
+            _ if is_dir && has_pyd(path) => {}
             _ if is_dir => modules.entry(name).or_default().push(path.to_path_buf()),
-            Some("py") | Some("so") | Some("pyd") => modules.entry(stem).or_default().push(path.to_path_buf()),
+            Some("py") | Some("so") => modules.entry(stem).or_default().push(path.to_path_buf()),
             Some("pyx") => {
                 cython.insert(stem);
             }
@@ -381,6 +384,10 @@ fn case_insensitive_exists(dir: &Path, rest: &Path) -> bool {
         }
     }
     true
+}
+
+fn has_pyd(dir: &Path) -> bool {
+    fs::read_dir(dir).into_iter().flatten().flatten().any(|e| e.path().extension().is_some_and(|x| x == "pyd"))
 }
 
 /// Files and folders under `dir`, not following links, at most 6 deep, skipping caches,

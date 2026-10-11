@@ -63,6 +63,9 @@ pub enum Problem {
     /// The developer's launcher script saved with Windows line endings: Linux takes
     /// "/bin/bash\r" for the shell's name and won't start it (Curse of the Arrow's run.sh).
     WindowsLineEndings(PathBuf),
+    /// Folders a config file beside the program names among others that exist, which the
+    /// download lacks: (config file, folders), relative to the game's root.
+    MissingFolders(PathBuf, Vec<PathBuf>),
     /// Library name → the game's files that need it: `libs` at start (the game can't start
     /// without them), `later` only by plugins loaded later, if at all. Which of all those Steam's
     /// runtime for older games has, and which the game ships in a folder ld.so doesn't look in.
@@ -430,6 +433,9 @@ pub fn check(game: &Game, system: &System) -> Report {
     let mode = std::fs::metadata(game.full(main)).map(|m| m.permissions().mode()).unwrap_or(0);
     if mode & 0o100 == 0 {
         problems.push(Problem::NotExecutable(main.path.clone()));
+    }
+    if let Some((config, folders)) = missing_folders(&game.root, main.path.parent().unwrap_or(Path::new(""))) {
+        problems.push(Problem::MissingFolders(config, folders));
     }
     if let Some(l) = game.launcher().filter(|l| binary::crlf(&game.full(l))) {
         problems.push(Problem::WindowsLineEndings(l.path.clone()));
@@ -808,6 +814,38 @@ fn pulse_socket() -> String {
         format!("/run/user/{uid}")
     });
     format!("unix:{runtime}/pulse/native")
+}
+
+/// A small text file in the program's folder that lists folders under one key, some there and
+/// some not (labb's config.labb: `data editor_data`, `data data-hd`, `data data`; the download
+/// has no editor_data, and the game stops when it lists it). `key value` or `key = value`
+/// lines; a value counts as a folder name when it has no dot or slash. At least two of the
+/// key's values must be folders that exist.
+fn missing_folders(root: &Path, dir: &Path) -> Option<(PathBuf, Vec<PathBuf>)> {
+    let here = root.join(dir);
+    for entry in std::fs::read_dir(&here).ok()?.flatten() {
+        let path = entry.path();
+        if !path.is_file() || entry.metadata().map_or(true, |m| m.len() > 64 << 10) {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else { continue };
+        let mut keys: std::collections::BTreeMap<&str, Vec<&str>> = Default::default();
+        for line in text.lines().map(str::trim).filter(|l| !l.starts_with('#') && !l.starts_with(';')) {
+            let parts: Vec<&str> = line.split(|c: char| c.is_whitespace() || c == '=').filter(|p| !p.is_empty()).collect();
+            if let [key, value] = parts.as_slice() {
+                keys.entry(key).or_default().push(value);
+            }
+        }
+        for values in keys.values() {
+            let named = |v: &&str| !v.contains(['.', '/', '\\']) && v.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-');
+            let there = values.iter().filter(|v| named(v) && here.join(v).is_dir()).count();
+            let missing: Vec<PathBuf> = values.iter().filter(|v| named(v) && !here.join(v).exists()).map(|v| dir.join(v)).collect();
+            if there >= 2 && !missing.is_empty() {
+                return Some((path.strip_prefix(root).ok()?.to_path_buf(), missing));
+            }
+        }
+    }
+    None
 }
 
 /// LÖVE 0.x, which today's LÖVE 11 can't run.
@@ -1418,6 +1456,12 @@ impl Report {
                     let _ = writeln!(out, "✗ The program is built for {cpu}, not a PC's x86 processor, so it can't run here.");
                     let _ = writeln!(out, "    Fix: get the game's download for x86_64 (\"Linux\", \"amd64\" or \"64-bit\"), or its Windows one with Proton.");
                 }
+                Problem::MissingFolders(config, folders) => {
+                    let names: Vec<String> = folders.iter().map(|f| f.display().to_string()).collect();
+                    let _ = writeln!(out, "✗ Its {} names folders the download doesn't have: {}. The game may stop", config.display(), names.join(", "));
+                    let _ = writeln!(out, "  when it looks in one (labb: \"directory iterator cannot open directory\").");
+                    let _ = writeln!(out, "    Fix: gamefix setup creates them, empty.");
+                }
                 Problem::WindowsLineEndings(p) => {
                     let _ = writeln!(out, "✗ {} was saved with Windows line endings, so Linux can't run it", p.display());
                     let _ = writeln!(out, "  (\"bad interpreter\", or \"No such file or directory\" for a file that's there).");
@@ -1704,6 +1748,21 @@ impl Report {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn folders_a_config_names() {
+        let root = std::env::temp_dir().join(format!("gamefix-folders-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for d in ["game/data", "game/data-hd"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        std::fs::write(root.join("game/config.labb"), "data editor_data\n# data data-sd\ndata data-hd\ndata data\nresolution 1024 768\n").unwrap();
+        // One folder there isn't enough to tell a folder list from other settings.
+        std::fs::write(root.join("game/other.cfg"), "music on\nmusic off\n").unwrap();
+        let found = missing_folders(&root, Path::new("game"));
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(found, Some((PathBuf::from("game/config.labb"), vec![PathBuf::from("game/editor_data")])));
+    }
 
     #[test]
     fn unity_versions_starting_tiny() {
