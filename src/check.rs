@@ -278,7 +278,8 @@ fn same_library(a: &Path, b: &Path) -> bool {
 fn web_export(root: &Path) -> Option<PathBuf> {
     let dirs = std::iter::once(root.to_path_buf()).chain(std::fs::read_dir(root).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.is_dir()));
     dirs.filter(|d| d.join("index.html").is_file())
-        .find(|d| d.join("scripts").is_dir() || std::fs::read_dir(d).into_iter().flatten().flatten().any(|e| e.path().extension().is_some_and(|x| x == "js")))
+        // Construct 2 keeps its scripts beside the page or in scripts/; others in js/ (Inferieur 8).
+        .find(|d| d.join("scripts").is_dir() || d.join("js").is_dir() || std::fs::read_dir(d).into_iter().flatten().flatten().any(|e| e.path().extension().is_some_and(|x| x == "js")))
         .map(|d| d.join("index.html").strip_prefix(root).map(Path::to_path_buf).unwrap_or_default())
 }
 
