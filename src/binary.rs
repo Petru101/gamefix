@@ -290,15 +290,22 @@ pub struct JarNeeds {
     /// and 27 its shader text overflows its buffer (Homorium: IndexOutOfBoundsException in
     /// glShaderSource); Java 11 runs it. Where between them it breaks isn't known.
     pub old_lwjgl3: bool,
+    /// One of its own shaders that Mesa rejects and NVIDIA accepts (see `glsl_mismatch`).
+    pub shader: Option<String>,
 }
 
 pub fn jar_needs(jar: &Path) -> JarNeeds {
     const LIBRARIES: &[&str] = &["org/lwjgl/", "org/newdawn/", "com/badlogic/", "net/java/", "com/jcraft/", "javazoom/", "paulscode/", "de/matthiasmann/", "org/jogamp/", "com/jogamp/", "jogamp/", "javax/", "kotlin/", "org/apache/", "com/google/", "org/json/", "com/esotericsoftware/", "org/ninjacave/"];
-    let mut needs = JarNeeds { applet: false, nashorn: false, old_lwjgl3: false };
+    let mut needs = JarNeeds { applet: false, nashorn: false, old_lwjgl3: false, shader: None };
     let Ok(list) = std::process::Command::new("unzip").arg("-Z1").arg(jar).output() else { return needs };
     let all = String::from_utf8_lossy(&list.stdout);
     needs.old_lwjgl3 = all.lines().any(|n| n.starts_with("org/lwjgl/system/MemoryAccess"));
     let engine = all.lines().any(|n| n.starts_with("org/mozilla/javascript/") || n.starts_with("org/openjdk/nashorn/"));
+    let shaders = all.lines().filter(|n| SHADERS.iter().any(|e| n.to_lowercase().ends_with(e)) && !LIBRARIES.iter().any(|l| n.starts_with(l)));
+    needs.shader = shaders.take(50).find(|n| {
+        let text = std::process::Command::new("unzip").arg("-p").arg(jar).arg(n).output().map(|o| o.stdout).unwrap_or_default();
+        glsl_mismatch(&String::from_utf8_lossy(&text))
+    }).map(String::from);
     let names: Vec<&str> = all.lines().filter(|n| n.ends_with(".class") && !LIBRARIES.iter().any(|l| n.starts_with(l))).collect();
     for chunk in names.chunks(500) {
         let out = std::process::Command::new("unzip").arg("-p").arg(jar).args(chunk).output().map(|o| o.stdout).unwrap_or_default();
@@ -309,6 +316,49 @@ pub fn jar_needs(jar: &Path) -> JarNeeds {
         }
     }
     needs
+}
+
+const SHADERS: &[&str] = &[".glsl", ".vert", ".frag", ".vsh", ".fsh", ".vs", ".fs"];
+
+/// A GLSL shader whose code doesn't match the version it's compiled as, which NVIDIA's driver
+/// lets pass and Mesa's (AMD, Intel; the VM's virgl) rejects: GLSL 1.30 functions
+/// (`textureSize`, `texelFetch`) with no `#version` or an older one (1.10 is the default), or
+/// a core version (1.40 and later) with the built-ins core removed (`varying`, `texture2D`,
+/// `gl_FragColor`). Aloisius' outline.fragment.glsl says `#version 330` and uses both, and
+/// Mesa compiled it as 1.10 ("no function with name 'textureSize'"): with Mesa's
+/// force_glsl_version=130 it runs. ES shaders are left alone.
+pub fn glsl_mismatch(text: &str) -> bool {
+    let mut code = String::new();
+    let mut rest = text;
+    while let Some(i) = rest.find('/') {
+        code.push_str(&rest[..i]);
+        let after = &rest[i..];
+        rest = if after.starts_with("//") {
+            after.find('\n').map_or("", |j| &after[j..])
+        } else if after.starts_with("/*") {
+            after.find("*/").map_or("", |j| &after[j + 2..])
+        } else {
+            code.push('/');
+            &after[1..]
+        };
+    }
+    code.push_str(rest);
+    let words: Vec<&str> = code.split(|c: char| !c.is_alphanumeric() && c != '_').filter(|w| !w.is_empty()).collect();
+    let calls = |name: &str| code.match_indices(name).any(|(i, _)| code[i + name.len()..].trim_start().starts_with('(') && !code[..i].ends_with(|c: char| c.is_alphanumeric() || c == '_'));
+    let needs130 = ["textureSize", "texelFetch", "textureGrad", "textureOffset"].iter().any(|f| calls(f));
+    let old = words.iter().any(|w| ["varying", "attribute", "gl_FragColor", "texture2D"].contains(w));
+    let version = code.lines().map(str::trim).find(|l| l.starts_with("#version")).map(|l| {
+        let mut parts = l.split_whitespace().skip(1);
+        (parts.next().and_then(|v| v.parse::<u32>().ok()).unwrap_or(110), parts.next().unwrap_or("").to_string())
+    });
+    match version {
+        None => needs130,
+        Some((_, profile)) if profile == "es" => false,
+        Some((v, _)) if v == 100 || v == 300 || v == 310 || v == 320 => false,
+        Some((v, _)) if v < 130 => needs130,
+        Some((v, profile)) if v >= 140 && profile != "compatibility" => old,
+        _ => false,
+    }
 }
 
 /// An Eclipse "jar-in-jar" export: the libraries are jars inside the jar, and Eclipse's own
@@ -802,5 +852,24 @@ mod tests {
         assert!(python2_source("import pygame\nprint \"hello\"\n"));
         assert!(python2_source("try:\n    x()\nexcept IOError, e:\n    pass\n"));
         assert!(!python2_source("print(\"hello\")\ntry:\n    x()\nexcept (IOError, OSError):\n    pass\n"));
+    }
+}
+
+#[cfg(test)]
+mod glsl_tests {
+    use super::glsl_mismatch;
+
+    #[test]
+    fn shaders_mesa_rejects() {
+        // Aloisius' outline shader: core 3.30 declared, old built-ins used.
+        assert!(glsl_mismatch("#version 330\nvarying vec2 v;\nvoid main(){ ivec2 s = textureSize(t,0); gl_FragColor = texture2D(t, v); }"));
+        // No version (1.10) with a 1.30 function.
+        assert!(glsl_mismatch("uniform sampler2D t;\nvoid main(){ ivec2 s = textureSize(t, 0); }"));
+        // Fine: old style without a version, a 1.30 function with 1.30, ES, compatibility, comments.
+        assert!(!glsl_mismatch("varying vec2 v;\nvoid main(){ gl_FragColor = texture2D(t, v); }"));
+        assert!(!glsl_mismatch("#version 130\nvoid main(){ ivec2 s = textureSize(t, 0); }"));
+        assert!(!glsl_mismatch("#version 300 es\nvoid main(){ ivec2 s = textureSize(t, 0); }"));
+        assert!(!glsl_mismatch("#version 330 compatibility\nvarying vec2 v;\nvoid main(){ gl_FragColor = vec4(1); }"));
+        assert!(!glsl_mismatch("// textureSize(t, 0)\n/* texelFetch(t) */\nvoid main(){ gl_FragColor = vec4(1); }"));
     }
 }

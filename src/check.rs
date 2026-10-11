@@ -1502,6 +1502,12 @@ impl Report {
                         let _ = writeln!(out, "  It uses Java applets, which Java 26 removed: it needs Java 25 or older (\"brew install");
                         let _ = writeln!(out, "  openjdk@21\"; gamefix uses that one when it's there).");
                     }
+                    if let Some(shader) = &needs.shader {
+                        let _ = writeln!(out, "✗ Its shader {shader} doesn't match the GLSL version it's compiled as: NVIDIA's driver lets");
+                        let _ = writeln!(out, "  that pass, Mesa's (AMD and Intel graphics) stops it with \"Error compiling shader\".");
+                        let _ = writeln!(out, "    Fix: gamefix setup makes Mesa read such shaders as GLSL 1.30 (force_glsl_version=130,");
+                        let _ = writeln!(out, "    which other drivers ignore).");
+                    }
                 }
                 Problem::Java { file, java: Some(java) } if scan::install4j_script(&game.root, file) => {
                     let _ = writeln!(out, "• This is a Java game; its launcher {} starts it with Java ({}).", file.display(), java.display());

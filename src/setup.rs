@@ -108,7 +108,18 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
         // A game another program runs: that program and the file to give it.
         let java_audio = crate::check::uses_java_sound(game);
         let runner = report.problems.iter().find_map(|p| match p {
-            Problem::Java { file, java: Some(java) } if file.extension().is_some_and(|e| e == "jar") => Some((java_sound(vec![java.display().to_string(), "-jar".into()], java_audio), file, "Java")),
+            Problem::Java { file, java: Some(java) } if file.extension().is_some_and(|e| e == "jar") => {
+                let mut command = java_sound(vec![java.display().to_string(), "-jar".into()], java_audio);
+                // Mesa reads the game's mismatched shaders as GLSL 1.30 (Aloisius); other drivers
+                // ignore the setting.
+                if crate::binary::jar_needs(&game.root.join(file)).shader.is_some() {
+                    command = match command[0].as_str() {
+                        "env" => [vec!["env".into(), "force_glsl_version=130".into()], command[1..].to_vec()].concat(),
+                        _ => [vec!["env".into(), "force_glsl_version=130".into()], command].concat(),
+                    };
+                }
+                Some((command, file, "Java"))
+            }
             // A Processing export's script runs plain `java`, which may be Homebrew's, off the
             // PATH menu entries get; and its exec bit is often lost.
             Problem::Java { file, java: Some(java) } => {
