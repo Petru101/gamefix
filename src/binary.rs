@@ -776,43 +776,6 @@ fn elf(f: &mut File, h: &[u8]) -> Option<Elf> {
     Some(Elf { bits, machine, program, needed, rpath, runpath, packed, pyinstaller, mojosetup, exec_stack })
 }
 
-const MEI_COOKIE: &[u8] = b"MEI\x0c\x0b\x0a\x0b\x0e";
-/// The cookie: magic, archive length, table of contents' offset and length (both from the
-/// archive's start), Python version, Python library name (64 bytes).
-const COOKIE_LEN: usize = 88;
-
-fn be32(b: &[u8], at: usize) -> usize {
-    u32::from_be_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]) as usize
-}
-
-/// The names of the files packed in a PyInstaller bundle's archive (one-file: the libraries
-/// too; a folder build's holds only Python code).
-pub fn bundle_names(path: &Path) -> Option<Vec<String>> {
-    let data = std::fs::read(path).ok()?;
-    // The cookie ends the archive: at the end of the file, or of its ELF section (newer
-    // PyInstaller: `pydata`), which the section headers follow.
-    let tail = data.len().saturating_sub(1 << 20);
-    let cookie = tail + data[tail..].windows(MEI_COOKIE.len()).rposition(|w| w == MEI_COOKIE)?;
-    if cookie + COOKIE_LEN > data.len() {
-        return None;
-    }
-    let start = (cookie + COOKIE_LEN).checked_sub(be32(&data, cookie + 8))?;
-    let (at, len) = (start + be32(&data, cookie + 12), be32(&data, cookie + 16));
-    let toc = data.get(at..at + len)?;
-    let mut names = Vec::new();
-    let mut pos = 0;
-    // Each entry: its length, data offset, packed and unpacked size, compressed flag, type, name.
-    while pos + 18 <= toc.len() {
-        let len = be32(toc, pos);
-        if len < 18 || pos + len > toc.len() {
-            return None;
-        }
-        names.push(String::from_utf8_lossy(&toc[pos + 18..pos + len]).trim_end_matches('\0').to_string());
-        pos += len;
-    }
-    Some(names)
-}
-
 /// The DLLs a Windows program or library needs to start (delay-loaded ones, loaded the first
 /// time they're used, aren't counted).
 pub struct Imports {
@@ -876,6 +839,203 @@ pub fn dotnet_runtime(path: &Path) -> Option<String> {
     let len = u32le(data.get(at..at + 16)?, 12) as usize;
     let version = data.get(at + 16..at + 16 + len.min(32))?;
     Some(String::from_utf8_lossy(version).trim_end_matches('\0').to_string())
+}
+
+const MEI_COOKIE: &[u8] = b"MEI\x0c\x0b\x0a\x0b\x0e";
+/// The cookie: magic, archive length, table of contents' offset and length (both from the
+/// archive's start), Python version, Python library name (64 bytes).
+const COOKIE_LEN: usize = 88;
+
+/// A PyInstaller one-file bundle's archive, in the whole file's bytes: where it starts, where its
+/// cookie is, and the ELF section holding it (newer PyInstaller: `pydata`), if it's in one.
+struct Archive {
+    start: usize,
+    cookie: usize,
+    section: Option<usize>,
+}
+
+fn be32(b: &[u8], at: usize) -> usize {
+    u32::from_be_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]) as usize
+}
+
+/// ELF64 section headers: (offset in the file of the header table, entry size, count).
+fn elf64_sections(data: &[u8]) -> Option<(usize, usize, usize)> {
+    (data.get(..6)? == b"\x7fELF\x02\x01").then(|| (u64le(data, 40) as usize, u16le(data, 58) as usize, u16le(data, 60) as usize))
+}
+
+fn archive(data: &[u8]) -> Option<Archive> {
+    // The cookie ends the archive; in a section, the section headers come after it.
+    let tail = data.len().saturating_sub(1 << 20);
+    let cookie = tail + data[tail..].windows(MEI_COOKIE.len()).rposition(|w| w == MEI_COOKIE)?;
+    let end = cookie + COOKIE_LEN;
+    let start = end.checked_sub(be32(data, cookie + 8))?;
+    let section = elf64_sections(data).and_then(|(shoff, size, count)| {
+        (0..count).find(|&i| {
+            let s = shoff + i * size;
+            s + 40 <= data.len() && u64le(data, s + 24) as usize == start && (u64le(data, s + 24) + u64le(data, s + 32)) as usize == end
+        })
+    });
+    if section.is_none() && end != data.len() {
+        return None;
+    }
+    Some(Archive { start, cookie, section })
+}
+
+/// The names of the files packed in a PyInstaller one-file bundle.
+pub fn bundle_names(path: &Path) -> Option<Vec<String>> {
+    let data = std::fs::read(path).ok()?;
+    let a = archive(&data)?;
+    let toc = data.get(a.start + be32(&data, a.cookie + 12)..a.start + be32(&data, a.cookie + 12) + be32(&data, a.cookie + 16))?;
+    let mut names = Vec::new();
+    let mut pos = 0;
+    // Each entry: its length, data offset, packed and unpacked size, compressed flag, type, name.
+    while pos + 18 <= toc.len() {
+        let len = be32(toc, pos);
+        if len < 18 || pos + len > toc.len() {
+            return None;
+        }
+        names.push(String::from_utf8_lossy(&toc[pos + 18..pos + len]).trim_end_matches('\0').to_string());
+        pos += len;
+    }
+    Some(names)
+}
+
+/// The bundle's bytes with one more data file packed in (stored as it is, unpacked with the rest
+/// at start): its data goes after the others, then the table of contents with the new entry and
+/// the cookie. When the archive is an ELF section, everything after it moves along and the
+/// section headers say so; nothing that's loaded into memory comes after it.
+pub fn bundle_with(data: &[u8], name: &str, content: &[u8]) -> Result<Vec<u8>, String> {
+    let a = archive(data).ok_or("not a PyInstaller bundle gamefix can read")?;
+    let (tocpos, toclen) = (be32(data, a.cookie + 12), be32(data, a.cookie + 16));
+    let mut out = data[..a.start + tocpos].to_vec();
+    out.extend_from_slice(content);
+    let new_tocpos = out.len() - a.start;
+    out.extend_from_slice(&data[a.start + tocpos..a.start + tocpos + toclen]);
+    let mut entry_len = 18 + name.len() + 1;
+    entry_len += (16 - entry_len % 16) % 16;
+    for v in [entry_len, tocpos, content.len(), content.len()] {
+        out.extend_from_slice(&(v as u32).to_be_bytes());
+    }
+    out.extend_from_slice(&[0, b'x']);
+    out.extend_from_slice(name.as_bytes());
+    out.resize(out.len() + entry_len - 18 - name.len(), 0);
+    let mut cookie = data[a.cookie..a.cookie + COOKIE_LEN].to_vec();
+    let archive_len = out.len() + COOKIE_LEN - a.start;
+    cookie[8..12].copy_from_slice(&(archive_len as u32).to_be_bytes());
+    cookie[12..16].copy_from_slice(&(new_tocpos as u32).to_be_bytes());
+    cookie[16..20].copy_from_slice(&((toclen + entry_len) as u32).to_be_bytes());
+    out.extend_from_slice(&cookie);
+    let old_end = a.cookie + COOKIE_LEN;
+    let delta = out.len() - old_end;
+    out.extend_from_slice(&data[old_end..]);
+    if let (Some(index), Some((shoff, size, count))) = (a.section, elf64_sections(data)) {
+        // Program headers: nothing loaded may lie after the archive.
+        let (phoff, phsize, phnum) = (u64le(data, 32) as usize, u16le(data, 54) as usize, u16le(data, 56) as usize);
+        if (0..phnum).any(|i| u64le(data, phoff + i * phsize + 8) as usize >= old_end) {
+            return Err("its program headers point past the archive; not changing it".into());
+        }
+        let set = |out: &mut Vec<u8>, at: usize, v: u64| out[at..at + 8].copy_from_slice(&v.to_le_bytes());
+        let new_shoff = if shoff >= old_end { shoff + delta } else { shoff };
+        set(&mut out, 40, new_shoff as u64);
+        for i in 0..count {
+            let s = new_shoff + i * size;
+            let off = u64le(&out, s + 24) as usize;
+            if i == index {
+                set(&mut out, s + 32, archive_len as u64);
+            } else if off >= old_end {
+                set(&mut out, s + 24, (off + delta) as u64);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// For `bundle_asks_default_font`: reads a PyInstaller program's packed code (zlib, so through
+/// the system's python3, which only unpacks bytes and runs none of it): its pyi_rth_pkgres hook is PyInstaller 3's (it registers
+/// NullProvider, not PyInstaller 4's PyiFrozenProvider), and the game's own code (not Python's
+/// or pygame's) names SysFont or get_default_font. Marshalled code keeps names as text.
+const DEFAULT_FONT_SCRIPT: &str = r#"
+import sys, struct, zlib, re, marshal
+d = open(sys.argv[1], 'rb').read()
+c = d.rfind(b'MEI\x0c\x0b\x0a\x0b\x0e')
+n, toc, toclen, _ = struct.unpack('!iiii', d[c + 8:c + 24])
+s = c + 88 - n
+t = d[s + toc:s + toc + toclen]
+lib = set(getattr(sys, 'stdlib_module_names', ())) | {'pygame', 'pkg_resources', 'PyInstaller', 'setuptools'}
+p, hook, code = 0, b'', []
+while p < len(t):
+    l, o, cl, ul, cf, ty = struct.unpack('!iiiiBc', t[p:p + 18])
+    name = t[p + 18:p + l].rstrip(b'\0').decode('utf8', 'replace')
+    p += l
+    b = d[s + o:s + o + cl]
+    if ty == b's':
+        b = zlib.decompress(b) if cf else b
+        if name == 'pyi_rth_pkgres':
+            hook = b
+        elif not name.startswith('pyi'):
+            code.append(b)
+    elif ty == b'z' and not cf:
+        entries = marshal.loads(b[struct.unpack('!i', b[8:12])[0]:])
+        for mod, (pkg, pos, size) in (entries.items() if isinstance(entries, dict) else entries):
+            if mod.split('.')[0] not in lib and not mod.startswith('_'):
+                try:
+                    code.append(zlib.decompress(b[pos:pos + size]))
+                except zlib.error:
+                    pass
+old = b'NullProvider' in hook and b'PyiFrozenProvider' not in hook
+print('yes' if old and any(re.search(rb'SysFont|get_default_font', x) for x in code) else 'no')
+"#;
+
+/// pygame 1 in it would crash on its default font (see `check::Problem::PygameFont`); false
+/// without python3.
+pub fn bundle_asks_default_font(path: &Path) -> bool {
+    let Some(python) = crate::python::python3() else { return false };
+    std::process::Command::new(python).arg("-c").arg(DEFAULT_FONT_SCRIPT).arg(path).stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null()).output().is_ok_and(|o| o.stdout.starts_with(b"yes"))
+}
+
+/// PyInstaller 3's start-up hook `pyi_rth_pkgres` gives its importer pkg_resources'
+/// NullProvider, whose every question raises NotImplementedError; pygame 1.9 asks pkg_resources
+/// for its default font first and crashes on that (Souls of the Tower). Turns the hook off (its
+/// entry gets a type the bootloader never runs or unpacks) and renames pkg_resources in the
+/// module archive's table to a name as long (`pkg_resourcez`), so importing it fails and pygame
+/// opens the file itself. Changes bytes in place: nothing moves.
+pub fn bundle_without_pkg_resources(data: &mut [u8]) -> Result<(), String> {
+    let a = archive(data).ok_or("not a PyInstaller bundle gamefix can read")?;
+    let (tocpos, toclen) = (a.start + be32(data, a.cookie + 12), be32(data, a.cookie + 16));
+    let (mut hook, mut renamed) = (false, false);
+    let mut pos = tocpos;
+    // Each entry: its length, data offset, packed and unpacked size, compressed flag, type, name.
+    while pos + 18 <= tocpos + toclen {
+        let len = be32(data, pos);
+        if len < 18 || pos + len > tocpos + toclen {
+            return Err("its table of contents can't be read".into());
+        }
+        let name = String::from_utf8_lossy(&data[pos + 18..pos + len]).trim_end_matches('\0').to_string();
+        let (offset, size, compressed, kind) = (be32(data, pos + 4), be32(data, pos + 8), data[pos + 16], data[pos + 17]);
+        if name == "pyi_rth_pkgres" && kind == b's' {
+            data[pos + 17] = b'-';
+            hook = true;
+        }
+        // The module archive (PYZ), stored as it is: "PYZ\0", the .pyc magic, then where its
+        // table (marshalled names and places) starts.
+        if kind == b'z' && compressed == 0 {
+            let pyz = a.start + offset;
+            if data.get(pyz..pyz + 4) == Some(b"PYZ\0") && pyz + size <= data.len() {
+                let table = pyz + be32(data, pyz + 8);
+                let mut at = table;
+                while let Some(i) = data[at..pyz + size].windows(13).position(|w| w == b"pkg_resources") {
+                    data[at + i + 12] = b'z';
+                    at += i + 13;
+                    renamed = true;
+                }
+            }
+        }
+        pos += len;
+    }
+    match (hook, renamed) {
+        (true, true) => Ok(()),
+        _ => Err("its pkg_resources hook or module wasn't where expected; not changing it".into()),
+    }
 }
 
 /// The maker a Windows file names in its version information ("CompanyName"), if any.
@@ -1053,6 +1213,91 @@ mod tests {
         std::fs::write(&path, &f).unwrap();
         assert!(identify(&path).is_none());
         std::fs::remove_file(&path).unwrap();
+    }
+
+    /// A bundle with its archive at the end (older PyInstaller): one more file packed in, the
+    /// old ones still listed. (The ELF-section layout is checked on a real bundle in the VM.)
+    #[test]
+    fn bundle_gets_a_file() {
+        let entry = |name: &str, pos: u32, len: u32| {
+            let mut e = Vec::new();
+            let mut n = 18 + name.len() + 1;
+            n += (16 - n % 16) % 16;
+            for v in [n as u32, pos, len, len] {
+                e.extend_from_slice(&v.to_be_bytes());
+            }
+            e.extend_from_slice(&[0, b'x']);
+            e.extend_from_slice(name.as_bytes());
+            e.resize(n, 0);
+            e
+        };
+        let mut file = b"bootloader".to_vec();
+        let start = file.len();
+        file.extend_from_slice(b"hello");
+        let toc = entry("data/a.txt", 0, 5);
+        let tocpos = file.len() - start;
+        file.extend_from_slice(&toc);
+        let mut cookie = MEI_COOKIE.to_vec();
+        let archive_len = file.len() - start + COOKIE_LEN;
+        for v in [archive_len, tocpos, toc.len(), 37] {
+            cookie.extend_from_slice(&(v as u32).to_be_bytes());
+        }
+        cookie.resize(COOKIE_LEN, 0);
+        file.extend_from_slice(&cookie);
+        let path = std::env::temp_dir().join(format!("gamefix-bundle-{}", std::process::id()));
+        std::fs::write(&path, &file).unwrap();
+        assert_eq!(bundle_names(&path).unwrap(), ["data/a.txt"]);
+        let new = bundle_with(&file, "pygame/freesansbold.ttf", b"FONT").unwrap();
+        std::fs::write(&path, &new).unwrap();
+        assert_eq!(bundle_names(&path).unwrap(), ["data/a.txt", "pygame/freesansbold.ttf"]);
+        assert!(new.starts_with(b"bootloaderhelloFONT"));
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// pyi_rth_pkgres gets a type nothing runs, pkg_resources' names in the module archive's
+    /// table become as long `pkg_resourcez` ones, and nothing else moves.
+    #[test]
+    fn bundle_loses_pkg_resources() {
+        let entry = |name: &str, pos: u32, len: u32, kind: u8| {
+            let mut n = 18 + name.len() + 1;
+            n += (16 - n % 16) % 16;
+            let mut e = Vec::new();
+            for v in [n as u32, pos, len, len] {
+                e.extend_from_slice(&v.to_be_bytes());
+            }
+            e.extend_from_slice(&[0, kind]);
+            e.extend_from_slice(name.as_bytes());
+            e.resize(n, 0);
+            e
+        };
+        let mut pyz = b"PYZ\0\x42\x0d\x0d\x0a".to_vec();
+        pyz.extend_from_slice(&16u32.to_be_bytes());
+        pyz.extend_from_slice(b"\0\0\0\0\xda\x0dpkg_resources\xda\x14pkg_resources.extern\xda\x04game");
+        let mut file = b"bootloader".to_vec();
+        let start = file.len();
+        file.extend_from_slice(b"HOOK");
+        file.extend_from_slice(&pyz);
+        let mut toc = entry("pyi_rth_pkgres", 0, 4, b's');
+        toc.extend(entry("PYZ-00.pyz", 4, pyz.len() as u32, b'z'));
+        let tocpos = file.len() - start;
+        file.extend_from_slice(&toc);
+        let mut cookie = MEI_COOKIE.to_vec();
+        for v in [file.len() - start + COOKIE_LEN, tocpos, toc.len(), 37] {
+            cookie.extend_from_slice(&(v as u32).to_be_bytes());
+        }
+        cookie.resize(COOKIE_LEN, 0);
+        file.extend_from_slice(&cookie);
+        let mut new = file.clone();
+        bundle_without_pkg_resources(&mut new).unwrap();
+        assert_eq!(new.len(), file.len());
+        let at = start + tocpos;
+        assert_eq!(new[at + 17], b'-');
+        let text = String::from_utf8_lossy(&new);
+        assert!(text.contains("pkg_resourcez\u{fffd}\u{14}pkg_resourcez.extern") && !text.contains("pkg_resources"));
+        // Nothing to hide: refused, unchanged.
+        let mut plain = file.clone();
+        plain[at + 18..at + 32].copy_from_slice(b"pyi_rth_other_");
+        assert!(bundle_without_pkg_resources(&mut plain.clone()).is_err());
     }
 
     #[test]

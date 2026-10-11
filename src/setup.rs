@@ -3,7 +3,7 @@
 //! Launch-time fixes go into the entry's command or Steam's launch options as plain settings,
 //! so they work without gamefix. What was changed is recorded under ~/.local/share/gamefix/games/.
 
-use crate::check::{Problem, Report};
+use crate::check::{Problem, PygameFont, Report};
 use crate::proton::{self, Advice};
 use crate::scan::Game;
 use crate::steam::{self, Steam};
@@ -39,6 +39,18 @@ fn hide_helpers_with(extra: &[String]) -> String {
 }
 
 const STEAM_OPEN: &str = "Steam is open. Close it first (Steam → Exit): it rewrites its game list when it quits, which would undo the change.";
+
+/// The game's own folder in ~/.local/share/gamefix/libs, made and recorded the first time
+/// (an empty one left from before counts as new, so undo removes it too).
+fn game_libs(game: &Game, record: &mut Vec<String>) -> Result<PathBuf, String> {
+    let dir = data_home().join("gamefix/libs").join(slug(&game.name));
+    let line = format!("created-dir\t{}", dir.display());
+    if fs::read_dir(&dir).map(|mut d| d.next().is_none()).unwrap_or(true) && !record.contains(&line) {
+        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        record.push(line);
+    }
+    Ok(dir)
+}
 
 fn data_home() -> PathBuf {
     std::env::var_os("XDG_DATA_HOME")
@@ -383,6 +395,42 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
                 }
                 Err(e) => not_fixed.push(e),
             },
+            Problem::PygameMp3 { sdl20 } => {
+                let dir = game_libs(game, &mut record)?;
+                let mut files = Vec::new();
+                let sdl = if *sdl20 { crate::fetch::fetch_debian("libSDL2-2.0.so.0", "bullseye", 64, &dir, &mut files) } else { None };
+                let fetched = crate::fetch::fetch(&["libSDL2_mixer-2.0.so.0".to_string()], 64, &dir);
+                files.extend(fetched.files);
+                record.extend(files.iter().map(|f| format!("created\t{}", f.display())));
+                let sources = fetched.sources.into_iter().chain(sdl.map(|s| format!("with {s}"))).collect::<Vec<_>>();
+                let mixer = dir.join("libSDL2_mixer-2.0.so.0");
+                if mixer.exists() && (!*sdl20 || dir.join("libSDL2-2.0.so.0").exists()) {
+                    preload.push(mixer.display().to_string());
+                    if !env.iter().any(|(k, _)| *k == "LD_LIBRARY_PATH") {
+                        env.push(("LD_LIBRARY_PATH", dir.display().to_string()));
+                    }
+                    done.push(format!("Fetched a newer SDL_mixer, which plays MP3 ({}), into ~/.local/share/gamefix/libs, and loads it first (at launch).", sources.join(" ")));
+                } else {
+                    not_fixed.push(format!("Its MP3 music: a newer SDL_mixer{} couldn't be fetched (no network?).", if *sdl20 { " and SDL 2.0" } else { "" }));
+                }
+            }
+            Problem::AllegroWebp(_) => {
+                let dir = game_libs(game, &mut record)?;
+                let fetched = crate::fetch::fetch(&["liballegro_image.so.5.2".to_string()], 64, &dir);
+                record.extend(fetched.files.iter().map(|f| format!("created\t{}", f.display())));
+                let image = dir.join("liballegro_image.so.5.2");
+                if image.exists() {
+                    // Only the add-on goes first; what it needs comes from the game's folders
+                    // (its RPATH), then this one.
+                    preload.push(image.display().to_string());
+                    if !env.iter().any(|(k, _)| *k == "LD_LIBRARY_PATH") {
+                        env.push(("LD_LIBRARY_PATH", dir.display().to_string()));
+                    }
+                    done.push(format!("Fetched an Allegro image add-on that reads WebP ({}) into ~/.local/share/gamefix/libs, and loads it first (at launch).", fetched.sources.join(", ")));
+                } else {
+                    not_fixed.push("Its WebP images: Fedora's Allegro image add-on couldn't be fetched (no network?).".into());
+                }
+            }
             Problem::BundledLibstdcxx(None) => not_fixed.push("Its bundled C++ library: the system's libstdc++.so.6 to preload wasn't found.".into()),
             Problem::OwnHarfbuzz(_, Some(path), false) => {
                 preload.push(path.clone());
@@ -426,6 +474,40 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
                     }
                 }
                 done.push(format!("Made empty stand-ins for the {} static librar{} its .NET list names but the download left out.", files.len(), if files.len() == 1 { "y" } else { "ies" }));
+            }
+            Problem::PygameFont { missing: Some(_), font: None, .. } => not_fixed.push("Its fonts: pygame's default font is missing too, and there's no TrueType font on this system to stand in for it.".into()),
+            Problem::PygameFont { program, missing, font } => {
+                // The original goes outside the game's folder, like a replaced launcher.
+                let file = game.root.join(program);
+                let mut bytes = fs::read(&file).map_err(|e| e.to_string())?;
+                crate::binary::bundle_without_pkg_resources(&mut bytes).map_err(|e| format!("Couldn't change {}: {e}", file.display()))?;
+                let stand_in = match font {
+                    Some(f) if missing.is_some() => Some((fs::read(f).map_err(|e| e.to_string())?, f.file_name().unwrap_or_default().to_string_lossy().into_owned())),
+                    _ => None,
+                };
+                if let (Some(PygameFont::Bundle), Some((content, _))) = (missing, &stand_in) {
+                    bytes = crate::binary::bundle_with(&bytes, &format!("pygame/{}", crate::check::PYGAME_FONT), content).map_err(|e| format!("Couldn't change {}: {e}", file.display()))?;
+                }
+                let backups = data_home().join("gamefix/backups").join(slug(&game.name));
+                if !backups.is_dir() {
+                    fs::create_dir_all(&backups).map_err(|e| e.to_string())?;
+                    record.push(format!("created-dir\t{}", backups.display()));
+                }
+                let backup = backups.join(file.file_name().unwrap_or_default());
+                fs::copy(&file, &backup).map_err(|e| e.to_string())?;
+                fs::write(&file, bytes).map_err(|e| e.to_string())?;
+                record.push(format!("replaced\t{}\t{}", backup.display(), file.display()));
+                done.push("Hid pkg_resources from the program's Python, so pygame opens its font file itself (the original program is kept in ~/.local/share/gamefix/backups).".into());
+                match (missing, stand_in) {
+                    (Some(PygameFont::Bundle), Some((_, name))) => done.push(format!("Packed a stand-in for pygame's missing default font ({name}) into the program.")),
+                    (Some(PygameFont::Folder(dir)), Some((content, name))) => {
+                        let target = game.root.join(dir).join(crate::check::PYGAME_FONT);
+                        fs::write(&target, content).map_err(|e| e.to_string())?;
+                        record.push(format!("created\t{}", target.display()));
+                        done.push(format!("Added a stand-in for pygame's missing default font ({name}) to its pygame folder."));
+                    }
+                    _ => {}
+                }
             }
             Problem::MissingLibs { bits, libs, later, in_old_runtime, misplaced } => {
                 if let Some(run) = report.old_runtime.as_ref().filter(|_| !in_old_runtime.is_empty()) {
@@ -482,7 +564,7 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
                             }
                         }
                     }
-                    if fs::read_dir(&links).map(|mut d| d.next().is_some()).unwrap_or(false) {
+                    if fs::read_dir(&links).map(|mut d| d.next().is_some()).unwrap_or(false) && !env.iter().any(|(k, _)| *k == "LD_LIBRARY_PATH") {
                         env.push(("LD_LIBRARY_PATH", links.display().to_string()));
                     } else if new_dir && fs::remove_dir(&links).is_ok() {
                         record.retain(|r| r != &format!("created-dir\t{}", links.display()));

@@ -69,7 +69,7 @@ pub fn fetch(libs: &[String], bits: u8, dest: &Path) -> Fetched {
                     continue;
                 }
             }
-            let found = debian_package(&lib, bits).map(|(suite, pkg, urls)| (format!("Debian {suite}'s {pkg}"), pkg, urls)).or_else(|| ubuntu_package(&lib, bits).map(|(suite, pkg, url)| (format!("Ubuntu {suite}'s {pkg}"), pkg, vec![url])));
+            let found = debian_package(&lib, bits, &DEBIAN_SUITES).map(|(suite, pkg, urls)| (format!("Debian {suite}'s {pkg}"), pkg, urls)).or_else(|| ubuntu_package(&lib, bits).map(|(suite, pkg, url)| (format!("Ubuntu {suite}'s {pkg}"), pkg, vec![url])));
             match found {
                 Some((source, _, _)) if out.sources.contains(&source) => {}
                 Some((source, pkg, urls)) => {
@@ -123,10 +123,10 @@ fn fedora_download(pkg: &str, bits: u8, dir: &Path) -> bool {
 /// The Debian package with a file of that name (packages.debian.org's contents search), and
 /// where to download it: the mirror, then archive.debian.org, where a release goes once its
 /// support ends (bullseye's security updates already have).
-fn debian_package(lib: &str, bits: u8) -> Option<(&'static str, String, Vec<String>)> {
+fn debian_package(lib: &str, bits: u8, suites: &[&'static str]) -> Option<(&'static str, String, Vec<String>)> {
     let arch = if bits == 64 { "amd64" } else { "i386" };
     let keyword = lib.replace('+', "%2B");
-    DEBIAN_SUITES.iter().find_map(|&suite| {
+    suites.iter().find_map(|&suite| {
         let page = get(&format!("https://packages.debian.org/search?searchon=contents&keywords={keyword}&mode=exactfilename&suite={suite}&arch={arch}"))?;
         let marker = format!("<a href=\"/{suite}/");
         let start = page.find(&marker)? + marker.len();
@@ -144,6 +144,22 @@ fn debian_package(lib: &str, bits: u8) -> Option<(&'static str, String, Vec<Stri
         let pool = &path[path.find("/pool/")?..];
         Some((suite, pkg, vec![format!("https://deb.debian.org/debian{pool}"), format!("https://archive.debian.org/debian{pool}")]))
     })
+}
+
+/// A library from one Debian release's package into `dest`, whether or not the system has its
+/// own: a game may need that version (pygame 2.0 accepts only an SDL 2.0.x, and Fedora's
+/// libSDL2 is sdl2-compat 2.32). What it needs in turn is fetched with whatever goes into
+/// `dest` next (`fetch`). Where it came from, or None.
+pub fn fetch_debian(lib: &str, suite: &'static str, bits: u8, dest: &Path, files: &mut Vec<PathBuf>) -> Option<String> {
+    let (suite, pkg, urls) = debian_package(lib, bits, &[suite])?;
+    let tmp = std::env::temp_dir().join(format!("gamefix-debian-{}", std::process::id()));
+    let (root, deb) = (tmp.join("root"), tmp.join(format!("{pkg}.deb")));
+    let ok = fs::create_dir_all(&root).is_ok() && urls.iter().any(|u| download(u, &deb)) && extract_deb(&deb, &root, &tmp.join(&pkg));
+    if ok {
+        copy_libs(&root, bits, dest, files);
+    }
+    let _ = fs::remove_dir_all(&tmp);
+    (ok && dest.join(lib).exists()).then(|| format!("Debian {suite}'s {pkg}"))
 }
 
 fn get(url: &str) -> Option<String> {

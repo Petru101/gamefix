@@ -119,6 +119,16 @@ pub enum Problem {
     /// needs the system's newer one and isn't loaded: "Couldn't find matching GLX visual" from
     /// SDL (Skeletris, RESYNC). The system's copy to preload.
     BundledLibstdcxx(Option<String>),
+    /// A PyInstaller pygame build whose SDL_mixer is older than 2.6 (MP3 only through a bundled
+    /// mpg123, smpeg or libmad, and it has none) while the game carries .mp3 files: loading the
+    /// music fails ("Unrecognized audio format": Flyre, pygame 2.0.1 with SDL_mixer 2.0.2).
+    /// `sdl20`: its SDL is 2.0.x, and pygame 2.0-2.1 refuses any other minor version ("SDL
+    /// compiled with version 2.0.14, linked to 2.32.72"), so a newer mixer needs an SDL 2.0 too.
+    PygameMp3 { sdl20: bool },
+    /// The game's own Allegro image add-on was built without WebP and the game has .webp images:
+    /// Allegro picks the loader by the file's ending, gets nothing, and the game crashes
+    /// (Non-Competitive Singing Potatoes: segfault on its logo, holypangolin.webp). The add-on.
+    AllegroWebp(PathBuf),
     /// A start-up file exporting its own HarfBuzz: the system's pango (through GTK) then gets
     /// those old functions and crashes (JK Assassins, NW.js with Chromium 48). What to preload
     /// (LD_PRELOAD's value), and whether the program itself exports it: then preloading the
@@ -172,6 +182,21 @@ pub enum Problem {
     /// are only for building and never loaded (Sokoban, 3.1.11: System.IO.Compression.Native.a
     /// and three more). Their names, in the program's folder.
     DotnetStatic(Vec<String>),
+    /// A pygame 1 game packed by PyInstaller 3 whose code asks for system fonts (SysFont,
+    /// get_default_font): for a font that isn't installed pygame falls back to its own default
+    /// font, which it looks up through pkg_resources first; PyInstaller 3's pyi_rth_pkgres hook
+    /// gives its importer pkg_resources' NullProvider, which raises NotImplementedError, and
+    /// pygame 1 segfaults on that (Souls of the Tower). pygame 2 and PyInstaller 4's hook
+    /// (PyiFrozenProvider) handle it. The program whose archive changes; where the default font
+    /// (freesansbold.ttf) is missing too, if it is; the stand-in for it.
+    PygameFont { program: PathBuf, missing: Option<PygameFont>, font: Option<PathBuf> },
+}
+
+pub enum PygameFont {
+    /// Inside a one-file bundle (the program).
+    Bundle,
+    /// In the pygame folder of a folder build (relative to the game's folder).
+    Folder(PathBuf),
 }
 
 pub struct Clash {
@@ -347,6 +372,67 @@ fn optional_plugin(path: &std::path::Path) -> Option<&'static str> {
     OPTIONAL_PLUGINS.iter().find(|(n, _)| name == *n).map(|(_, what)| *what)
 }
 
+pub const PYGAME_FONT: &str = "freesansbold.ttf";
+
+/// See `Problem::PygameFont`: Some(where the default font is missing too, if it is).
+fn pygame_font(game: &Game, main: &scan::Found) -> Option<Option<PygameFont>> {
+    let program = game.full(main);
+    let names = binary::bundle_names(&program)?;
+    if !names.iter().any(|n| n == "pyi_rth_pkgres") {
+        return None;
+    }
+    // pygame packed (one-file), or beside the program (a folder build). pygame 1 has the
+    // overlay module, which pygame 2 dropped.
+    let folder = ["pygame", "_internal/pygame"].iter().map(|d| program.parent().unwrap_or(&game.root).join(d)).find(|d| d.is_dir());
+    let overlay = |n: &str| n.starts_with("overlay.");
+    let pygame1 = names.iter().any(|n| n.strip_prefix("pygame/").is_some_and(overlay)) || folder.as_ref().is_some_and(|d| std::fs::read_dir(d).into_iter().flatten().flatten().any(|e| overlay(&e.file_name().to_string_lossy())));
+    if !pygame1 || !binary::bundle_asks_default_font(&program) {
+        return None;
+    }
+    Some(if names.iter().any(|n| n.starts_with("pygame/")) {
+        (!names.iter().any(|n| n == &format!("pygame/{PYGAME_FONT}"))).then_some(PygameFont::Bundle)
+    } else {
+        folder.filter(|d| !d.join(PYGAME_FONT).exists()).and_then(|d| d.strip_prefix(&game.root).ok().map(|d| PygameFont::Folder(d.to_path_buf())))
+    })
+}
+
+/// See `Problem::PygameMp3`: Some(whether its SDL is 2.0.x) when its mixer can't play the .mp3
+/// files it has. The libraries' names, packed (one-file) or beside the program (folder builds:
+/// `_internal`, auditwheel's `pygame.libs`), carry their versions: libSDL2_mixer-2.0.so.0.2.2
+/// is 2.0.2 (2.6 is .so.0.600.0), auditwheel's copies add "-<hash>" (libSDL2-2-d6813302.0.so.0.14.0).
+fn pygame_without_mp3(game: &Game, main: &scan::Found) -> Option<bool> {
+    let program = game.full(main);
+    let dir = program.parent()?;
+    let mut names = binary::bundle_names(&program).unwrap_or_default();
+    for sub in ["", "_internal", "pygame.libs", "_internal/pygame.libs"] {
+        names.extend(std::fs::read_dir(dir.join(sub)).into_iter().flatten().flatten().map(|e| e.file_name().to_string_lossy().into_owned()));
+    }
+    let minor = |prefix: &str| names.iter().filter(|n| n.starts_with(prefix)).find_map(|n| n.split(".so.").nth(1)?.split('.').nth(1)?.parse::<u32>().ok());
+    let mixer = minor("libSDL2_mixer-2")?;
+    let decoder = names.iter().any(|n| ["mpg123", "smpeg", "libmad"].iter().any(|d| n.contains(d)));
+    let mp3 = names.iter().any(|n| n.to_lowercase().ends_with(".mp3")) || has_ending(dir, "mp3", 4);
+    (mixer < 600 && !decoder && mp3).then(|| minor("libSDL2-2").is_some_and(|m| m < 100))
+}
+
+/// Whether a file with that ending (any case) is in the folder, at most `depth` folders down.
+fn has_ending(dir: &Path, ending: &str, depth: usize) -> bool {
+    std::fs::read_dir(dir).into_iter().flatten().flatten().any(|e| {
+        let path = e.path();
+        match e.file_type() {
+            Ok(t) if t.is_dir() => depth > 0 && has_ending(&path, ending, depth - 1),
+            Ok(t) if t.is_file() => path.extension().is_some_and(|x| x.eq_ignore_ascii_case(ending)),
+            _ => false,
+        }
+    })
+}
+
+/// A font to stand in for pygame's FreeSans Bold: the closest the system has.
+fn stand_in_font() -> Option<PathBuf> {
+    let out = std::process::Command::new("fc-match").args(["-f", "%{file}", "FreeSans:bold"]).output().ok()?;
+    let file = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+    (file.is_file() && file.extension().is_some_and(|e| e.eq_ignore_ascii_case("ttf"))).then_some(file)
+}
+
 pub fn check(game: &Game, system: &System) -> Report {
     let mut windows = Vec::new();
     let mut installers = Vec::new();
@@ -513,6 +599,22 @@ pub fn check(game: &Game, system: &System) -> Report {
         let opengl = || dir.join("OpenGL").is_dir() || dir.join("_internal/OpenGL").is_dir() || binary::contains(&game.full(main), b"OpenGL.GL");
         if (beside || binary::bundle_names(&game.full(main)).is_some_and(|n| n.iter().any(|n| n == "libstdc++.so.6"))) && opengl() {
             problems.push(Problem::BundledLibstdcxx(system.path("libstdc++.so.6", elf.bits).map(String::from)));
+        }
+    }
+    if elf.pyinstaller {
+        if let Some(sdl20) = pygame_without_mp3(game, main) {
+            problems.push(Problem::PygameMp3 { sdl20 });
+        }
+    }
+    if let Some(image) = game.files.iter().find(|f| f.path.file_name().is_some_and(|n| n == "liballegro_image.so.5.2")) {
+        if !binary::contains(&game.full(image), b"_al_load_webp") && has_ending(&game.root, "webp", 4) {
+            problems.push(Problem::AllegroWebp(image.path.clone()));
+        }
+    }
+    if elf.pyinstaller {
+        if let Some(missing) = pygame_font(game, main) {
+            let font = missing.as_ref().and_then(|_| stand_in_font());
+            problems.push(Problem::PygameFont { program: main.path.clone(), missing, font });
         }
     }
     let mode = std::fs::metadata(game.full(main)).map(|m| m.permissions().mode()).unwrap_or(0);
@@ -1939,6 +2041,21 @@ impl Report {
                         }
                     }
                 }
+                Problem::PygameMp3 { sdl20 } => {
+                    let _ = writeln!(out, "✗ Its music is MP3, and the SDL_mixer its pygame brings (older than 2.6) plays MP3 only with a");
+                    let _ = writeln!(out, "  decoder library the developer's build left out: \"Unrecognized audio format\" when it loads it.");
+                    let _ = writeln!(out, "    Fix (at launch): preload a newer SDL_mixer (Fedora's, which has MP3 built in); gamefix setup");
+                    let _ = writeln!(out, "    fetches it into ~/.local/share/gamefix/libs.");
+                    if *sdl20 {
+                        let _ = writeln!(out, "    Its pygame accepts only an SDL 2.0, so Debian 11's SDL 2.0.14 goes with it.");
+                    }
+                }
+                Problem::AllegroWebp(image) => {
+                    let _ = writeln!(out, "✗ Its own Allegro image add-on was built without WebP, and the game has .webp images: Allegro");
+                    let _ = writeln!(out, "  finds no loader for them and the game crashes when it draws one ({}).", image.display());
+                    let _ = writeln!(out, "    Fix (at launch): preload Fedora's Allegro image add-on, which reads WebP; gamefix setup");
+                    let _ = writeln!(out, "    fetches it into ~/.local/share/gamefix/libs.");
+                }
                 Problem::BundledLibstdcxx(preload) => {
                     let _ = writeln!(out, "✗ It draws with OpenGL from Python, and its bundle brings its own copy of the C++ standard");
                     let _ = writeln!(out, "  library, which goes first. If that's older than what the graphics driver (Mesa: AMD,");
@@ -2072,6 +2189,37 @@ impl Report {
                     let _ = writeln!(out, "    Fix: gamefix setup downloads that runtime from Microsoft into ~/.local/share/gamefix/dotnet");
                     let _ = writeln!(out, "    (30-100 MB, shared by every game of that version) and adds the game to the app menu.");
                     let _ = writeln!(out, "    Older versions get no security fixes; the Windows build with Proton avoids that.");
+                }
+                Problem::PygameFont { missing, font, .. } => {
+                    let _ = writeln!(out, "✗ It's a pygame 1 game packed by PyInstaller 3, and its code asks for system fonts (SysFont). For");
+                    let _ = writeln!(out, "  one that isn't installed pygame falls back to its own font, which it looks up through");
+                    let _ = writeln!(out, "  pkg_resources first; PyInstaller 3 left that unable to answer, so the game crashes there");
+                    let _ = writeln!(out, "  (\"NotImplementedError ... unregistered loader type\", then a segfault).");
+                    if let Some(missing) = missing {
+                        let place = if matches!(missing, PygameFont::Bundle) { "packed in the program" } else { "in its pygame folder" };
+                        let _ = writeln!(out, "  That font ({PYGAME_FONT}) isn't {place} either (the build left it out).");
+                    }
+                    match (missing, font) {
+                        (Some(_), None) => {
+                            let _ = writeln!(out, "    Fix: hide pkg_resources from its Python and add a stand-in font (any bold sans .ttf), but");
+                            let _ = writeln!(out, "    no TrueType font was found on this system.");
+                        }
+                        _ => {
+                            let _ = writeln!(out, "    Fix (once): gamefix setup hides pkg_resources from the program's Python, so pygame opens the");
+                            match (missing, font) {
+                                (Some(PygameFont::Bundle), Some(f)) => {
+                                    let _ = writeln!(out, "    font file itself, and packs a stand-in for it ({}) into the program.", f.file_name().unwrap_or_default().to_string_lossy());
+                                }
+                                (Some(PygameFont::Folder(_)), Some(f)) => {
+                                    let _ = writeln!(out, "    font file itself, and copies a stand-in for it ({}) into its pygame folder.", f.file_name().unwrap_or_default().to_string_lossy());
+                                }
+                                _ => {
+                                    let _ = writeln!(out, "    font file itself.");
+                                }
+                            }
+                            let _ = writeln!(out, "    The original program is kept in ~/.local/share/gamefix/backups.");
+                        }
+                    }
                 }
                 Problem::DotnetIcu(version) => {
                     let _ = writeln!(out, "✗ It's built on .NET Core {version}, which only looks for older versions of the ICU library");
