@@ -1502,6 +1502,13 @@ impl Report {
                         let _ = writeln!(out, "  It uses Java applets, which Java 26 removed: it needs Java 25 or older (\"brew install");
                         let _ = writeln!(out, "  openjdk@21\"; gamefix uses that one when it's there).");
                     }
+                    if let Some(dir) = &needs.home_dir {
+                        let home = std::env::var("HOME").unwrap_or_default();
+                        if !Path::new(&home).join(dir).exists() {
+                            let _ = writeln!(out, "• It keeps its files in ~/{dir}, which it may not make itself (Sheep Farm Simulator quits");
+                            let _ = writeln!(out, "  on its log file without it): gamefix setup creates that folder.");
+                        }
+                    }
                     if let Some(shader) = &needs.shader {
                         let _ = writeln!(out, "✗ Its shader {shader} doesn't match the GLSL version it's compiled as: NVIDIA's driver lets");
                         let _ = writeln!(out, "  that pass, Mesa's (AMD and Intel graphics) stops it with \"Error compiling shader\".");

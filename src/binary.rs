@@ -292,11 +292,17 @@ pub struct JarNeeds {
     pub old_lwjgl3: bool,
     /// One of its own shaders that Mesa rejects and NVIDIA accepts (see `glsl_mismatch`).
     pub shader: Option<String>,
+    /// The folder in the home folder its own classes keep files in, named like the game
+    /// (`user.home` + "/sheepfarmsimulator/log.txt"): Sheep Farm Simulator never makes it and
+    /// quits on its log file (FileNotFoundException) when it isn't there.
+    pub home_dir: Option<String>,
 }
 
 pub fn jar_needs(jar: &Path) -> JarNeeds {
     const LIBRARIES: &[&str] = &["org/lwjgl/", "org/newdawn/", "com/badlogic/", "net/java/", "com/jcraft/", "javazoom/", "paulscode/", "de/matthiasmann/", "org/jogamp/", "com/jogamp/", "jogamp/", "javax/", "kotlin/", "org/apache/", "com/google/", "org/json/", "com/esotericsoftware/", "org/ninjacave/"];
-    let mut needs = JarNeeds { applet: false, nashorn: false, old_lwjgl3: false, shader: None };
+    let mut needs = JarNeeds { applet: false, nashorn: false, old_lwjgl3: false, shader: None, home_dir: None };
+    let mut home = false;
+    let mut folders: Vec<String> = Vec::new();
     let Ok(list) = std::process::Command::new("unzip").arg("-Z1").arg(jar).output() else { return needs };
     let all = String::from_utf8_lossy(&list.stdout);
     needs.old_lwjgl3 = all.lines().any(|n| n.starts_with("org/lwjgl/system/MemoryAccess"));
@@ -311,11 +317,29 @@ pub fn jar_needs(jar: &Path) -> JarNeeds {
         let out = std::process::Command::new("unzip").arg("-p").arg(jar).args(chunk).output().map(|o| o.stdout).unwrap_or_default();
         needs.applet |= out.windows(12).any(|w| w == b"java/applet/");
         needs.nashorn |= !engine && out.windows(32).any(|w| w == b"javax/script/ScriptEngineManager");
-        if needs.applet && (needs.nashorn || engine) {
-            break;
-        }
+        home |= out.windows(9).any(|w| w == b"user.home");
+        folders.extend(class_paths(&out).filter_map(|p| p.strip_prefix('/').and_then(|p| p.split_once('/')).map(|(dir, _)| dir.to_string())));
     }
+    // Only a folder named like the game: the jar's name or its folder's, letters and digits
+    // compared ("sheepfarmsimulator" in "Sheep Farm Simulator 0.23.4.jar").
+    let plain = |s: &str| s.chars().filter(|c| c.is_alphanumeric()).collect::<String>().to_lowercase();
+    let names = [jar.file_stem(), jar.parent().and_then(|p| p.file_name())].map(|n| n.map(|n| plain(&n.to_string_lossy())).unwrap_or_default());
+    needs.home_dir = folders
+        .into_iter()
+        .filter(|_| home)
+        .find(|d| d.chars().all(|c| c.is_alphanumeric() || "._-".contains(c)) && plain(d).len() >= 4 && names.iter().any(|n| n.contains(&plain(d))))
+        .map(String::from);
     needs
+}
+
+/// Strings in Java class files (CONSTANT_Utf8: tag 1, a two-byte length, the text) that start
+/// with "/".
+fn class_paths(bytes: &[u8]) -> impl Iterator<Item = String> + '_ {
+    bytes.windows(4).enumerate().filter(|(_, w)| w[0] == 1 && w[3] == b'/').filter_map(move |(i, w)| {
+        let len = u16::from_be_bytes([w[1], w[2]]) as usize;
+        let text = bytes.get(i + 3..i + 3 + len)?;
+        (len < 200 && text.iter().all(|&b| (0x20..0x7f).contains(&b))).then(|| String::from_utf8_lossy(text).into_owned())
+    })
 }
 
 const SHADERS: &[&str] = &[".glsl", ".vert", ".frag", ".vsh", ".fsh", ".vs", ".fs"];

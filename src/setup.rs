@@ -167,7 +167,20 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
         return match game.windows {
             _ if runner.is_some() => {
                 let (command, file, name) = runner.unwrap();
-                setup_runner(game, command, file, name, targets, Extra::default())
+                let mut extra = Extra::default();
+                // The folder a Java game keeps its files in and may not make (Sheep Farm
+                // Simulator); undo removes it only while it's still empty.
+                if file.extension().is_some_and(|e| e == "jar") {
+                    if let Some(dir) = crate::binary::jar_needs(&game.root.join(file)).home_dir {
+                        let path = PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(&dir);
+                        if !path.exists() {
+                            fs::create_dir(&path).map_err(|e| format!("Couldn't create {}: {e}", path.display()))?;
+                            extra.record.push(format!("created-dir\t{}", path.display()));
+                            extra.done.push(format!("Created ~/{dir}, the folder it keeps its files in."));
+                        }
+                    }
+                }
+                setup_runner(game, command, file, name, targets, extra)
             }
             _ if old_love.is_some() => {
                 let (file, build) = old_love.unwrap();
