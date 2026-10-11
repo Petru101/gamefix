@@ -179,7 +179,7 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
     let mut env: Vec<(&str, String)> = Vec::new();
     // Whether to start it through HIDE_HELPERS.
     let mut hide_helpers = false;
-    // Steam's runtime for older games, for the app-menu entry (Steam uses it by itself).
+    // Steam's runtime for older games: Steam itself doesn't pass its libraries on to games.
     let mut old_runtime = None;
     // Libraries to load first, joined into one LD_PRELOAD.
     let mut preload: Vec<String> = Vec::new();
@@ -279,7 +279,7 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
             Problem::MissingLibs { bits, libs, later, in_old_runtime, misplaced } => {
                 if let Some(run) = report.old_runtime.as_ref().filter(|_| !in_old_runtime.is_empty()) {
                     old_runtime = Some(run.clone());
-                    done.push("Starts it with Steam's runtime for older games, which has missing libraries (Steam does that by itself).".into());
+                    done.push("Starts it with Steam's runtime for older games, which has missing libraries.".into());
                 }
                 // Just the libraries the system lacks, linked into a folder of their own: putting
                 // the game's folders on LD_LIBRARY_PATH would put everything else in them first
@@ -321,7 +321,7 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
                         if fetched.needs_runtime && old_runtime.is_none() {
                             if let Some(run) = &report.old_runtime {
                                 old_runtime = Some(run.clone());
-                                done.push("Starts it with Steam's runtime for older games, which has libraries the fetched ones need (Steam does that by itself).".into());
+                                done.push("Starts it with Steam's runtime for older games, which has libraries the fetched ones need.".into());
                             }
                         }
                     }
@@ -442,7 +442,7 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
         // A Steam game: its own launch options, keeping whatever was there.
         let file = steam.localconfig();
         let previous = steam::launch_options(&file, appid)?;
-        let options = launch_options(&env, &[], hide_helpers, previous.as_deref().unwrap_or(""));
+        let options = launch_options(&env, &[], old_runtime.as_deref(), hide_helpers, previous.as_deref().unwrap_or(""));
         if options != previous.clone().unwrap_or_default() {
             steam::set_launch_options(&file, appid, Some(&options))?;
             let previous = previous.map_or("-".to_string(), |p| format!("={p}"));
@@ -456,7 +456,7 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
             exe: &start,
             start_dir: workdir,
             icon: if icon.starts_with('/') { &icon } else { "" },
-            launch_options: &launch_options(&env, &[], hide_helpers, ""),
+            launch_options: &launch_options(&env, &[], old_runtime.as_deref(), hide_helpers, ""),
         };
         let appid = steam::add_shortcut(&file, &shortcut)?;
         record.push(format!("steam-shortcut\t{appid}\t{}", file.display()));
@@ -787,7 +787,7 @@ fn setup_install(game: &Game, installer: Installer, targets: &Targets) -> Result
     let own = proton::ignored_dlls(&exe);
     let mut env = vec![("STEAM_COMPAT_DATA_PATH", prefix.display().to_string())];
     add_overrides(&mut env, &own);
-    let line = launch_options(&env, &[], false, "");
+    let line = launch_options(&env, &[], None, false, "");
     let shortcuts = steam.shortcuts();
     let workdir = exe.parent().unwrap_or(&prefix);
     let shortcut = steam::Shortcut { name: &name, exe: &exe, start_dir: workdir, icon: "", launch_options: &line };
@@ -914,7 +914,7 @@ fn setup_windows(game: &Game, report: &Report, exe: &crate::scan::Found, targets
         let args = options.as_ref().map(|o| o.args.clone()).unwrap_or_default();
         let file = steam.localconfig();
         let previous = steam::launch_options(&file, appid)?;
-        let line = launch_options(&env, &args, false, previous.as_deref().unwrap_or(""));
+        let line = launch_options(&env, &args, None, false, previous.as_deref().unwrap_or(""));
         if line != previous.clone().unwrap_or_default() {
             steam::set_launch_options(&file, appid, Some(&line))?;
             done.push(match &previous {
@@ -947,7 +947,7 @@ fn setup_windows(game: &Game, report: &Report, exe: &crate::scan::Found, targets
     let file = steam.shortcuts();
     let mut env = Vec::new();
     add_overrides(&mut env, &own);
-    let line = launch_options(&env, &[], false, "");
+    let line = launch_options(&env, &[], None, false, "");
     let shortcut = steam::Shortcut { name: &game.name, exe: &program, start_dir: workdir, icon: "", launch_options: &line };
     let appid = steam::add_shortcut(&file, &shortcut)?;
     let mut record = vec![format!("steam-shortcut\t{appid}\t{}", file.display())];
@@ -1017,23 +1017,29 @@ fn dll_files(dlls: &[String]) -> String {
 }
 
 /// Steam runs launch options with `sh -c`, `%command%` standing for its launch helpers and the
-/// game. Settings go first and the wrapper right before `%command%`, so they fit around options
-/// already there (`gamemoderun %command%`, or bare game arguments like `-insecure`). Steam
-/// itself preloads its overlay, so LD_PRELOAD adds to it instead of replacing it. Game arguments
-/// go right after `%command%`. A setting or argument the options already have is left as it is.
-fn launch_options(env: &[(&str, String)], args: &[String], hide_helpers: bool, existing: &str) -> String {
+/// game. Settings go first and the wrappers (Steam's old runtime's run.sh, then the helper
+/// hiding) right before `%command%`, so they fit around options already there (`gamemoderun
+/// %command%`, or bare game arguments like `-insecure`). Steam itself preloads its overlay, so
+/// LD_PRELOAD adds to it instead of replacing it. Game arguments go right after `%command%`. A
+/// setting or argument the options already have is left as it is.
+fn launch_options(env: &[(&str, String)], args: &[String], runtime: Option<&Path>, hide_helpers: bool, existing: &str) -> String {
     let words: Vec<&str> = existing.split_whitespace().collect();
     let env: Vec<&(&str, String)> = env.iter().filter(|(k, _)| matches!(*k, "LD_PRELOAD" | "LD_LIBRARY_PATH") || !words.iter().any(|w| w.starts_with(&format!("{k}=")))).collect();
     let args: Vec<&String> = args.iter().filter(|a| !words.contains(&a.split(' ').next().unwrap_or(""))).collect();
-    if env.is_empty() && args.is_empty() && !hide_helpers {
+    let runtime = runtime.map(|r| r.display().to_string()).filter(|r| !existing.contains(r.as_str()));
+    if env.is_empty() && args.is_empty() && runtime.is_none() && !hide_helpers {
         return existing.to_string();
     }
     let quote = |v: &str| if v.chars().all(|c| c.is_ascii_alphanumeric() || "/-_.=+:,".contains(c)) { v.to_string() } else { format!("'{}'", v.replace('\'', "'\\''")) };
     let settings: Vec<String> = env
         .iter()
-        .map(|(k, v)| if matches!(*k, "LD_PRELOAD" | "LD_LIBRARY_PATH") { format!("{k}=\"${k}:{v}\"") } else { format!("{k}={}", quote(v)) })
+        .map(|(k, v)| if matches!(*k, "LD_PRELOAD" | "LD_LIBRARY_PATH") { format!("{k}=\"${{{k}:+${k}:}}{v}\"") } else { format!("{k}={}", quote(v)) })
         .collect();
     let command = if hide_helpers { "\"$@\" %command%".to_string() } else { "%command%".to_string() };
+    let command = match &runtime {
+        Some(run) => format!("{} {command}", quote(run)),
+        None => command,
+    };
     let command = args.iter().fold(command, |c, a| format!("{c} {a}"));
     let command = command.as_str();
     let existing = existing.trim();
@@ -1136,16 +1142,22 @@ mod tests {
     #[test]
     fn launch_options_fit_around_existing_ones() {
         let env = [("GLIBC_TUNABLES", "glibc.rtld.execstack=2".to_string())];
-        assert_eq!(launch_options(&env, &[], false, ""), "GLIBC_TUNABLES=glibc.rtld.execstack=2 %command%");
-        assert_eq!(launch_options(&[], &[], true, "STEAM_COMPAT_LAUNCHER_SERVICE=proton %command%"), format!("{HIDE_HELPERS} STEAM_COMPAT_LAUNCHER_SERVICE=proton \"$@\" %command%"));
-        assert_eq!(launch_options(&env, &[], false, "-insecure"), "GLIBC_TUNABLES=glibc.rtld.execstack=2 %command% -insecure");
-        assert_eq!(launch_options(&[], &[], false, "-insecure"), "-insecure");
+        assert_eq!(launch_options(&env, &[], None, false, ""), "GLIBC_TUNABLES=glibc.rtld.execstack=2 %command%");
+        assert_eq!(launch_options(&[], &[], None, true, "STEAM_COMPAT_LAUNCHER_SERVICE=proton %command%"), format!("{HIDE_HELPERS} STEAM_COMPAT_LAUNCHER_SERVICE=proton \"$@\" %command%"));
+        assert_eq!(launch_options(&env, &[], None, false, "-insecure"), "GLIBC_TUNABLES=glibc.rtld.execstack=2 %command% -insecure");
+        assert_eq!(launch_options(&[], &[], None, false, "-insecure"), "-insecure");
         // From ProtonDB's table: arguments right after %command%, nothing the options already have.
         let wined3d = [("PROTON_USE_WINED3D", "1".to_string())];
         let args = ["-force-d3d11".to_string(), "--rendering-driver vulkan".to_string()];
-        assert_eq!(launch_options(&wined3d, &args, false, ""), "PROTON_USE_WINED3D=1 %command% -force-d3d11 --rendering-driver vulkan");
-        assert_eq!(launch_options(&wined3d, &args[..1], false, "gamemoderun %command% -skipintro"), "PROTON_USE_WINED3D=1 gamemoderun %command% -force-d3d11 -skipintro");
-        assert_eq!(launch_options(&wined3d, &args[..1], false, "PROTON_USE_WINED3D=0 %command% -force-d3d11"), "PROTON_USE_WINED3D=0 %command% -force-d3d11");
+        assert_eq!(launch_options(&wined3d, &args, None, false, ""), "PROTON_USE_WINED3D=1 %command% -force-d3d11 --rendering-driver vulkan");
+        assert_eq!(launch_options(&wined3d, &args[..1], None, false, "gamemoderun %command% -skipintro"), "PROTON_USE_WINED3D=1 gamemoderun %command% -force-d3d11 -skipintro");
+        assert_eq!(launch_options(&wined3d, &args[..1], None, false, "PROTON_USE_WINED3D=0 %command% -force-d3d11"), "PROTON_USE_WINED3D=0 %command% -force-d3d11");
+        // Steam doesn't pass its old runtime's libraries on to games: its run.sh goes in front.
+        let run = Path::new("/home/a b/.local/share/Steam/ubuntu12_32/steam-runtime/run.sh");
+        let libs = [("LD_LIBRARY_PATH", "/x/libs".to_string())];
+        assert_eq!(launch_options(&libs, &[], Some(run), false, ""), "LD_LIBRARY_PATH=\"${LD_LIBRARY_PATH:+$LD_LIBRARY_PATH:}/x/libs\" '/home/a b/.local/share/Steam/ubuntu12_32/steam-runtime/run.sh' %command%");
+        assert_eq!(launch_options(&[], &[], Some(run), true, "gamemoderun %command%"), format!("{HIDE_HELPERS} gamemoderun '{}' \"$@\" %command%", run.display()));
+        assert_eq!(launch_options(&[], &[], Some(run), false, "'/home/a b/.local/share/Steam/ubuntu12_32/steam-runtime/run.sh' %command%"), "'/home/a b/.local/share/Steam/ubuntu12_32/steam-runtime/run.sh' %command%");
     }
 
     /// The snippet must hide exactly the /proc/self/exe helpers and run the command after it.

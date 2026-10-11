@@ -1305,7 +1305,7 @@ impl Report {
                         Some(run) if !in_old_runtime.is_empty() => {
                             let _ = writeln!(out, "  Steam's runtime for older games keeps libraries newer systems dropped{}.", if in_old_runtime.len() < libs.len() + later.len() { " (marked)" } else { ", all of these" });
                             let _ = writeln!(out, "    Fix (at launch): start it through {}", run.display());
-                            let _ = writeln!(out, "    Started from Steam it gets them by itself; gamefix setup does it for the app-menu entry.");
+                            let _ = writeln!(out, "    Steam doesn't do that by itself; gamefix setup does it for the app-menu entry and the Steam shortcut.");
                         }
                         Some(_) => {}
                         None => {
