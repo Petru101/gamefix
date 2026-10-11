@@ -435,6 +435,7 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
                     not_fixed.push("Old Unity \"Player is already running\": needs bwrap, which isn't installed. If it happens, close Steam before starting.".into());
                 }
             }
+            Problem::UnityShaders(n) => done.push(format!("Nothing to change for its first start, which stays black for a while (maybe minutes) while the graphics driver compiles its {n} shaders; the driver keeps them, so later starts are quick.")),
             Problem::UnityFont(_) => match (bwrap_overlays(), arial_fonts()) {
                 (true, Ok(dir)) => {
                     hide_helpers = true;

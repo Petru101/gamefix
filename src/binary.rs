@@ -218,6 +218,27 @@ pub fn contains(path: &Path, needle: &[u8]) -> bool {
     contains_groups(path, &[&[needle]])
 }
 
+/// How many times `needle` occurs in a file, read in chunks (Unity's sharedassets run to
+/// hundreds of MB). The needle's bytes must all differ from its first, so matches can't overlap.
+pub fn count(path: &Path, needle: &[u8]) -> usize {
+    let Ok(mut f) = File::open(path) else { return 0 };
+    let mut buf = vec![0u8; 1 << 20];
+    // The last needle.len() - 1 bytes of the previous chunk, where a match may start.
+    let mut carry: Vec<u8> = Vec::new();
+    let mut n = 0;
+    loop {
+        let Ok(read) = f.read(&mut buf) else { break };
+        if read == 0 {
+            break;
+        }
+        carry.extend_from_slice(&buf[..read]);
+        n += carry.windows(needle.len()).filter(|w| w[0] == needle[0] && *w == needle).count();
+        let keep = carry.len().min(needle.len() - 1);
+        carry.drain(..carry.len() - keep);
+    }
+    n
+}
+
 /// Whether the first `limit` bytes of a file hold `needle` (a .NET single-file program's
 /// launcher, at the start, names libhostfxr.so; the bundle follows).
 pub fn head_contains(path: &Path, needle: &[u8], limit: u64) -> bool {
@@ -866,6 +887,21 @@ mod tests {
         let mut found = super::find_any(data, &[(0, b"Arial"), (1, b"Liberation Sans"), (2, b"FreeSans"), (3, b"/usr/share/fonts")]);
         found.sort();
         assert_eq!(found, [0, 2, 3]);
+    }
+
+    /// Matches inside a chunk, at its very end and across the 1 MB chunk boundary all count.
+    #[test]
+    fn counts_across_chunks() {
+        let needle = b"#ifdef VERTEX";
+        let mut data = vec![b'.'; 3 << 20];
+        for at in [10, (1 << 20) - 5, (2 << 20) - needle.len(), data.len() - needle.len()] {
+            data[at..at + needle.len()].copy_from_slice(needle);
+        }
+        let path = std::env::temp_dir().join(format!("gamefix-count-{}", std::process::id()));
+        std::fs::write(&path, &data).unwrap();
+        let n = super::count(&path, needle);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(n, 4);
     }
 
     #[test]
