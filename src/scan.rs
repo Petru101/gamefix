@@ -20,6 +20,8 @@ pub struct Found {
 pub struct Engine {
     pub name: &'static str,
     pub version: Option<String>,
+    /// Why the version is what it is when the game doesn't say (read from its code).
+    pub guess: Option<String>,
 }
 
 pub struct Game {
@@ -137,7 +139,14 @@ pub fn scan(path: &Path) -> Option<Game> {
         .flatten();
     let program = main.or(windows);
     let engine = match portable {
-        Some(i) if matches!(files[i].binary, Binary::Love) => Some(Engine { name: "LÖVE", version: love_version(&root.join(&files[i].path)) }),
+        Some(i) if matches!(files[i].binary, Binary::Love) => {
+            let file = root.join(&files[i].path);
+            let (version, guess) = match love_version(&file) {
+                Some(v) => (Some(v), None),
+                None => love_guess(&file).map_or((None, None), |(v, why)| (Some(v.to_string()), Some(why))),
+            };
+            Some(Engine { name: "LÖVE", version, guess })
+        }
         _ => program.and_then(|i| engine(&root, &files[i].path, &files)),
     };
     let name = program
@@ -417,39 +426,144 @@ fn love_version(file: &Path) -> Option<String> {
     (!v.is_empty()).then_some(v)
 }
 
+/// The LÖVE series a game that names no version in conf.lua was written for, from the
+/// functions its code calls: 0.x games often leave it out (Disposable, Pop, Soulstice), and
+/// LÖVE 11 either stops on them (Disposable's `isDown(' ')`: "Invalid key constant") or draws
+/// them wrong (colours as 0-255 become white, fades don't fade). Something only LÖVE 11 has
+/// means 11 (None, like no version); else what 0.10 removed and nothing it added means 0.9;
+/// else what 11 removed or changed means 0.10, whose games mostly run on 0.10 even when a
+/// leftover 0.9 call sits in unused code.
+fn love_guess(file: &Path) -> Option<(&'static str, String)> {
+    let out = std::process::Command::new("unzip").arg("-p").arg(file).arg("*.lua").output().ok()?;
+    love_guess_code(&String::from_utf8_lossy(&out.stdout))
+}
+
+fn love_guess_code(code: &str) -> Option<(&'static str, String)> {
+    let code = lua_without_comments(code);
+    const NEW11: &[&str] = &["filesystem.getInfo", "graphics.captureScreenshot", "getDPIScale", "math.colorFromBytes", "graphics.applyTransform", "data.compress", "data.decompress", "data.encode", "data.decode", "data.newByteData", "data.hash", "data.pack", "data.unpack"];
+    const NEW10: &[&str] = &["graphics.stencil", "graphics.points"];
+    const OLD9: &[&str] = &["graphics.setStencil", "graphics.setInvertedStencil", "graphics.newStencil", "graphics.point", "graphics.setPointStyle", "graphics.getMaxImageSize", "graphics.isSupported"];
+    const OLD10: &[&str] = &["filesystem.exists", "filesystem.isFile", "filesystem.isDirectory", "filesystem.isSymlink", "filesystem.getLastModified", "filesystem.getSize", "graphics.newScreenshot", "window.getPixelScale"];
+    if NEW11.iter().any(|f| calls(&code, f)) {
+        return None;
+    }
+    let added10 = NEW10.iter().any(|f| calls(&code, f)) || code.contains("love.wheelmoved") || code.contains("love.touch.") || call_args(&code, "isDown").any(|a| quoted(a).any(|s| s == "space"));
+    let old9 = OLD9.iter().find(|f| calls(&code, f)).map(|f| format!("love.{f}, which LÖVE 0.10 removed"))
+        .or_else(|| call_args(&code, "isDown").any(|a| quoted(a).any(|s| s == " ")).then(|| "the 0.9 name for the space key (\" \"; \"space\" since 0.10)".to_string()))
+        .or_else(|| call_args(&code, "mouse.isDown").any(|a| quoted(a).any(|s| matches!(s, "l" | "r" | "m"))).then(|| "the 0.9 names for mouse buttons (\"l\", \"r\"; numbers since 0.10)".to_string()));
+    if let (Some(why), false) = (&old9, added10) {
+        return Some(("0.9", why.clone()));
+    }
+    let old = OLD10.iter().find(|f| calls(&code, f)).map(|f| format!("love.{f}, which LÖVE 11 removed"))
+        .or_else(|| ["setColor", "setBackgroundColor", "graphics.clear"].iter().any(|f| call_args(&code, f).any(|a| byte_colour(a))).then(|| "colours from 0 to 255 (0 to 1 since LÖVE 11)".to_string()))
+        .or(old9)?;
+    Some(("0.10", old))
+}
+
+/// Lua code with its comments (`--` to the end of the line, `--[[ ... ]]`, `--[==[ ... ]==]`)
+/// taken out; strings aren't tracked, a `--` inside one cuts the rest of that line.
+fn lua_without_comments(code: &str) -> String {
+    let mut out = String::with_capacity(code.len());
+    let mut rest = code;
+    while let Some(i) = rest.find("--") {
+        out.push_str(&rest[..i]);
+        let after = &rest[i + 2..];
+        let level = after.strip_prefix('[').map(|a| a.bytes().take_while(|&b| b == b'=').count()).filter(|&n| after[1 + n..].starts_with('['));
+        rest = match level {
+            Some(n) => {
+                let close = format!("]{}]", "=".repeat(n));
+                after.find(&close).map_or("", |j| &after[j + close.len()..])
+            }
+            None => after.find('\n').map_or("", |j| &after[j..]),
+        };
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Whether the code calls `name` (`love.graphics.point(`, `lg.point (`): the name, not
+/// followed by more of a longer name, then `(`.
+fn calls(code: &str, name: &str) -> bool {
+    call_args(code, name).next().is_some()
+}
+
+/// The argument text of each call to `name`, up to the matching `)`.
+fn call_args<'a>(code: &'a str, name: &'a str) -> impl Iterator<Item = &'a str> + 'a {
+    code.match_indices(name).filter_map(move |(i, _)| {
+        let before = code[..i].chars().next_back();
+        // `graphics.point` inside `love.graphics.point` is fine; inside `xgraphics.point` isn't.
+        if before.is_some_and(|c| c.is_alphanumeric() || c == '_') {
+            return None;
+        }
+        let rest = code[i + name.len()..].trim_start();
+        let args = rest.strip_prefix('(')?;
+        let mut depth = 0;
+        let end = args.char_indices().find(|&(_, c)| {
+            match c {
+                '(' => depth += 1,
+                ')' if depth == 0 => return true,
+                ')' => depth -= 1,
+                _ => {}
+            }
+            false
+        })?;
+        Some(&args[..end.0])
+    })
+}
+
+/// The quoted strings in some code.
+fn quoted(code: &str) -> impl Iterator<Item = &str> {
+    let mut rest = code;
+    std::iter::from_fn(move || {
+        let start = rest.find(['"', '\''])?;
+        let q = rest[start..].chars().next()?;
+        let body = &rest[start + 1..];
+        let end = body.find(q)?;
+        rest = &body[end + 1..];
+        Some(&body[..end])
+    })
+}
+
+/// Whether a colour call's first argument is a whole number above 1 (`255, 255, 255`), the way
+/// 0.x games give colours; `255/255` and variables don't count.
+fn byte_colour(args: &str) -> bool {
+    let first = args.split(',').next().unwrap_or("").trim();
+    first.len() <= 3 && first.parse::<u32>().is_ok_and(|n| n > 1)
+}
+
 fn engine(root: &Path, main: &Path, files: &[Found]) -> Option<Engine> {
     let dir = root.join(main.parent().unwrap_or(Path::new("")));
     let s = stem(main);
     let data = dir.join(format!("{s}_Data"));
     if data.is_dir() {
         let version = ["globalgamemanagers", "mainData", "data.unity3d"].iter().find_map(|f| unity_version(&data.join(f)));
-        return Some(Engine { name: "Unity", version });
+        return Some(Engine { name: "Unity", version, guess: None });
     }
     let named = |n: &str| files.iter().any(|f| f.path.file_name().is_some_and(|x| x == n));
     if dir.join(format!("{s}.pck")).is_file() || dir.join("data.pck").is_file() || ends_with_pck(&dir.join(main.file_name()?)) {
-        return Some(Engine { name: "Godot", version: None });
+        return Some(Engine { name: "Godot", version: None, guess: None });
     }
     if main.components().any(|c| c.as_os_str() == "Binaries") || root.join("Engine").is_dir() {
-        return Some(Engine { name: "Unreal Engine", version: None });
+        return Some(Engine { name: "Unreal Engine", version: None, guess: None });
     }
     if dir.join("assets/game.unx").is_file() || dir.join("game.unx").is_file() {
-        return Some(Engine { name: "GameMaker", version: None });
+        return Some(Engine { name: "GameMaker", version: None, guess: None });
     }
     // GameMaker games ship data.win next to the program, or packed inside it.
     if dir.join("data.win").is_file() || (main.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe")) && binary::contains(&dir.join(main.file_name()?), b"data.win")) {
-        return Some(Engine { name: "GameMaker", version: None });
+        return Some(Engine { name: "GameMaker", version: None, guess: None });
     }
     if main.ancestors().any(|a| root.join(a).join("renpy").is_dir()) {
-        return Some(Engine { name: "Ren'Py", version: None });
+        return Some(Engine { name: "Ren'Py", version: None, guess: None });
     }
     if named("UnityPlayer.so") {
-        return Some(Engine { name: "Unity", version: None });
+        return Some(Engine { name: "Unity", version: None, guess: None });
     }
     let here = |n: &str| dir.join(n).exists();
     let (name, found) = [("Adventure Game Studio", here("acsetup.cfg") && main.file_name().is_some_and(|n| n.to_string_lossy().starts_with("ags"))), ("Defold", here("game.projectc")), ("MonoGame", here("MonoGame.Framework.dll")), ("FNA", here("FNA.dll")), ("NW.js", here("nw.pak") || here("lib/libnw.so")), ("Java", here("jre") && std::fs::read_dir(&dir).into_iter().flatten().flatten().any(|e| e.path().extension().is_some_and(|x| x == "jar")))]
         .into_iter()
         .find(|(_, found)| *found)?;
-    found.then_some(Engine { name, version: None })
+    found.then_some(Engine { name, version: None, guess: None })
 }
 
 /// Godot can embed its data in the program; such files end with "GDPC".
@@ -476,4 +590,26 @@ fn unity_product(root: &Path, main: &Path) -> Option<String> {
     let dir = root.join(main.parent().unwrap_or(Path::new("")));
     let info = fs::read_to_string(dir.join(format!("{}_Data/app.info", stem(main)))).ok()?;
     info.lines().nth(1).map(str::trim).filter(|s| !s.is_empty()).map(String::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::love_guess_code;
+
+    #[test]
+    fn love_series_from_code() {
+        let series = |code: &str| love_guess_code(code).map(|(v, _)| v);
+        // Disposable: the 0.9 space key, colours as bytes.
+        assert_eq!(series("if LK.isDown('return', ' ') then end\nlove.graphics.setColor(255, 255, 255)"), Some("0.9"));
+        // A 0.9 call next to something 0.10 added: 0.10 (leftover code).
+        assert_eq!(series("love.graphics.setStencil(f)\nlove.graphics.stencil(f)"), Some("0.10"));
+        assert_eq!(series("lg.setColor(255, 0, 255)"), Some("0.10"));
+        assert_eq!(series("if love.filesystem.exists('save') then end"), Some("0.10"));
+        // LÖVE 11's own functions win, even beside an unused 0.x library.
+        assert_eq!(series("love.filesystem.getInfo('a')\nlove.graphics.setColor(255, 255, 255)"), None);
+        // Colours as fractions, variables, divisions, comments: nothing to go on.
+        assert_eq!(series("love.graphics.setColor(1, 1, 1)\nsetColor(r, g, b)\nsetColor(255/255, 0, 0)\n-- love.graphics.setColor(255, 0, 0)\n--[[ love.filesystem.exists(x) ]]"), None);
+        // `points(` isn't `point(`.
+        assert_eq!(series("love.graphics.points(1, 2)"), None);
+    }
 }

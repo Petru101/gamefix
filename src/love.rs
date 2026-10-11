@@ -34,9 +34,10 @@ const BUILDS: [(&str, &str, [(&str, &str); 2]); 2] = [
 ];
 
 /// The LÖVE build gamefix can run a game made for this version with (patch releases of a
-/// series kept its API: 0.10.0 and 0.10.1 games run on 0.10.2).
+/// series kept its API: 0.10.0 and 0.10.1 games run on 0.10.2). A series alone ("0.9", guessed
+/// from the code) counts too.
 pub fn build_for(version: &str) -> Option<&'static str> {
-    BUILDS.iter().find(|(prefix, ..)| version.starts_with(prefix)).map(|(_, build, _)| *build)
+    BUILDS.iter().find(|(prefix, ..)| format!("{version}.").starts_with(prefix)).map(|(_, build, _)| *build)
 }
 
 fn folder(build: &str) -> PathBuf {

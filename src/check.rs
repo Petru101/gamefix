@@ -1332,6 +1332,9 @@ impl Report {
                     } else {
                         let _ = writeln!(out, "✗ This is a LÖVE game: {} is run by the LÖVE program, which isn't part of the system.", file.display());
                     }
+                    if let Some(why) = game.engine.as_ref().and_then(|e| e.guess.as_ref()) {
+                        let _ = writeln!(out, "  (Its conf.lua names no LÖVE version; its code uses {why}.)");
+                    }
                     if old {
                         if love.is_none() {
                             let _ = writeln!(out, "  It was made for LÖVE {}, and the LÖVE you can install (11, on Flathub) can't run", version.as_deref().unwrap_or_default());
