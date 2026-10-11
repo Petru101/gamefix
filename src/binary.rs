@@ -21,6 +21,8 @@ pub enum Binary {
     Python(Python),
     /// A Flash movie or game (.swf), which Flash Player ran; Ruffle does now.
     Flash,
+    /// A TIC-80 cartridge (.tic), a game for that fantasy console; its own player runs it.
+    Tic,
     /// A DOS program (.exe or .com), which Wine won't run; DOSBox does.
     Dos,
     /// A CD or DVD image (.iso): usually a Windows game's disc, to install from.
@@ -112,6 +114,9 @@ pub fn identify(path: &Path) -> Option<Binary> {
         Some(Binary::Jar)
     } else if ext == "swf" && [&b"FWS"[..], b"CWS", b"ZWS"].iter().any(|m| head.starts_with(m)) {
         Some(Binary::Flash)
+    } else if ext == "tic" && head.len() >= 4 {
+        // Chunks with no file signature: the extension is all there is.
+        Some(Binary::Tic)
     } else if ext == "apk" && head.starts_with(b"PK\x03\x04") {
         Some(Binary::Package("apk"))
     } else if ext == "deb" && head.starts_with(b"!<arch>\ndebian") {
@@ -259,15 +264,36 @@ pub fn zip_complete(path: &Path) -> bool {
     tail.windows(4).any(|w| w == b"PK\x05\x06")
 }
 
+/// The ways a script may write a program's name: as it is, or with its ending as a shell
+/// variable picked by architecture (Star Turtle 64's run.sh: `bin/love$BITS` for love64/love32).
+fn name_forms(name: &str) -> Vec<String> {
+    let mut forms = vec![name.to_string()];
+    // Split only where a letter ends: love|64, Game|.x86_64.
+    for (i, _) in name.char_indices().filter(|&(i, _)| i >= 3 && name.len() - i <= 8 && name[..i].ends_with(|c: char| c.is_ascii_alphabetic())) {
+        let (prefix, rest) = name.split_at(i);
+        if rest.starts_with(|c: char| c.is_ascii_digit() || c == '_' || c == '.') && rest.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.') && rest.chars().any(|c| c.is_ascii_digit()) {
+            forms.push(format!("{prefix}$"));
+        }
+    }
+    forms
+}
+
+/// Whether a script's text names the program (see `name_forms`).
+pub fn names_program(script: &Path, name: &str) -> bool {
+    let Ok(text) = std::fs::read(script) else { return false };
+    let text = String::from_utf8_lossy(&text);
+    name_forms(name).iter().any(|f| text.contains(f.as_str()))
+}
+
 /// Whether a script runs `path` (a path ending in /<program name>) on some line, rather than
 /// only preparing it: Alcarys Complex's install script `chmod`s Alcarys_Complex/runner and
 /// writes a desktop shortcut, and doesn't start the game.
 pub fn runs_path(script: &Path, name: &str) -> bool {
     let Ok(text) = std::fs::read(script) else { return false };
-    let needle = format!("/{name}");
+    let needles: Vec<String> = name_forms(name).iter().map(|f| format!("/{f}")).collect();
     String::from_utf8_lossy(&text).lines().any(|line| {
         let l = line.trim();
-        if l.starts_with('#') || !l.contains(&needle) {
+        if l.starts_with('#') || !needles.iter().any(|n| l.contains(n.as_str())) {
             return false;
         }
         // The command on the line, after any VAR=value settings and `exec`.
@@ -478,10 +504,43 @@ pub fn crlf(path: &Path) -> bool {
     std::fs::read(path).is_ok_and(|t| t.windows(2).any(|w| w == b"\r\n"))
 }
 
-/// Whether a script that sets LD_LIBRARY_PATH keeps what was there ("$LD_LIBRARY_PATH"),
-/// rather than replacing it (labb.sh: `LD_LIBRARY_PATH=. ./labb`).
+/// Whether a script that sets LD_LIBRARY_PATH keeps what was there ("$LD_LIBRARY_PATH" in
+/// the value it gives it), rather than replacing it (labb.sh: `LD_LIBRARY_PATH=. ./labb`).
+/// Saving it elsewhere doesn't count: Star Turtle 64's run.sh has
+/// `SYSTEM_LD_LIBRARY_PATH=$LD_LIBRARY_PATH`, then `export LD_LIBRARY_PATH="$SCRIPT_PATH/lib/$ARCH"`.
 pub fn keeps_library_path(path: &Path) -> bool {
-    contains_groups(path, &[&[b"$LD_LIBRARY_PATH", b"${LD_LIBRARY_PATH"]])
+    let Ok(text) = std::fs::read(path) else { return false };
+    String::from_utf8_lossy(&text).lines().any(|line| {
+        line.match_indices("LD_LIBRARY_PATH=").any(|(i, _)| {
+            let own = i == 0 || !line.as_bytes()[i - 1].is_ascii_alphanumeric() && line.as_bytes()[i - 1] != b'_';
+            let value = &line[i + "LD_LIBRARY_PATH=".len()..];
+            own && (value.contains("$LD_LIBRARY_PATH") || value.contains("${LD_LIBRARY_PATH"))
+        })
+    })
+}
+
+/// The tags of the needles found in `data`, in one pass over it (a pass per needle was most of
+/// the time spent reading big programs).
+pub fn find_any(data: &[u8], needles: &[(usize, &[u8])]) -> Vec<usize> {
+    let mut by_first: Vec<Vec<(usize, &[u8])>> = vec![Vec::new(); 256];
+    for &(tag, n) in needles.iter().filter(|(_, n)| !n.is_empty()) {
+        by_first[n[0] as usize].push((tag, n));
+    }
+    let mut tags: Vec<usize> = needles.iter().map(|(t, _)| *t).collect();
+    tags.sort();
+    tags.dedup();
+    let mut found: Vec<usize> = Vec::new();
+    for i in 0..data.len() {
+        for &(tag, n) in &by_first[data[i] as usize] {
+            if !found.contains(&tag) && data[i..].starts_with(n) {
+                found.push(tag);
+            }
+        }
+        if found.len() == tags.len() {
+            break;
+        }
+    }
+    found
 }
 
 /// Whether the file holds, for every group, at least one of its byte strings; read once.
@@ -502,8 +561,10 @@ pub fn find_groups(path: &Path, groups: &[&[&[u8]]]) -> Vec<bool> {
             return found;
         }
         let end = carry + n;
-        for (g, group) in groups.iter().enumerate() {
-            found[g] = found[g] || group.iter().any(|needle| buf[..end].windows(needle.len()).any(|w| w == *needle));
+        let needles: Vec<(usize, &[u8])> = groups.iter().enumerate().filter(|(g, _)| !found[*g]).flat_map(|(g, group)| group.iter().map(move |n| (g, *n))).collect();
+        let hits = find_any(&buf[..end], &needles);
+        for g in hits {
+            found[g] = true;
         }
         if found.iter().all(|&f| f) {
             return found;
@@ -799,6 +860,21 @@ fn pe(f: &mut File, h: &[u8]) -> Option<Pe> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn finds_needles_in_one_pass() {
+        let data = b"xx/usr/share/fonts..Arial.ttf FreeSansH9";
+        let mut found = super::find_any(data, &[(0, b"Arial"), (1, b"Liberation Sans"), (2, b"FreeSans"), (3, b"/usr/share/fonts")]);
+        found.sort();
+        assert_eq!(found, [0, 2, 3]);
+    }
+
+    #[test]
+    fn program_names_with_a_variable_ending() {
+        assert_eq!(super::name_forms("love64"), ["love64", "love$"]);
+        assert_eq!(super::name_forms("Game.x86_64"), ["Game.x86_64", "Game$", "Game.x$"]);
+        assert_eq!(super::name_forms("gPlead"), ["gPlead"]);
+    }
+
     use super::*;
 
     /// A minimal 32-bit Windows program: one section holding the import table, naming two DLLs.

@@ -65,7 +65,7 @@ impl Game {
             let Some(dir) = f.path.parent() else { return false };
             matches!(f.binary, Binary::Script)
                 && main.path.starts_with(dir)
-                && ((binary::sets_library_path(&self.full(f)) && binary::contains(&self.full(f), name.as_bytes()))
+                && ((binary::sets_library_path(&self.full(f)) && binary::names_program(&self.full(f), &name))
                     || binary::passes_file(&self.full(f), &name)
                     // Ren'Py's <name>.sh, which starts lib/<platform>/<name> with `-EO <name>.py`:
                     // started alone, Ren'Py 6 and 7 quit ("No module named site": Tunnel Vision).
@@ -128,7 +128,7 @@ pub fn scan(path: &Path) -> Option<Game> {
     let windows = if cd_installer.is_some() || linux_installer.is_some() { None } else { windows };
     let portable = match main {
         Some(_) => None,
-        None if chosen.is_some() => chosen.as_ref().and_then(|c| files.iter().position(|f| &f.path == c && matches!(f.binary, Binary::Love | Binary::Jar | Binary::Flash | Binary::Python(_) | Binary::Dos))),
+        None if chosen.is_some() => chosen.as_ref().and_then(|c| files.iter().position(|f| &f.path == c && matches!(f.binary, Binary::Love | Binary::Jar | Binary::Flash | Binary::Tic | Binary::Python(_) | Binary::Dos))),
         // A DOS program only when nothing else runs: Windows games may carry DOS tools.
         None => pick_portable(&root, &files).or_else(|| if windows.is_none() { pick_dos(&root, &files) } else { None }),
     };
@@ -193,7 +193,10 @@ fn walk(root: &Path, rel: &Path, depth: usize, out: &mut Vec<Found>) {
             let keep = match &binary {
                 Binary::Pe(_) => is_exe,
                 Binary::Script => depth <= 2,
-                Binary::Love | Binary::Jar | Binary::Flash | Binary::Python(_) | Binary::Archive | Binary::Package(_) => depth <= 1,
+                // A .love is never a library; SHARECART1000 jam games keep it two folders down
+                // (`SHARECART1000/CARTFARMER/cartfarmer.love`).
+                Binary::Love => depth <= 3,
+                Binary::Jar | Binary::Flash | Binary::Tic | Binary::Python(_) | Binary::Archive | Binary::Package(_) => depth <= 1,
                 Binary::Dos => depth <= 2,
                 Binary::Disc => depth <= 1,
                 Binary::Elf(_) | Binary::Damaged => true,
@@ -346,7 +349,7 @@ fn pick_portable(root: &Path, files: &[Found]) -> Option<usize> {
     if let Some((i, _)) = install4j {
         return Some(i);
     }
-    for kind in [|b: &Binary| matches!(b, Binary::Love), |b: &Binary| matches!(b, Binary::Jar), |b: &Binary| matches!(b, Binary::Flash)] {
+    for kind in [|b: &Binary| matches!(b, Binary::Love), |b: &Binary| matches!(b, Binary::Jar), |b: &Binary| matches!(b, Binary::Flash), |b: &Binary| matches!(b, Binary::Tic)] {
         if let Some((i, _)) = files.iter().enumerate().filter(|(_, f)| kind(&f.binary)).min_by_key(|(_, f)| f.path.components().count()) {
             return Some(i);
         }
@@ -457,7 +460,7 @@ fn love_guess_code(code: &str) -> Option<(&'static str, String)> {
     let code = lua_without_comments(code);
     const NEW11: &[&str] = &["filesystem.getInfo", "graphics.captureScreenshot", "getDPIScale", "math.colorFromBytes", "graphics.applyTransform", "data.compress", "data.decompress", "data.encode", "data.decode", "data.newByteData", "data.hash", "data.pack", "data.unpack"];
     const NEW10: &[&str] = &["graphics.stencil", "graphics.points"];
-    const OLD9: &[&str] = &["graphics.setStencil", "graphics.setInvertedStencil", "graphics.newStencil", "graphics.point", "graphics.setPointStyle", "graphics.getMaxImageSize", "graphics.isSupported"];
+    const OLD9: &[&str] = &["graphics.setStencil", "graphics.setInvertedStencil", "graphics.newStencil", "graphics.point", "graphics.setPointStyle", "graphics.getMaxImageSize", "graphics.isSupported", "window.getWidth", "window.getHeight", "window.getDimensions"];
     const OLD10: &[&str] = &["filesystem.exists", "filesystem.isFile", "filesystem.isDirectory", "filesystem.isSymlink", "filesystem.getLastModified", "filesystem.getSize", "graphics.newScreenshot", "window.getPixelScale"];
     if NEW11.iter().any(|f| calls(&code, f)) {
         return None;
@@ -477,7 +480,7 @@ fn love_guess_code(code: &str) -> Option<(&'static str, String)> {
 
 /// Lua code with its comments (`--` to the end of the line, `--[[ ... ]]`, `--[==[ ... ]==]`)
 /// taken out; strings aren't tracked, a `--` inside one cuts the rest of that line.
-fn lua_without_comments(code: &str) -> String {
+pub fn lua_without_comments(code: &str) -> String {
     let mut out = String::with_capacity(code.len());
     let mut rest = code;
     while let Some(i) = rest.find("--") {
@@ -577,8 +580,13 @@ fn engine(root: &Path, main: &Path, files: &[Found]) -> Option<Engine> {
     let here = |n: &str| dir.join(n).exists();
     let (name, found) = [("Adventure Game Studio", here("acsetup.cfg") && main.file_name().is_some_and(|n| n.to_string_lossy().starts_with("ags"))), ("Defold", here("game.projectc")), ("MonoGame", here("MonoGame.Framework.dll")), ("FNA", here("FNA.dll")), ("NW.js", here("nw.pak") || here("lib/libnw.so")), ("Java", here("jre") && std::fs::read_dir(&dir).into_iter().flatten().flatten().any(|e| e.path().extension().is_some_and(|x| x == "jar")))]
         .into_iter()
-        .find(|(_, found)| *found)?;
-    found.then_some(Engine { name, version: None, guess: None })
+        .find(|(_, found)| *found)
+        .unwrap_or_default();
+    if found {
+        return Some(Engine { name, version: None, guess: None });
+    }
+    // Flash Player's own Linux player with the game's .swf built in (a "projector": Ending).
+    binary::contains(&dir.join(main.file_name()?), b"__flash__toXML").then_some(Engine { name: "Flash Player projector", version: None, guess: None })
 }
 
 /// Godot can embed its data in the program; such files end with "GDPC".
@@ -620,6 +628,8 @@ mod tests {
         assert_eq!(series("love.graphics.setStencil(f)\nlove.graphics.stencil(f)"), Some("0.10"));
         assert_eq!(series("lg.setColor(255, 0, 255)"), Some("0.10"));
         assert_eq!(series("if love.filesystem.exists('save') then end"), Some("0.10"));
+        // Refuel Rescue: love.window.getWidth, gone in 0.10, beside filesystem.exists.
+        assert_eq!(series("love.filesystem.exists('a')\nlocal w = love.window.getWidth()"), Some("0.9"));
         // LÖVE 11's own functions win, even beside an unused 0.x library.
         assert_eq!(series("love.filesystem.getInfo('a')\nlove.graphics.setColor(255, 255, 255)"), None);
         // Colours as fractions, variables, divisions, comments: nothing to go on.

@@ -2,6 +2,7 @@ mod binary;
 mod check;
 mod disc;
 mod fetch;
+mod font;
 mod love;
 mod proton;
 mod python;

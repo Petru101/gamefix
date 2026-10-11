@@ -32,6 +32,12 @@ const BWRAP: &str = "/usr/bin/bwrap";
 /// they are looked up at each launch.
 const HIDE_HELPERS: &str = "set -- /usr/bin/bwrap --dev-bind / /; for p in /proc/[0-9]*; do [ \"$(tr '\\0' '\\n' < $p/cmdline 2>/dev/null | head -n 1)\" = /proc/self/exe ] && set -- \"$@\" --ro-bind /dev/null $p/cmdline; done;";
 
+/// HIDE_HELPERS with more bwrap arguments (shell-quoted here) after the root's.
+fn hide_helpers_with(extra: &[String]) -> String {
+    let quoted: Vec<String> = extra.iter().map(|a| format!("'{}'", a.replace('\'', "'\\''"))).collect();
+    HIDE_HELPERS.replacen("--dev-bind / /;", &format!("--dev-bind / / {};", quoted.join(" ")), 1).replace(" / / ;", " / /;")
+}
+
 const STEAM_OPEN: &str = "Steam is open. Close it first (Steam → Exit): it rewrites its game list when it quits, which would undo the change.";
 
 fn data_home() -> PathBuf {
@@ -110,13 +116,21 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
         let runner = report.problems.iter().find_map(|p| match p {
             Problem::Java { file, java: Some(java) } if file.extension().is_some_and(|e| e == "jar") => {
                 let mut command = java_sound(vec![java.display().to_string(), "-jar".into()], java_audio);
+                let mut setting = |s: String| {
+                    command = match command[0].as_str() {
+                        "env" => [vec!["env".into(), s], command[1..].to_vec()].concat(),
+                        _ => [vec!["env".into(), s], command.clone()].concat(),
+                    };
+                };
                 // Mesa reads the game's mismatched shaders as GLSL 1.30 (Aloisius); other drivers
                 // ignore the setting.
                 if crate::binary::jar_needs(&game.root.join(file)).shader.is_some() {
-                    command = match command[0].as_str() {
-                        "env" => [vec!["env".into(), "force_glsl_version=130".into()], command[1..].to_vec()].concat(),
-                        _ => [vec!["env".into(), "force_glsl_version=130".into()], command].concat(),
-                    };
+                    setting("force_glsl_version=130".into());
+                }
+                // A launcher inside the jar may start the game in a second `java` found on the
+                // PATH (JarSplice: Dungeon Colony), which Homebrew's isn't on in menu entries.
+                if let Some(dir) = java.parent().filter(|d| !matches!(d.to_str(), Some("/usr/bin" | "/bin"))) {
+                    setting(format!("PATH={}:/usr/bin:/bin", dir.display()));
                 }
                 Some((command, file, "Java"))
             }
@@ -135,6 +149,14 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
                     command.insert(2, format!("--filesystem={dir}:ro"));
                 }
                 Some((command, file, "Ruffle"))
+            }
+            Problem::Tic { file, tic80: Some(tic80) } => {
+                let mut command = tic80.clone();
+                if command[0] == "flatpak" {
+                    let dir = game.root.join(file).parent().map(|d| d.display().to_string()).unwrap_or_default();
+                    command.insert(2, format!("--filesystem={dir}:ro"));
+                }
+                Some((command, file, "TIC-80"))
             }
             // Flathub's DOSBox likewise, writable: DOS games keep their settings and saves in
             // their folder. Staging quits with the game; the original DOSBox needs -exit for that.
@@ -210,7 +232,12 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
     if report.problems.iter().any(|p| matches!(p, Problem::WrongMachine(_))) {
         return Err("The program is built for a different processor; nothing can make it run here.".into());
     }
-    let steam = if targets.steam {
+    // A text game runs in a terminal, which Steam doesn't open.
+    let terminal = report.problems.iter().any(|p| matches!(p, Problem::Terminal { .. }));
+    if terminal && targets.steam && !targets.menu {
+        return Err("It's a text game that runs in a terminal, which Steam doesn't open: set it up for the app menu.".into());
+    }
+    let steam = if targets.steam && !terminal {
         let steam = Steam::find().ok_or("Steam isn't installed, or nobody has logged in to it yet.")?;
         if steam.running() {
             return Err(STEAM_OPEN.into());
@@ -222,8 +249,9 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
     let program = game.full(main);
     // Launch-time settings, as (name, value).
     let mut env: Vec<(&str, String)> = Vec::new();
-    // Whether to start it through HIDE_HELPERS.
+    // Whether to start it through HIDE_HELPERS, and what else bwrap does then.
     let mut hide_helpers = false;
+    let mut bwrap_extra: Vec<String> = Vec::new();
     // Steam's runtime for older games: Steam itself doesn't pass its libraries on to games.
     let mut old_runtime = None;
     // Libraries to load first, joined into one LD_PRELOAD.
@@ -302,9 +330,10 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
                 preload.push(path.clone());
                 done.push("Loads the old pango from Steam's runtime, which doesn't use the game's old HarfBuzz (at launch).".into());
             }
-            Problem::Shadowed(_, user, _, Some(path)) => {
+            Problem::Shadowed(copy, user, _, Some(path)) => {
                 preload.push(path.clone());
-                done.push(format!("Loads the system's newer copy of a library the game brings an old one of, so the system's {user} gets what it needs (at launch)."));
+                let name = copy.file_name().unwrap_or_default().to_string_lossy();
+                done.push(format!("Loads the system's newer {name} instead of the game's old one, so the system's {user} gets what it needs (at launch)."));
             }
             Problem::Shadowed(_, _, _, None) => not_fixed.push("An old library the game brings: the system's copy to preload wasn't found.".into()),
             Problem::OwnHarfbuzz(_, None, false) => not_fixed.push("Its built-in HarfBuzz: the system's libharfbuzz.so.0 to preload wasn't found.".into()),
@@ -363,7 +392,13 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
                     for (lib, dir) in misplaced {
                         let link = links.join(lib);
                         let _ = fs::remove_file(&link);
-                        std::os::unix::fs::symlink(game.root.join(dir).join(lib), &link).map_err(|e| e.to_string())?;
+                        // An unversioned name a game loads itself (LuaJIT's ffi.load "GLEW") points
+                        // to the versioned copy it ships (libGLEW.so.1.11).
+                        let dir = game.root.join(dir);
+                        let target = Some(dir.join(lib)).filter(|t| t.exists()).or_else(|| {
+                            fs::read_dir(&dir).ok()?.flatten().map(|e| e.path()).find(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with(&format!("{lib}."))))
+                        });
+                        std::os::unix::fs::symlink(target.unwrap_or(dir.join(lib)), &link).map_err(|e| e.to_string())?;
                         record.push(format!("created\t{}", link.display()));
                     }
                     if !misplaced.is_empty() {
@@ -400,6 +435,23 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
                     not_fixed.push("Old Unity \"Player is already running\": needs bwrap, which isn't installed. If it happens, close Steam before starting.".into());
                 }
             }
+            Problem::UnityFont(_) => match (bwrap_overlays(), arial_fonts()) {
+                (true, Ok(dir)) => {
+                    hide_helpers = true;
+                    bwrap_extra.extend(["--overlay-src", "/usr/share/fonts", "--tmp-overlay", "/usr/share/fonts", "--ro-bind"].map(String::from));
+                    bwrap_extra.extend([dir.display().to_string(), "/usr/share/fonts/gamefix-arial".into()]);
+                    done.push("Shows it a copy of Liberation Sans named Arial in /usr/share/fonts, so its text appears (at launch).".into());
+                }
+                (false, _) => not_fixed.push("Its text: the fix needs bwrap 0.10 or newer (overlays), which isn't installed.".into()),
+                (_, Err(e)) => not_fixed.push(format!("Its text: {e}")),
+            },
+            // The entry's Terminal=true is handled above.
+            Problem::Terminal { old_curses } => {
+                if *old_curses {
+                    env.push(("TERM", "xterm".into()));
+                    done.push("Tells its old ncurses the terminal is a plain xterm, a description it can read (at launch).".into());
+                }
+            }
             Problem::UnityH264(_) => not_fixed.push("Its H.264 videos: Unity's Linux player can't play them; the Windows download with Proton can.".into()),
             Problem::NwjsFonts(_) => {
                 env.push(("FONTCONFIG_FILE", plain_fonts()?.display().to_string()));
@@ -421,7 +473,7 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
             Problem::Alsa32(None) => not_fixed.push("Its 32-bit ALSA sound: needs Steam's runtime (install Steam), which has a plugin that works.".into()),
             Problem::KickFiles(files) => not_fixed.push(format!("Its missing Mono files ({}): only the developer can add them; the .exe with Proton works.", files.join(", "))),
             Problem::FnaLibs(libs) => not_fixed.push(format!("Its missing native libraries ({}): get FNA's fnalibs, or use the Windows download with Proton.", libs.join(", "))),
-            Problem::NoLinuxBuild | Problem::UnityDataMissing(_) | Problem::LinuxInstaller(_) | Problem::OwnWindowsDlls(_) | Problem::MissingWindowsParts(_) | Problem::Source(..) | Problem::Web(_) | Problem::Damaged(_) | Problem::Package(..) | Problem::Flash { .. } | Problem::Dos { .. } | Problem::Disc { .. } | Problem::CdFiles { .. } | Problem::Protected { .. } | Problem::Archive(_) | Problem::WrongMachine(_) | Problem::Love { .. } | Problem::Python { .. } | Problem::Java { .. } => {}
+            Problem::NoLinuxBuild | Problem::UnityDataMissing(_) | Problem::LinuxInstaller(_) | Problem::OwnWindowsDlls(_) | Problem::MissingWindowsParts(_) | Problem::Source(..) | Problem::Web(_) | Problem::Damaged(_) | Problem::Package(..) | Problem::Flash { .. } | Problem::Tic { .. } | Problem::Dos { .. } | Problem::Disc { .. } | Problem::CdFiles { .. } | Problem::Protected { .. } | Problem::Archive(_) | Problem::WrongMachine(_) | Problem::Love { .. } | Problem::Python { .. } | Problem::Java { .. } => {}
         }
     }
     if !preload.is_empty() {
@@ -480,6 +532,7 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
     let workdir = exodus_top.or(launcher_dir.as_deref()).or(start.parent()).unwrap_or(&game.root);
     let icon = icon(game, &main.path);
 
+    let wrap = hide_helpers.then(|| hide_helpers_with(&bwrap_extra));
     if targets.menu {
         let mut exec = Vec::new();
         if !env.is_empty() {
@@ -489,20 +542,23 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
         if let Some(run) = &old_runtime {
             exec.push(exec_arg(&run.display().to_string()));
         }
-        if hide_helpers {
-            exec.extend(["sh", "-c", &format!("{HIDE_HELPERS} exec \"$@\" \"$0\"")].map(exec_arg));
+        if let Some(wrap) = &wrap {
+            exec.extend(["sh", "-c", &format!("{wrap} exec \"$@\" \"$0\"")].map(exec_arg));
         }
         exec.push(exec_arg(&start.display().to_string()));
-        let entry = write_entry(game, &exec, workdir, &icon, false)?;
+        let entry = write_entry(game, &exec, workdir, &icon, terminal)?;
         record.push(format!("created\t{}", entry.display()));
-        done.push(format!("Added \"{}\" to the app menu, under Games.", game.name));
+        done.push(format!("Added \"{}\" to the app menu, under Games{}.", game.name, if terminal { " (it opens in a terminal)" } else { "" }));
+    }
+    if terminal && targets.steam {
+        not_fixed.push("Not added to Steam: it's a text game that runs in a terminal, which Steam doesn't open.".into());
     }
 
     if let (Some(steam), Some(appid)) = (&steam, steam::installed_app(&game.root)) {
         // A Steam game: its own launch options, keeping whatever was there.
         let file = steam.localconfig();
         let previous = steam::launch_options(&file, appid)?;
-        let options = launch_options(&env, &[], old_runtime.as_deref(), hide_helpers, previous.as_deref().unwrap_or(""));
+        let options = launch_options(&env, &[], old_runtime.as_deref(), wrap.as_deref(), previous.as_deref().unwrap_or(""));
         if options != previous.clone().unwrap_or_default() {
             steam::set_launch_options(&file, appid, Some(&options))?;
             let previous = previous.map_or("-".to_string(), |p| format!("={p}"));
@@ -516,7 +572,7 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
             exe: &start,
             start_dir: workdir,
             icon: if icon.starts_with('/') { &icon } else { "" },
-            launch_options: &launch_options(&env, &[], old_runtime.as_deref(), hide_helpers, ""),
+            launch_options: &launch_options(&env, &[], old_runtime.as_deref(), wrap.as_deref(), ""),
         };
         let appid = steam::add_shortcut(&file, &shortcut)?;
         record.push(format!("steam-shortcut\t{appid}\t{}", file.display()));
@@ -549,6 +605,7 @@ pub fn missing_runner(game: &Game, report: &Report) -> Option<Runner> {
         Problem::Java { java, .. } => java.is_some(),
         Problem::Love { love, version, .. } => love.is_some() || crate::check::old_love(version.as_deref()),
         Problem::Flash { ruffle, .. } => ruffle.is_some(),
+        Problem::Tic { tic80, .. } => tic80.is_some(),
         Problem::Dos { dosbox, .. } => dosbox.is_some(),
         _ => false,
     });
@@ -558,6 +615,7 @@ pub fn missing_runner(game: &Game, report: &Report) -> Option<Runner> {
     report.problems.iter().find_map(|p| match p {
         Problem::Love { love: None, .. } => Some(Runner { name: "LÖVE", app: "org.love2d.love2d" }),
         Problem::Flash { ruffle: None, .. } => Some(Runner { name: "Ruffle", app: "rs.ruffle.Ruffle" }),
+        Problem::Tic { tic80: None, .. } => Some(Runner { name: "TIC-80", app: "com.tic80.TIC_80" }),
         Problem::Dos { dosbox: None, .. } => Some(Runner { name: "DOSBox Staging", app: "io.github.dosbox-staging" }),
         _ => None,
     })
@@ -570,6 +628,7 @@ fn runner_needed(report: &Report) -> Option<String> {
         Problem::Java { java: None, .. } => Some(format!("This is a Java game, and Java isn't installed. On Bazzite, run \"brew install openjdk\" in a terminal, {then}")),
         Problem::Love { love: None, version, .. } if !crate::check::old_love(version.as_deref()) => Some(format!("This is a LÖVE game, and LÖVE isn't installed. Install LÖVE from Discover (it's on Flathub), {then}")),
         Problem::Flash { ruffle: None, .. } => Some(format!("This is a Flash game; it plays in Ruffle, which isn't installed. Install Ruffle from Discover (it's on Flathub), {then}")),
+        Problem::Tic { tic80: None, .. } => Some(format!("This is a TIC-80 game; it plays in TIC-80, which isn't installed. Install TIC-80 from Discover (it's on Flathub), {then}")),
         Problem::Dos { dosbox: None, .. } => Some(format!("This is a DOS game; it runs in DOSBox Staging, which isn't installed. Install DOSBox Staging from Discover (it's on Flathub), {then}")),
         Problem::Python { v2: true, .. } => Some("This is a Python 2 game; Python 2 is gone from current systems (see gamefix check).".into()),
         Problem::Love { .. } => Some("This LÖVE game needs an older LÖVE than any gamefix can set up (see gamefix check).".into()),
@@ -639,6 +698,49 @@ fn alsa_pulse32(pcm: &Path, ctl: &Path) -> Result<String, String> {
     );
     fs::write(&file, text).map_err(|e| e.to_string())?;
     Ok(file.display().to_string())
+}
+
+/// Whether the installed bwrap can lay an overlay over a folder (0.10 and newer).
+fn bwrap_overlays() -> bool {
+    let Ok(out) = Command::new(BWRAP).arg("--version").stdin(Stdio::null()).output() else { return false };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut v = text.split_whitespace().last().unwrap_or("").split('.').map(|n| n.parse::<u32>().unwrap_or(0));
+    (v.next().unwrap_or(0), v.next().unwrap_or(0)) >= (0, 10)
+}
+
+/// Copies of the system's Liberation Sans named Arial (`~/.local/share/gamefix/fonts/arial`,
+/// shared by every game and kept on undo, like the plain font list), for Unity players that
+/// look for Arial by name in /usr/share/fonts only.
+fn arial_fonts() -> Result<PathBuf, String> {
+    let dir = data_home().join("gamefix/fonts/arial");
+    let styles = [("Regular", "Arial", "ArialMT"), ("Bold", "Arial Bold", "Arial-BoldMT"), ("Italic", "Arial Italic", "Arial-ItalicMT"), ("BoldItalic", "Arial Bold Italic", "Arial-BoldItalicMT")];
+    let mut sources = Vec::new();
+    let mut todo = vec![(PathBuf::from("/usr/share/fonts"), 0)];
+    while let Some((d, depth)) = todo.pop() {
+        for entry in fs::read_dir(&d).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() && depth < 3 {
+                todo.push((path, depth + 1));
+            } else if let Some(style) = path.file_name().and_then(|n| n.to_str()).and_then(|n| n.strip_prefix("LiberationSans-")).and_then(|n| n.strip_suffix(".ttf")) {
+                sources.push((style.to_string(), path));
+            }
+        }
+    }
+    if !sources.iter().any(|(s, _)| s == "Regular") {
+        return Err("it needs Liberation Sans (Fedora's liberation-sans-fonts), which isn't installed.".into());
+    }
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    for (style, full, ps) in styles {
+        let target = dir.join(format!("{}.ttf", full.replace(' ', "")));
+        let Some((_, source)) = sources.iter().find(|(s, _)| s == style) else { continue };
+        if target.is_file() {
+            continue;
+        }
+        let data = fs::read(source).map_err(|e| e.to_string())?;
+        let font = crate::font::renamed(&data, &[(1, "Arial"), (4, full), (6, ps), (16, "Arial")]).ok_or(format!("couldn't read {}", source.display()))?;
+        fs::write(&target, font).map_err(|e| e.to_string())?;
+    }
+    Ok(dir)
 }
 
 /// Java's own sound for a game gamefix starts with Java: the command with the ALSA setting in
@@ -1062,7 +1164,7 @@ fn setup_install(game: &Game, installer: Installer, targets: &Targets) -> Result
     let own = proton::ignored_dlls(&exe);
     let mut env = vec![("STEAM_COMPAT_DATA_PATH", prefix.display().to_string())];
     add_overrides(&mut env, &own);
-    let line = launch_options(&env, &[], None, false, "");
+    let line = launch_options(&env, &[], None, None, "");
     let shortcuts = steam.shortcuts();
     let workdir = exe.parent().unwrap_or(&prefix);
     let shortcut = steam::Shortcut { name: &name, exe: &exe, start_dir: workdir, icon: "", launch_options: &line };
@@ -1189,7 +1291,7 @@ fn setup_windows(game: &Game, report: &Report, exe: &crate::scan::Found, targets
         let args = options.as_ref().map(|o| o.args.clone()).unwrap_or_default();
         let file = steam.localconfig();
         let previous = steam::launch_options(&file, appid)?;
-        let line = launch_options(&env, &args, None, false, previous.as_deref().unwrap_or(""));
+        let line = launch_options(&env, &args, None, None, previous.as_deref().unwrap_or(""));
         if line != previous.clone().unwrap_or_default() {
             steam::set_launch_options(&file, appid, Some(&line))?;
             done.push(match &previous {
@@ -1222,7 +1324,7 @@ fn setup_windows(game: &Game, report: &Report, exe: &crate::scan::Found, targets
     let file = steam.shortcuts();
     let mut env = Vec::new();
     add_overrides(&mut env, &own);
-    let line = launch_options(&env, &[], None, false, "");
+    let line = launch_options(&env, &[], None, None, "");
     let shortcut = steam::Shortcut { name: &game.name, exe: &program, start_dir: workdir, icon: "", launch_options: &line };
     let appid = steam::add_shortcut(&file, &shortcut)?;
     let mut record = vec![format!("steam-shortcut\t{appid}\t{}", file.display())];
@@ -1297,12 +1399,12 @@ fn dll_files(dlls: &[String]) -> String {
 /// %command%`, or bare game arguments like `-insecure`). Steam itself preloads its overlay, so
 /// LD_PRELOAD adds to it instead of replacing it. Game arguments go right after `%command%`. A
 /// setting or argument the options already have is left as it is.
-fn launch_options(env: &[(&str, String)], args: &[String], runtime: Option<&Path>, hide_helpers: bool, existing: &str) -> String {
+fn launch_options(env: &[(&str, String)], args: &[String], runtime: Option<&Path>, wrap: Option<&str>, existing: &str) -> String {
     let words: Vec<&str> = existing.split_whitespace().collect();
     let env: Vec<&(&str, String)> = env.iter().filter(|(k, _)| matches!(*k, "LD_PRELOAD" | "LD_LIBRARY_PATH") || !words.iter().any(|w| w.starts_with(&format!("{k}=")))).collect();
     let args: Vec<&String> = args.iter().filter(|a| !words.contains(&a.split(' ').next().unwrap_or(""))).collect();
     let runtime = runtime.map(|r| r.display().to_string()).filter(|r| !existing.contains(r.as_str()));
-    if env.is_empty() && args.is_empty() && runtime.is_none() && !hide_helpers {
+    if env.is_empty() && args.is_empty() && runtime.is_none() && wrap.is_none() {
         return existing.to_string();
     }
     let quote = |v: &str| if v.chars().all(|c| c.is_ascii_alphanumeric() || "/-_.=+:,".contains(c)) { v.to_string() } else { format!("'{}'", v.replace('\'', "'\\''")) };
@@ -1310,7 +1412,7 @@ fn launch_options(env: &[(&str, String)], args: &[String], runtime: Option<&Path
         .iter()
         .map(|(k, v)| if matches!(*k, "LD_PRELOAD" | "LD_LIBRARY_PATH") { format!("{k}=\"${{{k}:+${k}:}}{v}\"") } else { format!("{k}={}", quote(v)) })
         .collect();
-    let command = if hide_helpers { "\"$@\" %command%".to_string() } else { "%command%".to_string() };
+    let command = if wrap.is_some() { "\"$@\" %command%".to_string() } else { "%command%".to_string() };
     let command = match &runtime {
         Some(run) => format!("{} {command}", quote(run)),
         None => command,
@@ -1326,7 +1428,10 @@ fn launch_options(env: &[(&str, String)], args: &[String], runtime: Option<&Path
         format!("{command} {existing}")
     };
     let line = settings.into_iter().chain([rest]).collect::<Vec<_>>().join(" ");
-    if hide_helpers { format!("{HIDE_HELPERS} {line}") } else { line }
+    match wrap {
+        Some(wrap) => format!("{wrap} {line}"),
+        None => line,
+    }
 }
 
 /// Whether undoing this game's setup changes Steam's files.
@@ -1431,22 +1536,22 @@ mod tests {
     #[test]
     fn launch_options_fit_around_existing_ones() {
         let env = [("GLIBC_TUNABLES", "glibc.rtld.execstack=2".to_string())];
-        assert_eq!(launch_options(&env, &[], None, false, ""), "GLIBC_TUNABLES=glibc.rtld.execstack=2 %command%");
-        assert_eq!(launch_options(&[], &[], None, true, "STEAM_COMPAT_LAUNCHER_SERVICE=proton %command%"), format!("{HIDE_HELPERS} STEAM_COMPAT_LAUNCHER_SERVICE=proton \"$@\" %command%"));
-        assert_eq!(launch_options(&env, &[], None, false, "-insecure"), "GLIBC_TUNABLES=glibc.rtld.execstack=2 %command% -insecure");
-        assert_eq!(launch_options(&[], &[], None, false, "-insecure"), "-insecure");
+        assert_eq!(launch_options(&env, &[], None, None, ""), "GLIBC_TUNABLES=glibc.rtld.execstack=2 %command%");
+        assert_eq!(launch_options(&[], &[], None, Some(HIDE_HELPERS), "STEAM_COMPAT_LAUNCHER_SERVICE=proton %command%"), format!("{HIDE_HELPERS} STEAM_COMPAT_LAUNCHER_SERVICE=proton \"$@\" %command%"));
+        assert_eq!(launch_options(&env, &[], None, None, "-insecure"), "GLIBC_TUNABLES=glibc.rtld.execstack=2 %command% -insecure");
+        assert_eq!(launch_options(&[], &[], None, None, "-insecure"), "-insecure");
         // From ProtonDB's table: arguments right after %command%, nothing the options already have.
         let wined3d = [("PROTON_USE_WINED3D", "1".to_string())];
         let args = ["-force-d3d11".to_string(), "--rendering-driver vulkan".to_string()];
-        assert_eq!(launch_options(&wined3d, &args, None, false, ""), "PROTON_USE_WINED3D=1 %command% -force-d3d11 --rendering-driver vulkan");
-        assert_eq!(launch_options(&wined3d, &args[..1], None, false, "gamemoderun %command% -skipintro"), "PROTON_USE_WINED3D=1 gamemoderun %command% -force-d3d11 -skipintro");
-        assert_eq!(launch_options(&wined3d, &args[..1], None, false, "PROTON_USE_WINED3D=0 %command% -force-d3d11"), "PROTON_USE_WINED3D=0 %command% -force-d3d11");
+        assert_eq!(launch_options(&wined3d, &args, None, None, ""), "PROTON_USE_WINED3D=1 %command% -force-d3d11 --rendering-driver vulkan");
+        assert_eq!(launch_options(&wined3d, &args[..1], None, None, "gamemoderun %command% -skipintro"), "PROTON_USE_WINED3D=1 gamemoderun %command% -force-d3d11 -skipintro");
+        assert_eq!(launch_options(&wined3d, &args[..1], None, None, "PROTON_USE_WINED3D=0 %command% -force-d3d11"), "PROTON_USE_WINED3D=0 %command% -force-d3d11");
         // Steam doesn't pass its old runtime's libraries on to games: its run.sh goes in front.
         let run = Path::new("/home/a b/.local/share/Steam/ubuntu12_32/steam-runtime/run.sh");
         let libs = [("LD_LIBRARY_PATH", "/x/libs".to_string())];
-        assert_eq!(launch_options(&libs, &[], Some(run), false, ""), "LD_LIBRARY_PATH=\"${LD_LIBRARY_PATH:+$LD_LIBRARY_PATH:}/x/libs\" '/home/a b/.local/share/Steam/ubuntu12_32/steam-runtime/run.sh' %command%");
-        assert_eq!(launch_options(&[], &[], Some(run), true, "gamemoderun %command%"), format!("{HIDE_HELPERS} gamemoderun '{}' \"$@\" %command%", run.display()));
-        assert_eq!(launch_options(&[], &[], Some(run), false, "'/home/a b/.local/share/Steam/ubuntu12_32/steam-runtime/run.sh' %command%"), "'/home/a b/.local/share/Steam/ubuntu12_32/steam-runtime/run.sh' %command%");
+        assert_eq!(launch_options(&libs, &[], Some(run), None, ""), "LD_LIBRARY_PATH=\"${LD_LIBRARY_PATH:+$LD_LIBRARY_PATH:}/x/libs\" '/home/a b/.local/share/Steam/ubuntu12_32/steam-runtime/run.sh' %command%");
+        assert_eq!(launch_options(&[], &[], Some(run), Some(HIDE_HELPERS), "gamemoderun %command%"), format!("{HIDE_HELPERS} gamemoderun '{}' \"$@\" %command%", run.display()));
+        assert_eq!(launch_options(&[], &[], Some(run), None, "'/home/a b/.local/share/Steam/ubuntu12_32/steam-runtime/run.sh' %command%"), "'/home/a b/.local/share/Steam/ubuntu12_32/steam-runtime/run.sh' %command%");
     }
 
     /// The snippet must hide exactly the /proc/self/exe helpers and run the command after it.
@@ -1454,5 +1559,9 @@ mod tests {
     fn hide_helpers_runs_the_command() {
         let out = std::process::Command::new("sh").arg("-c").arg(format!("{HIDE_HELPERS} printf '%s ' \"$@\"")).output().unwrap();
         assert!(String::from_utf8_lossy(&out.stdout).starts_with("/usr/bin/bwrap --dev-bind / / "));
+        let extra = ["--ro-bind".to_string(), "/a b's".to_string(), "/x".to_string()];
+        let out = std::process::Command::new("sh").arg("-c").arg(format!("{} printf '%s|' \"$@\"", hide_helpers_with(&extra))).output().unwrap();
+        assert!(String::from_utf8_lossy(&out.stdout).starts_with("/usr/bin/bwrap|--dev-bind|/|/|--ro-bind|/a b's|/x|"));
+        assert_eq!(hide_helpers_with(&[]), HIDE_HELPERS);
     }
 }

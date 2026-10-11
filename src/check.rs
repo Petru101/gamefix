@@ -40,6 +40,8 @@ pub enum Problem {
     UnityDataMissing(PathBuf),
     /// A Flash game (.swf); `ruffle` is how to start an installed Ruffle.
     Flash { file: PathBuf, ruffle: Option<Vec<String>> },
+    /// A TIC-80 cartridge; `tic80` is how to start an installed TIC-80.
+    Tic { file: PathBuf, tic80: Option<Vec<String>> },
     /// A CD's files, with the installer among them.
     CdFiles { installer: PathBuf },
     /// Disc copy protection (SafeDisc, SecuROM) around the game's program, which Wine can't
@@ -82,8 +84,20 @@ pub enum Problem {
     SymbolClash(Vec<Clash>),
     /// Unity before 5.4: its single-instance check mistakes other programs for the game.
     UnitySingleInstance,
+    /// A program that draws no window and drives the terminal itself (ncurses, or raw
+    /// termios with escape codes): started from the app menu without one, it has nowhere to
+    /// draw (Potatoed Encryption: "Error opening terminal: unknown."; Xonitix: std::length_error).
+    /// `old_curses`: it uses ncurses 5, which can't read the terminal descriptions current
+    /// systems keep for xterm-256color (ncurses 6's extended format: "Error opening terminal:
+    /// xterm-256color"); plain xterm's are still in the old format.
+    Terminal { old_curses: bool },
     /// H.264 videos in a Unity Linux build: its player only decodes VP8 there.
     UnityH264(Vec<PathBuf>),
+    /// A Unity player that finds its built-in font (the GUI's, "Arial", which carries no font
+    /// data) by name in /usr/share/fonts, and none of the names it tries is there: text drawn
+    /// with it doesn't show (Zandvox, Sector Plural Zed: Unity 4.3, buttons without labels).
+    /// The names it tries.
+    UnityFont(Vec<&'static str>),
     /// The program has the C++ standard library built in and exports it; the system's copy,
     /// loaded later by the graphics driver, then gets the old functions and crashes (2:22AM).
     /// The system's libstdc++ to preload, if found.
@@ -337,6 +351,7 @@ pub fn check(game: &Game, system: &System) -> Report {
                 problems.push(Problem::Java { file: f.path.clone(), java });
             }
             Some(f) if matches!(f.binary, Binary::Flash) => problems.push(Problem::Flash { file: f.path.clone(), ruffle: system.ruffle() }),
+            Some(f) if matches!(f.binary, Binary::Tic) => problems.push(Problem::Tic { file: f.path.clone(), tic80: system.tic80() }),
             Some(f) if matches!(f.binary, Binary::Dos) => problems.push(Problem::Dos { file: f.path.clone(), dosbox: system.dosbox() }),
             Some(f) => {
                 let python = game.files.iter().filter_map(|f| match &f.binary {
@@ -524,6 +539,26 @@ pub fn check(game: &Game, system: &System) -> Report {
             (if at_start { &mut missing } else { &mut later }).entry(lib.clone()).or_default().push(path.clone());
         }
     }
+    // The window may come from any of the game's own files: OpenFL's lime.ndll and SDL2
+    // builds load X11 themselves, and .NET, Haxe and Lisp runtimes use termios too.
+    let window = |e: &Elf| e.needed.iter().any(|l| WINDOW_LIBS.iter().any(|w| l.starts_with(w)));
+    // Text games are small, and bundled window libraries show in their names (libSDL2-2.0.so.0,
+    // OpenFL's lime.ndll): both rule out reading big runtimes (.NET, OpenRA) for nothing.
+    let bundled_window = game.files.iter().filter_map(|f| f.path.file_name()).map(|n| n.to_string_lossy()).any(|n| WINDOW_LIBS.iter().any(|w| n.starts_with(w)) || n.ends_with(".ndll"));
+    let small = same.iter().map(|(p, _)| std::fs::metadata(game.root.join(p)).map_or(0, |m| m.len())).sum::<u64>() < 64 << 20;
+    if game.engine.is_none() && small && !bundled_window && !elf.packed && !elf.pyinstaller && !elf.needed.is_empty() && !same.iter().any(|(_, e)| window(e)) {
+        let needed: Vec<&String> = same.iter().filter(|(p, _)| startup.contains(p)).flat_map(|(_, e)| &e.needed).collect();
+        let curses = needed.iter().any(|l| ["libncurses", "libtinfo", "libcurses"].iter().any(|c| l.starts_with(c)));
+        // Names of window libraries its files may load later (dlopen), read only when it sets
+        // the terminal up at all.
+        let names: Vec<Vec<u8>> = WINDOW_LIBS.iter().flat_map(|w| [format!("{w}.so"), format!("{w}-")]).map(String::into_bytes).collect();
+        let names: Vec<&[u8]> = names.iter().map(Vec::as_slice).collect();
+        let termios = curses || binary::contains(&game.full(main), b"\0tcsetattr\0");
+        if termios && !same.iter().any(|(p, _)| binary::find_groups(&game.root.join(p), &[&names])[0]) {
+            let old_curses = needed.iter().any(|l| ["libncurses.so.5", "libncursesw.so.5", "libtinfo.so.5"].contains(&l.as_str()));
+            problems.push(Problem::Terminal { old_curses });
+        }
+    }
     // A program needing only glibc's parts may load the rest itself, by names it keeps as text
     // (D's Derelict bindings: Blue Bug Bob quit with "libSDL2_image.so ... cannot open shared
     // object file"). It needs one of each list at start.
@@ -536,6 +571,24 @@ pub fn check(game: &Game, system: &System) -> Report {
             // The versioned name, as packages and Steam's runtime carry it.
             if let Some(name) = names.iter().filter(|n| !n.contains('/')).max_by_key(|n| n.matches('.').count()) {
                 missing.entry(name.clone()).or_default().push(main.path.clone());
+            }
+        }
+    }
+    // A LuaJIT game loads its libraries from Lua (`ffi.load "GLee"`), by the unversioned names
+    // only development packages install (Phone Fighter: libGLee.so, libSDL.so). The game's own
+    // ones are found through its launcher's LD_LIBRARY_PATH.
+    let luajit = main.path.file_name().is_some_and(|n| n.to_string_lossy().starts_with("luajit")) || elf.needed.iter().any(|l| l.starts_with("libluajit"));
+    if luajit {
+        let own: HashSet<String> = game.files.iter().filter_map(|f| f.path.file_name()).map(|n| n.to_string_lossy().into_owned()).collect();
+        for (lib, file) in lua_ffi_libs(&game.root) {
+            let found = own.contains(&lib) || system.has(&lib, elf.bits) || system.old_runtime.as_ref().is_some_and(|r| r.has(&lib, elf.bits));
+            if !found && !missing.contains_key(&lib) {
+                // A versioned copy the game ships (libGLEW.so.1.11 for "GLEW"): what the name
+                // pointed to on the developer's system.
+                if let Some(copy) = game.files.iter().find(|f| f.path.file_name().is_some_and(|n| n.to_string_lossy().starts_with(&format!("{lib}.")))) {
+                    misplaced.insert(lib.clone(), copy.path.parent().unwrap_or(Path::new("")).to_path_buf());
+                }
+                missing.entry(lib).or_default().push(file);
             }
         }
     }
@@ -645,12 +698,38 @@ pub fn check(game: &Game, system: &System) -> Report {
         .filter_map(|(n, p)| n.map(|n| (n, p)))
         .collect();
     if !first.is_empty() {
-        let mut users: BTreeSet<&String> = BTreeSet::new();
+        let mut users: BTreeSet<String> = BTreeSet::new();
         for (_, e) in &same {
-            users.extend(e.needed.iter().filter(|l| !by_name.contains_key(OsStr::new(l.as_str())) && system.has(l, elf.bits) && !glibc_part(l)));
+            users.extend(e.needed.iter().filter(|l| !by_name.contains_key(OsStr::new(l.as_str())) && system.has(l, elf.bits) && !glibc_part(l)).cloned());
+        }
+        // And system libraries the game loads by way of others, which the walk can't see: the
+        // sound server's client loaded by the game's SDL or OpenAL brings libsndfile, which then
+        // gets Star Turtle 64's bundled libmpg123 (run.sh puts it first) and fails on
+        // mpg123_info2. Only for what PulseAudio, PipeWire and ALSA load: a check against
+        // every system library that needs the name named copies the game never loads.
+        let sound = ["libpulse.so.0", "libpulse-simple.so.0", "libasound.so.2", "libpipewire-0.3.so.0"];
+        // Followed through RUNPATHs too: libpulse finds libpulsecommon in /usr/lib64/pulseaudio.
+        let mut queue: Vec<(String, PathBuf)> = sound.iter().filter_map(|l| Some((l.to_string(), PathBuf::from(system.path(l, elf.bits)?)))).collect();
+        let mut closure: BTreeSet<String> = BTreeSet::new();
+        while let Some((lib, path)) = queue.pop() {
+            if !closure.insert(lib) {
+                continue;
+            }
+            if let Some(Binary::Elf(e)) = binary::identify(&path) {
+                for l in e.needed.iter().filter(|l| !glibc_part(l)) {
+                    let found = system.path(l, elf.bits).map(PathBuf::from).or_else(|| e.runpath.iter().map(|d| Path::new(d).join(l)).find(|p| p.is_file()));
+                    if let Some(p) = found {
+                        queue.push((l.clone(), p));
+                    }
+                }
+            }
+        }
+        let loads_sound = same.iter().any(|(_, e)| e.needed.iter().any(|l| ["libSDL2", "libSDL-1.2", "libopenal", "libpulse", "libasound"].iter().any(|s| l.starts_with(s))));
+        if loads_sound {
+            users.extend(closure.into_iter().filter(|l| !by_name.contains_key(OsStr::new(l.as_str()))));
         }
         let mut seen: BTreeSet<&String> = BTreeSet::new();
-        for user in users {
+        for user in &users {
             let Some(user_path) = system.path(user, elf.bits) else { continue };
             let Some(Binary::Elf(user_elf)) = binary::identify(Path::new(user_path)) else { continue };
             let Some(user_syms) = binary::symbols(Path::new(user_path)) else { continue };
@@ -680,7 +759,10 @@ pub fn check(game: &Game, system: &System) -> Report {
     // Unity 4 players have it too, but run fine (Succulent, Forever, Hurt Me Plenty); Unity 5.0
     // crashes (2:22AM, Flail Rider).
     let unity4 = game.engine.as_ref().is_some_and(|e| e.name == "Unity" && e.version.as_deref().is_some_and(|v| v.starts_with("4.")));
-    if !unity4 && !elf.needed.iter().any(|l| l == "libstdc++.so.6") && binary::symbols(&game.full(main)).is_some_and(|s| s.defined.iter().any(|d| d.starts_with("_ZNSt8ios_base4Init"))) {
+    // Flash Player's projector has one too, and crashes with the system's preloaded ("free():
+    // invalid size": Ending); without it, it runs.
+    let projector = game.engine.as_ref().is_some_and(|e| e.name == "Flash Player projector");
+    if !unity4 && !projector && !elf.needed.iter().any(|l| l == "libstdc++.so.6") && binary::symbols(&game.full(main)).is_some_and(|s| s.defined.iter().any(|d| d.starts_with("_ZNSt8ios_base4Init"))) {
         problems.push(Problem::OwnLibstdcxx(system.path("libstdc++.so.6", elf.bits).map(String::from)));
     }
     let mut startup_files: Vec<&PathBuf> = startup.iter().copied().filter(|p| !p.to_string_lossy().contains("libharfbuzz")).collect();
@@ -726,7 +808,14 @@ pub fn check(game: &Game, system: &System) -> Report {
     if old_unity.is_some_and(|v| v < (5, 4)) {
         problems.push(Problem::UnitySingleInstance);
     }
-    if game.engine.as_ref().is_some_and(|e| e.name == "Unity") {
+    // Unity 5.0.1 and newer fall back to fonts Linux systems have (Liberation Sans, then
+    // Droid and Noto); 2017 and newer draw text here too (Karlson, Baldi's Basics), with the
+    // names in UnityPlayer.so not readable as text, so only 4.x and 5.0 players are read.
+    if old_unity.is_some_and(|v| v <= (5, 0)) {
+        let player = [main_dir.join("UnityPlayer.so"), game.full(main)].into_iter().find(|p| p.is_file());
+        if let Some(names) = player.and_then(|p| unity_missing_font(&p)) {
+            problems.push(Problem::UnityFont(names));
+        }
         let videos = h264_videos(&game.root, &main.path);
         if !videos.is_empty() {
             problems.push(Problem::UnityH264(videos));
@@ -752,6 +841,102 @@ fn chromium_version(path: &Path) -> Option<String> {
         }
     }
     counts.into_iter().max_by_key(|&(_, n)| n).map(|(s, _)| String::from_utf8_lossy(s).into_owned())
+}
+
+/// Libraries a program opens a window or draws with. One that loads none at start and names
+/// none for loading later, but uses ncurses or sets the terminal up itself, is a text game.
+const WINDOW_LIBS: &[&str] = &[
+    "libX11", "libxcb", "libGL", "libEGL", "libOpenGL", "libvulkan", "libwayland", "libSDL", "libglfw", "libgtk", "libgdk", "libQt", "libsfml-window",
+    "libsfml-graphics", "liballegro", "libraylib", "libglut", "libnw", "libcef", "liblove", "libIrrlicht", "libOgre",
+];
+
+/// Libraries a LuaJIT game's Lua code loads (`ffi.load "name"`), as file names the way LuaJIT
+/// makes them ("GLee" → libGLee.so), with the file whose code asks: loose .lua files and those
+/// inside zips near the top (Phone Fighter keeps its code in rom.zip beside bin/luajit's folder). Only the last
+/// quoted name in a call counts: `ffi.load((pandora and "SDL-1.2.so.0") or "SDL")`. Names with
+/// a folder are the developer's own paths.
+fn lua_ffi_libs(root: &Path) -> Vec<(String, PathBuf)> {
+    let mut sources: Vec<(PathBuf, String)> = Vec::new();
+    let mut todo = vec![(root.to_path_buf(), 0)];
+    while let Some((d, depth)) = todo.pop() {
+        for entry in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            let path = entry.path();
+            let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+            if path.is_dir() && depth < 3 {
+                todo.push((path, depth + 1));
+            } else if ext == "lua" {
+                sources.push((path.clone(), scan::lua_without_comments(&std::fs::read_to_string(&path).unwrap_or_default())));
+            } else if ext == "zip" && depth <= 1 {
+                let out = std::process::Command::new("unzip").arg("-p").arg(&path).arg("*.lua").stderr(std::process::Stdio::null()).output();
+                sources.push((path.clone(), scan::lua_without_comments(&out.map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default())));
+            }
+        }
+    }
+    let mut out: Vec<(String, PathBuf)> = Vec::new();
+    for (path, code) in sources {
+        for (at, _) in code.match_indices("ffi.load") {
+            let rest = &code[at + 8..];
+            // The call's text: a bare string (`ffi.load "x"`) or up to the closing parenthesis.
+            let call = if rest.trim_start().starts_with('(') {
+                let mut level = 0;
+                let end = rest.char_indices().find(|&(_, c)| {
+                    level += (c == '(') as i32 - (c == ')') as i32;
+                    c == ')' && level == 0
+                });
+                &rest[..end.map_or(rest.len().min(400), |(i, _)| i)]
+            } else {
+                rest.lines().next().unwrap_or("")
+            };
+            let strings: Vec<&str> = call.split(['"', '\'']).skip(1).step_by(2).collect();
+            let Some(name) = strings.last().filter(|n| !n.is_empty() && !n.contains('/') && !n.contains(char::is_whitespace)) else { continue };
+            let mut lib = if name.contains('.') { name.to_string() } else { format!("{name}.so") };
+            if !lib.starts_with("lib") {
+                lib = format!("lib{lib}");
+            }
+            let rel = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
+            if !out.iter().any(|(l, _)| l == &lib) {
+                out.push((lib, rel));
+            }
+        }
+    }
+    out
+}
+
+/// Names Unity players look for in /usr/share/fonts for their built-in font: Arial, then
+/// (4.6.8 and 5.0.1 on) Liberation Sans, later DejaVu, Droid and Noto CJK. Players before
+/// those have only Arial and FreeSans, neither of which Fedora (Bazzite) installs.
+const UNITY_FONTS: &[&str] = &["Arial", "Liberation Sans", "DejaVu Sans", "FreeSans", "Droid Sans", "Droid Sans Fallback", "Noto Sans CJK JP", "Noto Sans CJK SC"];
+
+/// The names a Unity player tries for its built-in font, when it looks in /usr/share/fonts
+/// and finds none of them there (its own list, as text in the player).
+fn unity_missing_font(player: &Path) -> Option<Vec<&'static str>> {
+    let data = std::fs::read(player).ok()?;
+    let needles: Vec<(usize, &[u8])> = UNITY_FONTS.iter().map(|n| n.as_bytes()).chain([&b"/usr/share/fonts"[..]]).enumerate().collect();
+    let found = binary::find_any(&data, &needles);
+    if !found.contains(&UNITY_FONTS.len()) {
+        return None;
+    }
+    let names: Vec<&str> = UNITY_FONTS.iter().enumerate().filter(|(i, _)| found.contains(i)).map(|(_, n)| *n).collect();
+    let installed = system_fonts()?;
+    (!names.iter().any(|n| installed.contains(*n))).then_some(names)
+}
+
+/// Family names of the fonts in /usr/share/fonts, from fontconfig (None without fc-list).
+fn system_fonts() -> Option<&'static BTreeSet<String>> {
+    static FONTS: std::sync::OnceLock<Option<BTreeSet<String>>> = std::sync::OnceLock::new();
+    FONTS
+        .get_or_init(|| {
+            let out = std::process::Command::new("fc-list").args(["--format", "%{file}\t%{family}\n"]).output().ok().filter(|o| o.status.success())?;
+            Some(
+                String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .filter_map(|l| l.split_once('\t'))
+                    .filter(|(file, _)| file.starts_with("/usr/share/fonts/"))
+                    .flat_map(|(_, families)| families.split(',').map(str::to_string).collect::<Vec<_>>())
+                    .collect(),
+            )
+        })
+        .as_ref()
 }
 
 /// Native libraries an FNA game maps to in FNA.dll.config (os="linux") that aren't in its lib64/
@@ -1099,6 +1284,7 @@ impl Report {
                 (Binary::Python(p), _) if p.v2 => "Python 2 game".into(),
                 (Binary::Jar, _) => "Java game".into(),
                 (Binary::Flash, _) => "Flash game".into(),
+                (Binary::Tic, _) => "TIC-80 cartridge".into(),
                 (Binary::Dos, _) => "DOS game".into(),
                 (Binary::Script, _) if scan::install4j_script(&game.root, &f.path) => "Java game, install4j launcher".into(),
                 (Binary::Script, _) => "Processing game, runs with Java".into(),
@@ -1265,6 +1451,16 @@ impl Report {
                     let _ = writeln!(out, "✗ This is a Flash game ({}): Flash Player was retired in 2020.", file.display());
                     let _ = writeln!(out, "    Fix: Ruffle from Flathub (rs.ruffle.Ruffle) plays most Flash games: gamefix setup offers to");
                     let _ = writeln!(out, "    install it, then adds the game to the app menu or Steam.");
+                }
+                Problem::Tic { file, tic80: Some(tic80) } => {
+                    let _ = writeln!(out, "• This is a TIC-80 game (a cartridge for that fantasy console); TIC-80 is installed:");
+                    let _ = writeln!(out, "  {} \"{}\"", tic80.join(" "), file.display());
+                    let _ = writeln!(out, "  gamefix setup adds that to the app menu.");
+                }
+                Problem::Tic { file, tic80: None } => {
+                    let _ = writeln!(out, "✗ This is a TIC-80 game ({}): a cartridge for that fantasy console, not a program.", file.display());
+                    let _ = writeln!(out, "    Fix: TIC-80 from Flathub (com.tic80.TIC_80) plays it: gamefix setup offers to install it,");
+                    let _ = writeln!(out, "    then adds the game to the app menu or Steam.");
                 }
                 Problem::CdFiles { installer } => {
                     let _ = writeln!(out, "• These are a Windows game CD's files; its installer is {}.", installer.display());
@@ -1730,6 +1926,17 @@ impl Report {
                     let _ = writeln!(out, "  which Unity's Linux player can't decode (it plays VP8/WebM only). The game still runs:");
                     list(&mut out, files);
                     let _ = writeln!(out, "    Fix: if the game has a Windows download, that with Proton plays them.");
+                }
+                Problem::UnityFont(names) => {
+                    let _ = writeln!(out, "✗ Its text may not show: this Unity player draws its built-in font with a system font named");
+                    let _ = writeln!(out, "  {}, which it looks for in /usr/share/fonts only, and this system has none of them.", names.join(" or "));
+                    let _ = writeln!(out, "  Menus and labels drawn with it come out blank (Zandvox, Sector Plural Zed).");
+                    let _ = writeln!(out, "    Fix (at launch): a copy of Liberation Sans named Arial, shown to the game in that folder");
+                    let _ = writeln!(out, "    (gamefix setup does that with bwrap; /usr itself isn't changed).");
+                }
+                Problem::Terminal { .. } => {
+                    let _ = writeln!(out, "• It's a text game: it draws in a terminal, not a window, so started without one it");
+                    let _ = writeln!(out, "  quits at once. gamefix setup's menu entry opens a terminal for it (Steam can't).");
                 }
                 Problem::UnitySingleInstance => {
                     let _ = writeln!(out, "✗ Unity before 5.4 may quit at once with \"Player is already running\" while Steam or");

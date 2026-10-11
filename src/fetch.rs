@@ -16,9 +16,10 @@ use std::process::{Command, Stdio};
 const DEBIAN_SUITES: [&str; 3] = ["bookworm", "trixie", "bullseye"];
 
 /// Ubuntu releases still in its archive, oldest first. packages.ubuntu.com no longer lists
-/// 18.04, so these are searched through each release's own index files (cached). 16.04 last,
-/// only for what the newer ones dropped (Allegro 5.0: Mediator); its indexes are 45 MB more.
-const UBUNTU_SUITES: [&str; 4] = ["bionic", "focal", "jammy", "xenial"];
+/// 18.04, so these are searched through each release's own index files (cached). 16.04 then
+/// 14.04 last, only for what the newer ones dropped (Allegro 5.0: Mediator; SFML 2.1's
+/// libsfml-*.so.2: Quadtriad); their indexes are 40-45 MB more each.
+const UBUNTU_SUITES: [&str; 5] = ["bionic", "focal", "jammy", "xenial", "trusty"];
 
 pub struct Fetched {
     /// Files written into the folder (libraries and their links), for undo.
@@ -198,6 +199,23 @@ fn copy_libs(root: &Path, bits: u8, dest: &Path, files: &mut Vec<PathBuf>) {
 fn needs(dest: &Path, bits: u8, system: &System, runtime: &mut bool) -> Vec<String> {
     let mut out = BTreeSet::new();
     for entry in fs::read_dir(dest).into_iter().flatten().flatten() {
+        // A development package's unversioned link (libGLee.so → libglee.so.0d1, for a game
+        // that loads that name itself): pointed at the system's or Steam's runtime's copy of
+        // the library it names, else that library is fetched too.
+        if let (Ok(target), false) = (fs::read_link(entry.path()), entry.path().exists()) {
+            let Some(name) = target.file_name().map(|n| n.to_string_lossy().into_owned()) else { continue };
+            let elsewhere = system.path(&name, bits).map(PathBuf::from).or_else(|| system.old_runtime.as_ref().and_then(|r| r.path(&name, bits)).inspect(|_| *runtime = true));
+            match elsewhere {
+                Some(path) => {
+                    let _ = fs::remove_file(entry.path());
+                    let _ = std::os::unix::fs::symlink(path, entry.path());
+                }
+                None => {
+                    out.insert(name);
+                }
+            }
+            continue;
+        }
         if let Some(Binary::Elf(elf)) = binary::identify(&entry.path()) {
             for lib in elf.needed.iter().filter(|l| elf.bits == bits && !system.has(l, bits) && !dest.join(l).exists()) {
                 if system.old_runtime.as_ref().is_some_and(|r| r.has(lib, bits)) {

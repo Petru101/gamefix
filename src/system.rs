@@ -171,6 +171,19 @@ impl System {
         std::env::split_paths(&path).map(|d| d.join("ruffle")).find(|l| l.is_file()).map(|l| vec![l.display().to_string()])
     }
 
+    /// How to start TIC-80, which plays .tic cartridges: Flathub's (it can read the home folder
+    /// only, so setup adds the game's folder) or a `tic80` on the PATH. `--skip` leaves out
+    /// its start-up animation.
+    pub fn tic80(&self) -> Option<Vec<String>> {
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+        let flatpak = [PathBuf::from("/var/lib/flatpak"), home.join(".local/share/flatpak")].iter().any(|d| d.join("app/com.tic80.TIC_80/current").exists());
+        if flatpak {
+            return Some(vec!["flatpak".into(), "run".into(), "com.tic80.TIC_80".into(), "--skip".into()]);
+        }
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        std::env::split_paths(&path).map(|d| d.join("tic80")).find(|l| l.is_file()).map(|l| vec![l.display().to_string(), "--skip".into()])
+    }
+
     /// How to start DOSBox: Flathub's DOSBox Staging (it can read the home folder only, so
     /// setup adds the game's folder), else a `dosbox` on the PATH (Staging or the original).
     pub fn dosbox(&self) -> Option<Vec<String>> {
