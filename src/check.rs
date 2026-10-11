@@ -75,6 +75,10 @@ pub enum Problem {
     /// loaded later by the graphics driver, then gets the old functions and crashes (2:22AM).
     /// The system's libstdc++ to preload, if found.
     OwnLibstdcxx(Option<String>),
+    /// A PyInstaller build carrying its own libstdc++.so.6, which goes first; Mesa's GL driver
+    /// needs the system's newer one and isn't loaded: "Couldn't find matching GLX visual" from
+    /// SDL (Skeletris, RESYNC). The system's copy to preload.
+    BundledLibstdcxx(Option<String>),
     /// A start-up file exporting its own HarfBuzz: the system's pango (through GTK) then gets
     /// those old functions and crashes (JK Assassins, NW.js with Chromium 48). What to preload
     /// (LD_PRELOAD's value), and whether the program itself exports it: then preloading the
@@ -112,6 +116,10 @@ pub enum Problem {
     /// .NET Core before 5 only looks for older ICU versions than current systems have, and
     /// quits at start (The Heart's Illumination, 2.1).
     DotnetIcu(String),
+    /// A framework-dependent .NET program (no libhostfxr.so beside it; its runtimeconfig.json
+    /// names the framework) and no .NET runtime of that major version installed: Incremental
+    /// Unlimited ("the required library libhostfxr.so could not be found", .NET Core 2.1).
+    DotnetRuntime(String),
     /// A self-contained .NET program whose deps.json lists static libraries (.a) the download
     /// left out; the host refuses to start while any listed file is missing, though .a files
     /// are only for building and never loaded (Sokoban, 3.1.11: System.IO.Compression.Native.a
@@ -339,6 +347,17 @@ pub fn check(game: &Game, system: &System) -> Report {
     }
     report.packed = elf.packed;
     report.pyinstaller = elf.pyinstaller && system.refuses_exec_stack();
+    // Nearly every PyInstaller pygame build carries libstdc++, harmless while SDL draws without
+    // OpenGL; ones drawing through PyOpenGL load the driver (Tempest Run's runs anyway: its
+    // libstdc++ may be newer, which can't be read from the packed copy; the preload is harmless).
+    if elf.pyinstaller {
+        let dir = game.full(main).parent().map(Path::to_path_buf).unwrap_or_default();
+        let beside = dir.join("libstdc++.so.6").is_file() || dir.join("_internal/libstdc++.so.6").is_file();
+        let opengl = || dir.join("OpenGL").is_dir() || dir.join("_internal/OpenGL").is_dir() || binary::contains(&game.full(main), b"OpenGL.GL");
+        if (beside || binary::bundle_names(&game.full(main)).is_some_and(|n| n.iter().any(|n| n == "libstdc++.so.6"))) && opengl() {
+            problems.push(Problem::BundledLibstdcxx(system.path("libstdc++.so.6", elf.bits).map(String::from)));
+        }
+    }
     let mode = std::fs::metadata(game.full(main)).map(|m| m.permissions().mode()).unwrap_or(0);
     if mode & 0o100 == 0 {
         problems.push(Problem::NotExecutable(main.path.clone()));
@@ -588,6 +607,9 @@ pub fn check(game: &Game, system: &System) -> Report {
     if let Some(version) = old_dotnet(&main_dir, &main.path) {
         problems.push(Problem::DotnetIcu(version));
     }
+    if let Some(version) = dotnet_framework(&main_dir, &main.path).filter(|v| !dotnet_installed(v)) {
+        problems.push(Problem::DotnetRuntime(version));
+    }
     let statics = dotnet_missing_static(&main_dir, &main.path);
     if !statics.is_empty() {
         problems.push(Problem::DotnetStatic(statics));
@@ -756,6 +778,34 @@ fn dotnet_core_version(dir: &Path, main: &Path) -> Option<String> {
     };
     let at = deps.find(".NETCoreApp,Version=v")? + ".NETCoreApp,Version=v".len();
     Some(deps[at..].chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect())
+}
+
+/// The .NET version a framework-dependent program asks for: its runtimeconfig.json names
+/// Microsoft.NETCore.App under "framework" ("frameworks" from .NET 7), and libhostfxr.so isn't
+/// beside it (a self-contained one brings it; a single-file one has its own runtimeconfig inside).
+fn dotnet_framework(dir: &Path, main: &Path) -> Option<String> {
+    let stem = main.file_name()?.to_string_lossy().into_owned();
+    if dir.join("libhostfxr.so").is_file() {
+        return None;
+    }
+    let config = std::fs::read_to_string(dir.join(format!("{stem}.runtimeconfig.json"))).ok()?;
+    let at = config.find("\"Microsoft.NETCore.App\"")?;
+    let rest = &config[at..];
+    let v = rest.find("\"version\"").map(|i| &rest[i + 9..])?;
+    let v = v.trim_start_matches([' ', ':', '\n', '\r', '\t', '"']);
+    Some(v.chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect()).filter(|v: &String| !v.is_empty())
+}
+
+/// Whether a .NET runtime of that major version is in one of the usual places (its default
+/// roll-forward takes a newer minor or patch, not a newer major).
+fn dotnet_installed(version: &str) -> bool {
+    let major = version.split('.').next().unwrap_or("");
+    let mut roots: Vec<PathBuf> = ["/usr/share/dotnet", "/usr/lib64/dotnet", "/usr/lib/dotnet", "/opt/dotnet"].iter().map(PathBuf::from).collect();
+    roots.extend(std::env::var_os("DOTNET_ROOT").map(PathBuf::from));
+    roots.extend(std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".dotnet")));
+    roots.iter().any(|r| {
+        std::fs::read_dir(r.join("shared/Microsoft.NETCore.App")).is_ok_and(|d| d.flatten().any(|e| e.file_name().to_string_lossy().split('.').next() == Some(major)))
+    })
 }
 
 /// Its major version.
@@ -1335,6 +1385,20 @@ impl Report {
                         }
                     }
                 }
+                Problem::BundledLibstdcxx(preload) => {
+                    let _ = writeln!(out, "✗ It draws with OpenGL from Python, and its bundle brings its own copy of the C++ standard");
+                    let _ = writeln!(out, "  library, which goes first. If that's older than what the graphics driver (Mesa: AMD,");
+                    let _ = writeln!(out, "  Intel) needs, the driver doesn't load and no window opens (\"Couldn't find matching GLX");
+                    let _ = writeln!(out, "  visual\": Skeletris, RESYNC).");
+                    match preload {
+                        Some(p) => {
+                            let _ = writeln!(out, "    Fix (at launch): LD_PRELOAD={p}");
+                        }
+                        None => {
+                            let _ = writeln!(out, "    Fix (at launch): preload the system's libstdc++.so.6 (not found here).");
+                        }
+                    }
+                }
                 Problem::OwnLibstdcxx(preload) => {
                     let _ = writeln!(out, "✗ The program has its own old copy of the C++ standard library built in. When the graphics");
                     let _ = writeln!(out, "  driver loads the system's copy, that one gets the program's old functions and the game");
@@ -1404,6 +1468,13 @@ impl Report {
                     let _ = writeln!(out, "  while any listed file is missing (\"An assembly specified in the application dependencies");
                     let _ = writeln!(out, "  manifest ... was not found\").");
                     let _ = writeln!(out, "    Fix (once): empty files with those names next to the program (gamefix setup makes them).");
+                }
+                Problem::DotnetRuntime(version) => {
+                    let _ = writeln!(out, "✗ It was published without .NET: it needs Microsoft's .NET runtime {version} installed, and");
+                    let _ = writeln!(out, "  there's none here, so it quits at once (\"libhostfxr.so could not be found\").");
+                    let _ = writeln!(out, "    Fix: Microsoft's dotnet-install script (dot.net/v1/dotnet-install.sh, --runtime dotnet");
+                    let _ = writeln!(out, "    --version {version}) puts it in ~/.dotnet, and the game starts with DOTNET_ROOT=~/.dotnet.");
+                    let _ = writeln!(out, "    Older versions get no security fixes; a Windows build with Proton avoids that.");
                 }
                 Problem::DotnetIcu(version) => {
                     let _ = writeln!(out, "✗ It's built on .NET Core {version}, which only looks for older versions of the ICU library");

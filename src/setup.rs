@@ -235,6 +235,12 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
                 preload.push(path.clone());
                 done.push("Loads the system's C++ library first, so the graphics driver doesn't crash the game (at launch).".into());
             }
+            Problem::BundledLibstdcxx(Some(path)) => {
+                preload.push(path.clone());
+                done.push("Loads the system's C++ library first, so the graphics driver can load (at launch).".into());
+            }
+            Problem::DotnetRuntime(version) => not_fixed.push(format!("It needs Microsoft's .NET runtime {version} installed (see gamefix check).")),
+            Problem::BundledLibstdcxx(None) => not_fixed.push("Its bundled C++ library: the system's libstdc++.so.6 to preload wasn't found.".into()),
             Problem::OwnHarfbuzz(_, Some(path), false) => {
                 preload.push(path.clone());
                 done.push("Loads the system's HarfBuzz first, so its text libraries don't get the game's old copy (at launch).".into());

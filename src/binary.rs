@@ -315,7 +315,8 @@ pub fn passes_file(script: &Path, program: &str) -> bool {
         }
         let arg = rest.split_whitespace().next().unwrap_or("").trim_matches(['"', '\'']);
         let arg = if arg.starts_with('$') { arg.rsplit('/').next().unwrap_or("") } else { arg };
-        !arg.is_empty() && !arg.starts_with(['-', '$']) && dir.join(arg).is_file()
+        // Not the program itself (`ln -s $lib_dir/<name> $bin_dir/<name>`).
+        !arg.is_empty() && !arg.starts_with(['-', '$']) && arg != program && dir.join(arg).is_file()
     })
 }
 
@@ -472,6 +473,43 @@ fn elf(f: &mut File, h: &[u8]) -> Option<Elf> {
     f.read_to_end(&mut end).ok()?;
     let pyinstaller = end.windows(8).any(|w| w == b"MEI\x0c\x0b\x0a\x0b\x0e");
     Some(Elf { bits, machine, program, needed, rpath, runpath, packed, pyinstaller, exec_stack })
+}
+
+const MEI_COOKIE: &[u8] = b"MEI\x0c\x0b\x0a\x0b\x0e";
+/// The cookie: magic, archive length, table of contents' offset and length (both from the
+/// archive's start), Python version, Python library name (64 bytes).
+const COOKIE_LEN: usize = 88;
+
+fn be32(b: &[u8], at: usize) -> usize {
+    u32::from_be_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]) as usize
+}
+
+/// The names of the files packed in a PyInstaller bundle's archive (one-file: the libraries
+/// too; a folder build's holds only Python code).
+pub fn bundle_names(path: &Path) -> Option<Vec<String>> {
+    let data = std::fs::read(path).ok()?;
+    // The cookie ends the archive: at the end of the file, or of its ELF section (newer
+    // PyInstaller: `pydata`), which the section headers follow.
+    let tail = data.len().saturating_sub(1 << 20);
+    let cookie = tail + data[tail..].windows(MEI_COOKIE.len()).rposition(|w| w == MEI_COOKIE)?;
+    if cookie + COOKIE_LEN > data.len() {
+        return None;
+    }
+    let start = (cookie + COOKIE_LEN).checked_sub(be32(&data, cookie + 8))?;
+    let (at, len) = (start + be32(&data, cookie + 12), be32(&data, cookie + 16));
+    let toc = data.get(at..at + len)?;
+    let mut names = Vec::new();
+    let mut pos = 0;
+    // Each entry: its length, data offset, packed and unpacked size, compressed flag, type, name.
+    while pos + 18 <= toc.len() {
+        let len = be32(toc, pos);
+        if len < 18 || pos + len > toc.len() {
+            return None;
+        }
+        names.push(String::from_utf8_lossy(&toc[pos + 18..pos + len]).trim_end_matches('\0').to_string());
+        pos += len;
+    }
+    Some(names)
 }
 
 /// The DLLs a Windows program or library needs to start (delay-loaded ones, loaded the first

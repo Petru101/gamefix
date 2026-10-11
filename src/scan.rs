@@ -9,7 +9,7 @@ const MAX_DEPTH: usize = 8;
 const MAX_FILES: usize = 50_000;
 
 /// Programs that ship next to games but aren't the game.
-const NOT_THE_GAME: &[&str] = &["crashhandler", "crashpad", "createdump", "crashreport", "chrome-sandbox", "unins", "redist", "vc_redist", "dxsetup", "steamwebhelper", "quicksfv", "nacl_helper", "nwjc", "chromedriver", "minidump_stackwalk"];
+const NOT_THE_GAME: &[&str] = &["crashhandler", "crashpad", "createdump", "crashreport", "chrome-sandbox", "unins", "redist", "vc_redist", "dxsetup", "steamwebhelper", "quicksfv", "nacl_helper", "nwjc", "chromedriver", "minidump_stackwalk", "ffmpeg", "ffprobe", "ffplay"];
 
 pub struct Found {
     /// Relative to the game's root.
@@ -65,7 +65,10 @@ impl Game {
                     // Ren'Py's <name>.sh, which starts lib/<platform>/<name> with `-EO <name>.py`:
                     // started alone, Ren'Py 6 and 7 quit ("No module named site": Tunnel Vision).
                     || (f.path.file_stem().is_some_and(|s| s.to_string_lossy() == name) && self.root.join(dir).join(format!("{name}.py")).is_file())
-                    || (dir != main_dir && binary::runs_path(&self.full(f), &name) && !f.path.to_string_lossy().to_lowercase().contains("install")))
+                    || (dir != main_dir && binary::runs_path(&self.full(f), &name)))
+                // Install scripts copy the game elsewhere, naming the program on the way:
+                // Alcarys Complex's chmods it, Pixel Wheels' install.sh links it.
+                && !f.path.file_name().is_some_and(|n| n.to_string_lossy().to_lowercase().contains("install"))
                 // Not one starting it through a bundled ld.so (Exodus: Liberation Circuit), which
                 // setup bypasses on purpose.
                 && !binary::contains(&self.full(f), b"--library-path")
