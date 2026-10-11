@@ -1,11 +1,13 @@
 mod binary;
 mod check;
 mod disc;
+mod dotnet;
 mod fetch;
 mod font;
 mod love;
 mod proton;
 mod python;
+mod rpgmaker;
 mod rightclick;
 mod scan;
 mod setup;

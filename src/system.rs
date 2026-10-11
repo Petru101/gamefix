@@ -204,6 +204,20 @@ impl System {
         std::env::split_paths(&path).map(|d| d.join("mgba-qt")).find(|l| l.is_file()).map(|l| vec![l.display().to_string()])
     }
 
+    /// How to start EasyRPG Player, which plays RPG Maker 2000/2003 games: Flathub's (it sees
+    /// the home folder; setup adds the game's), its player itself, since the Flatpak's own
+    /// command runs a folder-picking wizard on first start even when given a game; else an
+    /// `easyrpg-player` on the PATH. The game's folder goes after `--project-path`.
+    pub fn easyrpg(&self) -> Option<Vec<String>> {
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+        let flatpak = [PathBuf::from("/var/lib/flatpak"), home.join(".local/share/flatpak")].iter().any(|d| d.join("app/org.easyrpg.player/current").exists());
+        if flatpak {
+            return Some(vec!["flatpak".into(), "run".into(), "--command=org.easyrpg.player.real".into(), "org.easyrpg.player".into()]);
+        }
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        std::env::split_paths(&path).map(|d| d.join("easyrpg-player")).find(|l| l.is_file()).map(|l| vec![l.display().to_string()])
+    }
+
     /// How to start DOSBox: Flathub's DOSBox Staging (it can read the home folder only, so
     /// setup adds the game's folder), else a `dosbox` on the PATH (Staging or the original).
     pub fn dosbox(&self) -> Option<Vec<String>> {

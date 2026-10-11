@@ -9,7 +9,7 @@ const MAX_DEPTH: usize = 8;
 const MAX_FILES: usize = 50_000;
 
 /// Programs that ship next to games but aren't the game.
-const NOT_THE_GAME: &[&str] = &["crashhandler", "crashpad", "createdump", "crashreport", "chrome-sandbox", "unins", "redist", "vc_redist", "dxsetup", "steamwebhelper", "quicksfv", "nacl_helper", "nwjc", "chromedriver", "minidump_stackwalk", "ffmpeg", "ffprobe", "ffplay"];
+const NOT_THE_GAME: &[&str] = &["crashhandler", "crashpad", "createdump", "crashreport", "chrome-sandbox", "unins", "redist", "vc_redist", "dxsetup", "steamwebhelper", "quicksfv", "nacl_helper", "nwjc", "chromedriver", "minidump_stackwalk", "ffmpeg", "ffprobe", "ffplay", "oalinst"];
 
 pub struct Found {
     /// Relative to the game's root.
@@ -41,6 +41,9 @@ pub struct Game {
     /// Index into `files` of a Linux installer (MojoSetup) the game is packed in, when there's
     /// no Linux program.
     pub linux_installer: Option<usize>,
+    /// Index into `files` of a package an RPG Maker game is packed in (RPG Maker 2000/2003's
+    /// game disk .lzh, a CAB self-extractor), when there's nothing else to run.
+    pub packed: Option<usize>,
     /// Index into `files` of a disc image to install the game from, when there's nothing else
     /// to run.
     pub disc: Option<usize>,
@@ -118,6 +121,10 @@ pub fn scan(path: &Path) -> Option<Game> {
         files.iter().position(|f| &f.path == c && matches!((&f.binary, want_elf), (Binary::Elf(_), true) | (Binary::Pe(_), false)))
     };
     let main = if chosen.is_some() { picked(true) } else { pick_main(&root, &files) };
+    // A MonoKickstart game whose own parts need .NET Standard, which the Mono it brings lacks
+    // (Mario is Doomed: Comora.dll): its .exe runs on a current Mono instead.
+    let kick = main.and_then(|m| kick_exe(&root, &files, m));
+    let main = if kick.is_some() { None } else { main };
     let windows = match main {
         Some(_) => None,
         None if chosen.is_some() => picked(false),
@@ -127,8 +134,29 @@ pub fn scan(path: &Path) -> Option<Game> {
     let linux_installer = if main.is_none() { files.iter().position(|f| matches!(&f.binary, Binary::Elf(e) if e.mojosetup)) } else { None };
     let windows = if cd_installer.is_some() || linux_installer.is_some() { None } else { windows };
     // A .NET program built for Mono on Linux is run by Mono, not Proton (CraftStudio's exports).
-    let mono = windows.filter(|&i| main.is_none() && mono_build(&root, &files[i]));
-    let windows = if mono.is_some() { None } else { windows };
+    let mono = kick.or_else(|| windows.filter(|&i| main.is_none() && mono_build(&root, &files[i])));
+    // Likewise a .NET program built for any system that brings Linux libraries: Microsoft's
+    // .NET runs it (Anodyne Sharp: MonoGame on .NET 6, runtimes/linux-x64 beside it).
+    let mono = mono.or_else(|| if main.is_none() && chosen.is_none() { dotnet_build(&root, &files) } else { None });
+    // An RPG Maker 2000/2003 game: EasyRPG Player plays it natively, rather than its RPG_RT.exe
+    // under Proton. Nearest the top.
+    let rm2k = if main.is_none() && chosen.is_none() {
+        files.iter().enumerate().filter(|(_, f)| matches!(f.binary, Binary::RpgMaker)).min_by_key(|(_, f)| f.path.components().count()).map(|(i, _)| i)
+    } else {
+        None
+    };
+    let mono = mono.or(rm2k);
+    // An RPG Maker game still in its package: a game disk's .lzh (its Setup.exe would want an
+    // RPG Maker installed), or the picked program being a CAB self-extractor.
+    let packed = if main.is_none() && mono.is_none() && chosen.is_none() {
+        files
+            .iter()
+            .position(|f| matches!(f.binary, Binary::Archive) && f.path.extension().is_some_and(|e| e.eq_ignore_ascii_case("lzh")) && crate::rpgmaker::packed(&root.join(&f.path)).is_some())
+            .or_else(|| windows.filter(|&i| crate::rpgmaker::packed(&root.join(&files[i].path)).is_some()))
+    } else {
+        None
+    };
+    let windows = if mono.is_some() || packed.is_some() { None } else { windows };
     let portable = match main {
         Some(_) => None,
         None if chosen.is_some() => chosen.as_ref().and_then(|c| files.iter().position(|f| &f.path == c && matches!(f.binary, Binary::Love | Binary::Jar | Binary::Flash | Binary::Tic | Binary::Rom(_) | Binary::Python(_) | Binary::Dos))),
@@ -136,7 +164,7 @@ pub fn scan(path: &Path) -> Option<Game> {
         None if mono.is_some() => mono,
         None => pick_portable(&root, &files).or_else(|| if windows.is_none() { pick_dos(&root, &files) } else { None }),
     };
-    let nothing = main.is_none() && windows.is_none() && portable.is_none() && cd_installer.is_none() && linux_installer.is_none();
+    let nothing = main.is_none() && windows.is_none() && portable.is_none() && cd_installer.is_none() && linux_installer.is_none() && packed.is_none();
     let disc = nothing.then(|| files.iter().enumerate().filter(|(_, f)| matches!(f.binary, Binary::Disc)).min_by_key(|(_, f)| f.path.components().count()).map(|(i, _)| i)).flatten();
     let archive = (nothing && disc.is_none())
         .then(|| files.iter().enumerate().filter(|(_, f)| matches!(f.binary, Binary::Archive)).min_by_key(|(_, f)| f.path.components().count()).map(|(i, _)| i))
@@ -152,6 +180,7 @@ pub fn scan(path: &Path) -> Option<Game> {
             Some(Engine { name: "LÖVE", version, guess })
         }
         Some(i) if matches!(files[i].binary, Binary::Pe(_)) => engine(&root, &files[i].path, &files),
+        Some(i) if matches!(files[i].binary, Binary::RpgMaker) => Some(Engine { name: "RPG Maker 2000/2003", version: None, guess: None }),
         _ => program.and_then(|i| engine(&root, &files[i].path, &files)),
     };
     let name = program
@@ -159,7 +188,7 @@ pub fn scan(path: &Path) -> Option<Game> {
         .or_else(|| chosen.as_ref().filter(|_| shared_folder(&root)).map(|c| stem(c)))
         .or_else(|| root.file_name().map(|n| n.to_string_lossy().into_owned()))
         .unwrap_or_else(|| root.display().to_string());
-    Some(Game { root, name, files, main, windows, portable, cd_installer, linux_installer, disc, archive, engine })
+    Some(Game { root, name, files, main, windows, portable, cd_installer, linux_installer, packed, disc, archive, engine })
 }
 
 /// Folders that hold unrelated downloads rather than one game.
@@ -196,13 +225,16 @@ fn walk(root: &Path, rel: &Path, depth: usize, out: &mut Vec<Found>) {
             let is_exe = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe"));
             // Windows DLLs aren't interesting, and scripts only near the top, where launchers live.
             let keep = match &binary {
-                Binary::Pe(_) => is_exe,
+                // A .NET program built for any system is a .dll with its runtimeconfig.json.
+                Binary::Pe(pe) => is_exe || (pe.dotnet && root.join(path.with_extension("runtimeconfig.json")).is_file()),
                 Binary::Script => depth <= 2,
                 // A .love is never a library; SHARECART1000 jam games keep it two folders down
                 // (`SHARECART1000/CARTFARMER/cartfarmer.love`).
                 Binary::Love => depth <= 3,
                 Binary::Jar | Binary::Flash | Binary::Tic | Binary::Rom(_) | Binary::Python(_) | Binary::Archive | Binary::Package(_) => depth <= 1,
                 Binary::Dos => depth <= 2,
+                // A game disk's .lzh unpacked beside it: `Mouth Sweet Ver 2/Mouth Sweet/RPG_RT.ldb`.
+                Binary::RpgMaker => depth <= 3,
                 Binary::Disc => depth <= 1,
                 Binary::Elf(_) | Binary::Damaged => true,
             };
@@ -280,15 +312,74 @@ fn mono_build(root: &Path, found: &Found) -> bool {
     pe.dotnet && pe.installer.is_none() && [dir.clone(), dir.join("lib64"), dir.join("x86_64")].iter().any(|d| has_so(d))
 }
 
+/// A framework-dependent .NET program for any system (`<name>.dll` whose runtimeconfig.json
+/// names Microsoft.NETCore.App) with Linux libraries beside it or in runtimes/linux-x64/:
+/// nearest the top. Its Windows launcher `<name>.exe` only starts .NET on Windows.
+fn dotnet_build(root: &Path, files: &[Found]) -> Option<usize> {
+    let has_so = |d: &Path| fs::read_dir(d).into_iter().flatten().flatten().any(|e| {
+        let name = e.file_name().to_string_lossy().into_owned();
+        name.ends_with(".so") || name.contains(".so.")
+    });
+    files
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| {
+            let dir = root.join(f.path.parent().unwrap_or(Path::new("")));
+            matches!(&f.binary, Binary::Pe(pe) if pe.dotnet)
+                && f.path.extension().is_some_and(|e| e.eq_ignore_ascii_case("dll"))
+                && crate::dotnet::framework(&root.join(f.path.with_extension("runtimeconfig.json"))).is_some()
+                && (has_so(&dir) || has_so(&dir.join("runtimes/linux-x64/native")))
+        })
+        .min_by_key(|(_, f)| f.path.components().count())
+        .map(|(i, _)| i)
+}
+
+/// The .NET program beside a MonoKickstart one (`<name>.bin.x86_64` → `<name>.exe`) when the
+/// game's own parts need .NET Standard (see `net_standard`).
+fn kick_exe(root: &Path, files: &[Found], main: usize) -> Option<usize> {
+    let path = &files[main].path;
+    let name = path.file_name()?.to_string_lossy().into_owned();
+    let base = &name[..name.find(".bin.x86")?];
+    let dir = path.parent().unwrap_or(Path::new(""));
+    if net_standard(&root.join(dir)).is_empty() {
+        return None;
+    }
+    files.iter().position(|f| f.path == dir.join(format!("{base}.exe")) && matches!(&f.binary, Binary::Pe(pe) if pe.dotnet))
+}
+
+/// The game's own .NET libraries next to a MonoKickstart program that reference .NET Standard's
+/// assemblies (System.Runtime, netstandard) when the folder has neither; the framework's own
+/// files mention those names too, so they're skipped. Mario is Doomed: Comora.dll.
+pub fn net_standard(dir: &Path) -> Vec<String> {
+    if ["System.Runtime.dll", "netstandard.dll", "Facades"].iter().any(|f| dir.join(f).exists()) {
+        return Vec::new();
+    }
+    let framework = |n: &str| ["System", "mscorlib", "Mono.", "Microsoft.", "MonoGame.", "FNA", "OpenTK", "Tao.", "SDL2-CS"].iter().any(|p| n.starts_with(p));
+    let mut out: Vec<String> = fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let ext = name.rsplit('.').next().unwrap_or("").to_lowercase();
+            ((ext == "dll" || ext == "exe") && !framework(&name) && binary::contains_groups(&e.path(), &[&[b"\0System.Runtime\0", b"\0netstandard\0"]])).then_some(name)
+        })
+        .collect();
+    out.sort();
+    out
+}
+
 /// The Windows game program: not an installer, helper or .NET part of a Linux build.
 fn pick_windows(root: &Path, files: &[Found]) -> Option<usize> {
-    let folder = root.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+    // Letters and digits only: goal-rush's game is GoalRush/goalrush.exe.
+    let plain = |s: &str| s.to_lowercase().chars().filter(|c| c.is_alphanumeric()).collect::<String>();
+    let folder = plain(&root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
     files
         .iter()
         .enumerate()
         .filter_map(|(i, f)| {
             let Binary::Pe(pe) = &f.binary else { return None };
-            if pe.installer.is_some() || not_the_game(&f.path) {
+            if pe.installer.is_some() || not_the_game(&f.path) || !f.path.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe")) {
                 return None;
             }
             let dir = root.join(f.path.parent().unwrap_or(Path::new("")));
@@ -300,7 +391,7 @@ fn pick_windows(root: &Path, files: &[Found]) -> Option<usize> {
             if f.path.components().count() == 1 {
                 score += 3;
             }
-            if folder.contains(&s.to_lowercase()) || s.to_lowercase().contains(&folder) {
+            if !plain(&s).is_empty() && (folder.contains(&plain(&s)) || plain(&s).contains(&folder)) {
                 score += 2;
             }
             if pe.bits == 64 {
@@ -381,6 +472,16 @@ fn pick_portable(root: &Path, files: &[Found]) -> Option<usize> {
             let Binary::Python(py) = &f.binary else { return None };
             let s = stem(&f.path).to_lowercase();
             if s.starts_with("setup") {
+                return None;
+            }
+            // Modules left beside a frozen Windows build (cx_Freeze, PyInstaller: python3x.dll
+            // there), whose start script is inside its .exe: Postrias' affichage.py, const.py.
+            let dir = root.join(f.path.parent().unwrap_or(Path::new("")));
+            let frozen = fs::read_dir(&dir).into_iter().flatten().flatten().any(|e| {
+                let n = e.file_name().to_string_lossy().to_lowercase();
+                n.starts_with("python") && n.ends_with(".dll")
+            });
+            if frozen && !py.main && crate::python::launcher(root, files, &f.path).is_none() {
                 return None;
             }
             let mut score = 0;
@@ -610,6 +711,14 @@ fn engine(root: &Path, main: &Path, files: &[Found]) -> Option<Engine> {
     // GameMaker games ship data.win next to the program, or packed inside it.
     if dir.join("data.win").is_file() || (main.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe")) && binary::contains(&dir.join(main.file_name()?), b"data.win")) {
         return Some(Engine { name: "GameMaker", version: None, guess: None });
+    }
+    if let Some((kind, _)) = crate::rpgmaker::rgss(&dir.join("Game.ini")) {
+        let name = match kind {
+            "XP" => "RPG Maker XP",
+            "VX" => "RPG Maker VX",
+            _ => "RPG Maker VX Ace",
+        };
+        return Some(Engine { name, version: None, guess: None });
     }
     if main.ancestors().any(|a| root.join(a).join("renpy").is_dir()) {
         return Some(Engine { name: "Ren'Py", version: None, guess: None });

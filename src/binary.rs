@@ -28,6 +28,8 @@ pub enum Binary {
     /// A game console's cartridge image (Game Boy, Game Boy Color, Game Boy Advance: homebrew
     /// made with GB Studio and the like), named by the console; an emulator runs it.
     Rom(&'static str),
+    /// An RPG Maker 2000/2003 game's database (RPG_RT.ldb): EasyRPG Player plays the folder.
+    RpgMaker,
     /// A CD or DVD image (.iso): usually a Windows game's disc, to install from.
     Disc,
     /// A distribution package (.deb or .rpm): meant to be installed into /usr.
@@ -129,6 +131,8 @@ pub fn identify(path: &Path) -> Option<Binary> {
         Some(Binary::Rom(if color { "Game Boy Color" } else { "Game Boy" }))
     } else if ext == "gba" && head.get(4..12) == Some(GBA_LOGO) {
         Some(Binary::Rom("Game Boy Advance"))
+    } else if ext == "ldb" && head.get(1..12) == Some(b"LcfDataBase") {
+        Some(Binary::RpgMaker)
     } else if ext == "tic" && head.len() >= 4 {
         // Chunks with no file signature: the extension is all there is.
         Some(Binary::Tic)
@@ -144,6 +148,9 @@ pub fn identify(path: &Path) -> Option<Binary> {
     } else if ["zip", "gz", "tgz", "xz", "bz2", "7z", "rar"].contains(&ext.as_str())
         && [&b"PK\x03\x04"[..], b"\x1f\x8b", b"BZh", b"\xfd7zXZ\0", b"7z\xbc\xaf\x27\x1c", b"Rar!"].iter().any(|m| head.starts_with(m))
     {
+        Some(Binary::Archive)
+    } else if ext == "lzh" && head.get(2..4) == Some(b"-l") && head.get(6) == Some(&b'-') {
+        // LHA ("-lh5-" at 2): RPG Maker 2000/2003's game disks pack the game in one.
         Some(Binary::Archive)
     } else if ext == "pyc" && n >= 4 && head[2..4] == *b"\r\n" {
         // The first two bytes number the bytecode format: Python 2 used 20121-62211 (2.7),

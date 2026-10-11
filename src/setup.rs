@@ -107,7 +107,7 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
     if report.problems.iter().any(|p| matches!(p, Problem::UnityDataMissing(_))) {
         return Err("The download lacks the game's data folder (see gamefix check): nothing to set up.".into());
     }
-    if let Some(Problem::LinuxInstaller(file)) = report.problems.iter().find(|p| matches!(p, Problem::LinuxInstaller(_))) {
+    if let Some(Problem::LinuxInstaller(file) | Problem::RpgMakerPacked { file, .. }) = report.problems.iter().find(|p| matches!(p, Problem::LinuxInstaller(_) | Problem::RpgMakerPacked { .. })) {
         return setup_unpacked(game, file, targets);
     }
     let Some((main, _)) = game.main() else {
@@ -158,6 +158,15 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
                 Some((command, file, "TIC-80"))
             }
             Problem::Rom { file, mgba: Some(mgba), .. } => Some((mgba.clone(), file, "mGBA")),
+            // EasyRPG writes saves into the game's folder; Flathub's sees only the home folder.
+            Problem::RpgMaker { dir, easyrpg: Some(easyrpg), .. } => {
+                let mut command = easyrpg.clone();
+                if command[0] == "flatpak" {
+                    command.insert(2, format!("--filesystem={}", game.root.join(dir).display()));
+                }
+                command.push("--project-path".into());
+                Some((command, dir, "EasyRPG Player"))
+            }
             Problem::Mono { file, mono: Some(mono), .. } => Some((vec![mono.display().to_string()], file, "Mono")),
             // Flathub's DOSBox likewise, writable: DOS games keep their settings and saves in
             // their folder. Staging quits with the game; the original DOSBox needs -exit for that.
@@ -175,6 +184,10 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
         // A game made for LÖVE 0.9 or 0.10: LÖVE's own build of that series, set up once.
         let old_love = report.problems.iter().find_map(|p| match p {
             Problem::Love { file, version: Some(v), .. } if crate::check::old_love(Some(v)) => crate::love::build_for(v).map(|b| (file, b)),
+            _ => None,
+        });
+        let dotnet = report.problems.iter().find_map(|p| match p {
+            Problem::Dotnet { file, version, .. } => Some((file, version)),
             _ => None,
         });
         let python = report.problems.iter().find_map(|p| match p {
@@ -244,7 +257,15 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
                 outcome.done.splice(0..0, note);
                 Ok(outcome)
             }
-            None if python.is_some() => {
+            _ if dotnet.is_some() => {
+                let (file, version) = dotnet.unwrap();
+                let (root, note) = crate::dotnet::runtime(version)?;
+                let command = vec!["env".into(), format!("DOTNET_ROOT={}", root.display()), root.join("dotnet").display().to_string()];
+                let mut outcome = setup_runner(game, command, file, &format!(".NET {}", crate::dotnet::channel(version)), targets, Extra::default())?;
+                outcome.done.splice(0..0, note);
+                Ok(outcome)
+            }
+            _ if python.is_some() => {
                 let (file, plan) = python.unwrap();
                 setup_python(game, file, plan, targets)
             }
@@ -354,7 +375,14 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
                 preload.push(path.clone());
                 done.push("Loads the system's C++ library first, so the graphics driver can load (at launch).".into());
             }
-            Problem::DotnetRuntime(version) => not_fixed.push(format!("It needs Microsoft's .NET runtime {version} installed (see gamefix check).")),
+            Problem::DotnetRuntime(version) => match crate::dotnet::runtime(version) {
+                Ok((root, note)) => {
+                    env.push(("DOTNET_ROOT", root.display().to_string()));
+                    done.extend(note);
+                    done.push("Starts it with that .NET runtime (DOTNET_ROOT, at launch).".into());
+                }
+                Err(e) => not_fixed.push(e),
+            },
             Problem::BundledLibstdcxx(None) => not_fixed.push("Its bundled C++ library: the system's libstdc++.so.6 to preload wasn't found.".into()),
             Problem::OwnHarfbuzz(_, Some(path), false) => {
                 preload.push(path.clone());
@@ -504,11 +532,10 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
                 env.push(("PULSE_SERVER", server.clone()));
                 done.push("Tells its old PulseAudio library where the sound server is (at launch).".into());
             }
-            Problem::NetStandard(_) => not_fixed.push("Its .NET Standard parts: the Mono it brings can't load them; the .exe with Proton can.".into()),
             Problem::Alsa32(None) => not_fixed.push("Its 32-bit ALSA sound: needs Steam's runtime (install Steam), which has a plugin that works.".into()),
             Problem::KickFiles(files) => not_fixed.push(format!("Its missing Mono files ({}): only the developer can add them; the .exe with Proton works.", files.join(", "))),
             Problem::FnaLibs(libs) => not_fixed.push(format!("Its missing native libraries ({}): get FNA's fnalibs, or use the Windows download with Proton.", libs.join(", "))),
-            Problem::NoLinuxBuild | Problem::UnityDataMissing(_) | Problem::LinuxInstaller(_) | Problem::OwnWindowsDlls(_) | Problem::MissingWindowsParts(_) | Problem::Source(..) | Problem::Web(_) | Problem::UnityWeb(_) | Problem::Damaged(_) | Problem::Package(..) | Problem::Flash { .. } | Problem::Tic { .. } | Problem::Rom { .. } | Problem::Mono { .. } | Problem::Dos { .. } | Problem::Disc { .. } | Problem::CdFiles { .. } | Problem::Protected { .. } | Problem::Archive(_) | Problem::WrongMachine(_) | Problem::Love { .. } | Problem::Python { .. } | Problem::Java { .. } => {}
+            Problem::NoLinuxBuild | Problem::UnityDataMissing(_) | Problem::LinuxInstaller(_) | Problem::OwnWindowsDlls(_) | Problem::MissingWindowsParts(_) | Problem::Source(..) | Problem::Web(_) | Problem::UnityWeb(_) | Problem::Damaged(_) | Problem::Package(..) | Problem::Flash { .. } | Problem::Tic { .. } | Problem::Rom { .. } | Problem::Mono { .. } | Problem::Dotnet { .. } | Problem::RpgMaker { .. } | Problem::RpgMakerPacked { .. } | Problem::RgssRtp(_) | Problem::Dos { .. } | Problem::Disc { .. } | Problem::CdFiles { .. } | Problem::Protected { .. } | Problem::Archive(_) | Problem::WrongMachine(_) | Problem::Love { .. } | Problem::Python { .. } | Problem::Java { .. } => {}
         }
     }
     if !preload.is_empty() {
@@ -642,6 +669,7 @@ pub fn missing_runner(game: &Game, report: &Report) -> Option<Runner> {
         Problem::Flash { ruffle, .. } => ruffle.is_some(),
         Problem::Tic { tic80, .. } => tic80.is_some(),
         Problem::Rom { mgba, .. } => mgba.is_some(),
+        Problem::RpgMaker { easyrpg, .. } => easyrpg.is_some(),
         Problem::Mono { mono, .. } => mono.is_some(),
         Problem::Dos { dosbox, .. } => dosbox.is_some(),
         _ => false,
@@ -654,6 +682,7 @@ pub fn missing_runner(game: &Game, report: &Report) -> Option<Runner> {
         Problem::Flash { ruffle: None, .. } => Some(Runner { name: "Ruffle", app: "rs.ruffle.Ruffle" }),
         Problem::Tic { tic80: None, .. } => Some(Runner { name: "TIC-80", app: "com.tic80.TIC_80" }),
         Problem::Rom { mgba: None, .. } => Some(Runner { name: "mGBA", app: "io.mgba.mGBA" }),
+        Problem::RpgMaker { easyrpg: None, .. } => Some(Runner { name: "EasyRPG Player", app: "org.easyrpg.player" }),
         Problem::Dos { dosbox: None, .. } => Some(Runner { name: "DOSBox Staging", app: "io.github.dosbox-staging" }),
         _ => None,
     })
@@ -669,6 +698,7 @@ fn runner_needed(report: &Report) -> Option<String> {
         Problem::Tic { tic80: None, .. } => Some(format!("This is a TIC-80 game; it plays in TIC-80, which isn't installed. Install TIC-80 from Discover (it's on Flathub), {then}")),
         Problem::Mono { mono: None, .. } => Some(format!("This is a .NET game built for Mono, and Mono isn't installed. On Bazzite, run \"brew install mono\" in a terminal, {then}")),
         Problem::Rom { mgba: None, console, .. } => Some(format!("This is a {console} game; it plays in mGBA, which isn't installed. Install mGBA from Discover (it's on Flathub), {then}")),
+        Problem::RpgMaker { easyrpg: None, .. } => Some(format!("This is an RPG Maker 2000/2003 game; it plays in EasyRPG Player, which isn't installed. Install EasyRPG Player from Discover (it's on Flathub), {then}")),
         Problem::Dos { dosbox: None, .. } => Some(format!("This is a DOS game; it runs in DOSBox Staging, which isn't installed. Install DOSBox Staging from Discover (it's on Flathub), {then}")),
         Problem::Python { v2: true, .. } => Some("This is a Python 2 game; Python 2 is gone from current systems (see gamefix check).".into()),
         Problem::Love { .. } => Some("This LÖVE game needs an older LÖVE than any gamefix can set up (see gamefix check).".into()),
@@ -1026,34 +1056,52 @@ pub fn unpacked_name(installer: &Path) -> String {
     if base.is_empty() || base == name { format!("{name} (unpacked)") } else { base }
 }
 
-/// A MojoSetup installer: the game it carries (its zip's `data/`, what the installer would copy)
-/// unpacked into a folder named after it beside it, then that set up. Undo leaves the folder,
-/// like an installed Windows game: the game may keep its saves there.
+/// A game still in its package, unpacked into a folder named after it beside it, then that set
+/// up: a MojoSetup installer (its zip's `data/`, what the installer would copy), an RPG Maker
+/// game disk or self-extractor (all of it, with 7-Zip). A folder already unpacked there (by the
+/// self-extractor itself, or an earlier setup) is used as it is. The unpacked game is set up
+/// under the download's name, so undo on the download finds it; undo leaves the folder, like
+/// an installed Windows game: the game may keep its saves there.
 fn setup_unpacked(game: &Game, file: &Path, targets: &Targets) -> Result<Outcome, String> {
     let installer = game.root.join(file);
     let dir = installer.parent().unwrap_or(&game.root);
-    let dest = dir.join(unpacked_name(&installer));
-    if dest.exists() {
+    let rpg = crate::rpgmaker::packed(&installer).is_some();
+    let dest = if rpg { crate::rpgmaker::unpacked_dir(&installer) } else { dir.join(unpacked_name(&installer)) };
+    let runnable = |g: &Game| g.main.is_some() || g.windows.is_some() || g.portable.is_some();
+    let earlier = dest.exists();
+    if earlier && !crate::scan::scan(&dest).is_some_and(|g| runnable(&g)) {
         return Err(format!("{} is already there but holds no game program: move it away and set up again.", dest.display()));
     }
-    let tmp = dir.join(format!(".gamefix-unpacking-{}", std::process::id()));
-    // unzip warns (exit 1) about the installer's program before the zip.
-    let out = Command::new("unzip").args(["-q", "-o"]).arg(&installer).arg("data/*").arg("-d").arg(&tmp).output().map_err(|e| format!("unzip: {e}"))?;
-    if out.status.code().is_none_or(|c| c > 1) || !tmp.join("data").is_dir() {
+    if !earlier {
+        let tmp = dir.join(format!(".gamefix-unpacking-{}", std::process::id()));
+        let unpacked = if rpg {
+            crate::rpgmaker::unpack(&installer, &tmp).map(|_| tmp.clone())
+        } else {
+            // unzip warns (exit 1) about the installer's program before the zip.
+            let out = Command::new("unzip").args(["-q", "-o"]).arg(&installer).arg("data/*").arg("-d").arg(&tmp).output().map_err(|e| format!("unzip: {e}"))?;
+            if out.status.code().is_none_or(|c| c > 1) || !tmp.join("data").is_dir() {
+                Err(format!("Couldn't unpack the game from {}: {}", installer.display(), String::from_utf8_lossy(&out.stderr).trim()))
+            } else {
+                Ok(tmp.join("data"))
+            }
+        };
+        let moved = unpacked.and_then(|from| fs::rename(from, &dest).map_err(|e| e.to_string()));
         let _ = fs::remove_dir_all(&tmp);
-        return Err(format!("Couldn't unpack the game from {}: {}", installer.display(), String::from_utf8_lossy(&out.stderr).trim()));
+        moved?;
     }
-    let moved = fs::rename(tmp.join("data"), &dest);
-    let _ = fs::remove_dir_all(&tmp);
-    moved.map_err(|e| e.to_string())?;
-    let unpacked = crate::scan::scan(&game.root).ok_or("The unpacked game couldn't be read.")?;
+    let mut unpacked = crate::scan::scan(&dest).filter(runnable).ok_or("The unpacked game couldn't be read.")?;
+    unpacked.name = game.name.clone();
     let report = crate::check::check(&unpacked, &crate::system::System::load());
     let mut outcome = setup(&unpacked, &report, targets)?;
     let record = record_path(&unpacked);
     let mut lines = fs::read_to_string(&record).unwrap_or_default();
     lines.push_str(&format!("installed-game\t{}\n", dest.display()));
     fs::write(&record, lines).map_err(|e| e.to_string())?;
-    outcome.done.insert(0, format!("Unpacked the game from its installer, {}, into {}.", file.display(), dest.display()));
+    outcome.done.insert(0, if earlier {
+        format!("Set up the game already unpacked from {} in {}.", file.display(), dest.display())
+    } else {
+        format!("Unpacked the game from {} into {}.", file.display(), dest.display())
+    });
     Ok(outcome)
 }
 
@@ -1391,6 +1439,20 @@ fn setup_windows(game: &Game, report: &Report, exe: &crate::scan::Found, targets
     let workdir = program.parent().unwrap_or(&game.root);
     let file = steam.shortcuts();
     let mut env = Vec::new();
+    // RPG Maker XP's runtime package, in a prefix of gamefix's own that Steam is pointed to.
+    match report.problems.iter().find_map(|p| if let Problem::RgssRtp(kind) = p { Some(*kind) } else { None }) {
+        Some("XP") => {
+            let umu = program_path("umu-run").ok_or("umu-run (umu-launcher) is needed to install RPG Maker XP's runtime package with Proton.")?;
+            let tool_dir = steam.tool_dir(&proton).ok_or(format!("Couldn't find where {proton} is installed."))?;
+            let (prefix, notes, problem) = crate::rpgmaker::xp_prefix(&umu, &tool_dir, &proton)?;
+            done.extend(notes);
+            not_fixed.extend(problem);
+            done.push("Has Steam run it in the RPG Maker XP prefix, ~/.local/share/gamefix/prefixes/rpg-maker-xp (STEAM_COMPAT_DATA_PATH in its launch options).".into());
+            env.push(("STEAM_COMPAT_DATA_PATH", prefix.display().to_string()));
+        }
+        Some(kind) => not_fixed.push(format!("RPG Maker {kind}'s runtime package: gamefix installs only XP's so far; install it into the game's Proton prefix ({}).", crate::rpgmaker::RTP_PAGE)),
+        None => {}
+    }
     add_overrides(&mut env, &own);
     let line = launch_options(&env, &[], None, None, "");
     let shortcut = steam::Shortcut { name: &game.name, exe: &program, start_dir: workdir, icon: "", launch_options: &line };

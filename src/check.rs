@@ -47,7 +47,7 @@ pub enum Problem {
     /// A .NET program built for Mono on Linux; `mono` is the installed Mono. `libs`: native
     /// libraries its .NET parts load by name that the system lacks (see `mono_libs`), and
     /// whether Steam's old runtime has each.
-    Mono { file: PathBuf, mono: Option<PathBuf>, libs: Vec<(String, bool)> },
+    Mono { file: PathBuf, mono: Option<PathBuf>, libs: Vec<(String, bool)>, standard: Vec<String> },
     /// A console cartridge (`console` names it); `mgba` is how to start an installed mGBA.
     Rom { file: PathBuf, console: &'static str, mgba: Option<Vec<String>> },
     /// A CD's files, with the installer among them.
@@ -150,12 +150,19 @@ pub enum Problem {
     /// system library loaded with it expects: (the copy, the system library, a function the
     /// copy lacks, the system's copy to preload).
     Shadowed(PathBuf, String, String, Option<String>),
-    /// The game's own .NET libraries built for .NET Standard, which the Mono it brings
-    /// (MonoKickstart) can't load: no System.Runtime / netstandard in its folder.
-    NetStandard(Vec<String>),
     /// .NET Core before 5 only looks for older ICU versions than current systems have, and
     /// quits at start (The Heart's Illumination, 2.1).
     DotnetIcu(String),
+    /// An RPG Maker 2000/2003 game (the folder holding RPG_RT.ldb); `easyrpg` is how to start an
+    /// installed EasyRPG Player; `rtp`: it uses RPG Maker's runtime package (not a full package).
+    RpgMaker { dir: PathBuf, easyrpg: Option<Vec<String>>, rtp: bool },
+    /// An RPG Maker game packed in a self-extracting package (see `rpgmaker::packed`).
+    RpgMakerPacked { file: PathBuf, kind: &'static str, dest: String },
+    /// An RPG Maker XP/VX/VX Ace game (Windows) needing that version's runtime package.
+    RgssRtp(&'static str),
+    /// A framework-dependent .NET program built for any system (`<name>.dll`, Linux libraries
+    /// beside it: Anodyne Sharp, .NET 6); `dotnet` is the installed runtime's folder.
+    Dotnet { file: PathBuf, version: String, dotnet: Option<PathBuf> },
     /// A framework-dependent .NET program (no libhostfxr.so beside it; its runtimeconfig.json
     /// names the framework) and no .NET runtime of that major version installed: Incremental
     /// Unlimited ("the required library libhostfxr.so could not be found", .NET Core 2.1).
@@ -382,13 +389,27 @@ pub fn check(game: &Game, system: &System) -> Report {
             Some(f) if matches!(f.binary, Binary::Tic) => problems.push(Problem::Tic { file: f.path.clone(), tic80: system.tic80() }),
             Some(scan::Found { path, binary: Binary::Rom(console) }) => problems.push(Problem::Rom { file: path.clone(), console, mgba: system.mgba() }),
             Some(f) if matches!(f.binary, Binary::Dos) => problems.push(Problem::Dos { file: f.path.clone(), dosbox: system.dosbox() }),
+            Some(f) if matches!(f.binary, Binary::RpgMaker) => {
+                let dir = f.path.parent().unwrap_or(Path::new("")).to_path_buf();
+                let rtp = !crate::rpgmaker::full_package(&game.root.join(&dir));
+                problems.push(Problem::RpgMaker { dir, easyrpg: system.easyrpg(), rtp });
+            }
+            Some(f) if matches!(f.binary, Binary::Pe(_)) && f.path.extension().is_some_and(|e| e.eq_ignore_ascii_case("dll")) => {
+                let version = crate::dotnet::framework(&game.root.join(f.path.with_extension("runtimeconfig.json"))).unwrap_or_default();
+                let dotnet = crate::dotnet::installed(&version);
+                problems.push(Problem::Dotnet { file: f.path.clone(), version, dotnet });
+            }
             Some(f) if matches!(f.binary, Binary::Pe(_)) => {
                 let mono = system.mono();
                 let libs = mono_libs(game, f, mono.as_deref(), system).into_iter().map(|l| {
                     let runtime = system.old_runtime.as_ref().is_some_and(|r| r.has(&l, 64));
                     (l, runtime)
                 });
-                problems.push(Problem::Mono { file: f.path.clone(), libs: libs.collect(), mono });
+                // Beside a MonoKickstart program: that one's Mono can't load these (scan::kick_exe).
+                let dir = game.root.join(f.path.parent().unwrap_or(Path::new("")));
+                let kick = game.files.iter().any(|k| k.path.parent() == f.path.parent() && k.path.to_string_lossy().contains(".bin.x86"));
+                let standard = if kick { scan::net_standard(&dir) } else { Vec::new() };
+                problems.push(Problem::Mono { file: f.path.clone(), libs: libs.collect(), mono, standard });
             }
             Some(f) => {
                 let python = game.files.iter().filter_map(|f| match &f.binary {
@@ -410,6 +431,12 @@ pub fn check(game: &Game, system: &System) -> Report {
                 let unity_web = if game.windows.is_none() { unity_web(&game.root) } else { None };
                 problems.push(match (damaged, game.archive, package) {
                     (Some(f), _, _) => Problem::Damaged(f.path.clone()),
+                    _ if game.packed.is_some() => {
+                        let file = game.files[game.packed.unwrap()].path.clone();
+                        let kind = crate::rpgmaker::packed(&game.root.join(&file)).unwrap_or("RPG Maker");
+                        let dest = crate::rpgmaker::unpacked_dir(&game.root.join(&file)).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                        Problem::RpgMakerPacked { file, kind, dest }
+                    }
                     _ if game.linux_installer.is_some() => Problem::LinuxInstaller(game.files[game.linux_installer.unwrap()].path.clone()),
                     _ if game.cd_installer.is_some() => Problem::CdFiles { installer: game.files[game.cd_installer.unwrap()].path.clone() },
                     _ if game.disc.is_some() => {
@@ -451,6 +478,10 @@ pub fn check(game: &Game, system: &System) -> Report {
             let dlls = crate::proton::ignored_dlls(&game.full(&game.files[i]));
             if !dlls.is_empty() {
                 problems.push(Problem::OwnWindowsDlls(dlls));
+            }
+            let ini = game.full(&game.files[i]).with_file_name("Game.ini");
+            if let Some((kind, true)) = crate::rpgmaker::rgss(&ini) {
+                problems.push(Problem::RgssRtp(kind));
             }
             let parts = crate::proton::missing_parts(&game.full(&game.files[i]));
             if !parts.is_empty() {
@@ -694,12 +725,6 @@ pub fn check(game: &Game, system: &System) -> Report {
             problems.push(Problem::KickFiles(gone));
         }
     }
-    if main.path.to_string_lossy().contains(".bin.x86") {
-        let libs = net_standard(&main_dir);
-        if !libs.is_empty() {
-            problems.push(Problem::NetStandard(libs));
-        }
-    }
 
     // A bundled Java: its own sound opens the card directly (see System::pipewire_alsa).
     if let Some(plugin) = (game.files.iter().any(|f| f.path.file_name().is_some_and(|n| n == "libjsound.so")) && uses_java_sound(game)).then(|| system.pipewire_alsa(elf.bits)).flatten() {
@@ -824,7 +849,7 @@ pub fn check(game: &Game, system: &System) -> Report {
     if let Some(version) = old_dotnet(&main_dir, &main.path) {
         problems.push(Problem::DotnetIcu(version));
     }
-    if let Some(version) = dotnet_framework(&main_dir, &main.path).filter(|v| !dotnet_installed(v)) {
+    if let Some(version) = dotnet_framework(&main_dir, &main.path).filter(|v| crate::dotnet::installed(v).is_none()) {
         problems.push(Problem::DotnetRuntime(version));
     }
     let statics = dotnet_missing_static(&main_dir, &main.path);
@@ -1002,28 +1027,6 @@ fn fna_libs(dir: &Path, bits: u8) -> Vec<String> {
 
 /// The .NET Core version a self-contained .NET program next to `dir` ships, if older than 5 and
 /// not already set to work without ICU.
-/// The game's own .NET libraries next to a MonoKickstart program that reference .NET Standard's
-/// assemblies (System.Runtime, netstandard) when the folder has neither; the framework's own
-/// files mention those names too, so they're skipped. Mario is Doomed: Comora.dll.
-fn net_standard(dir: &Path) -> Vec<String> {
-    if ["System.Runtime.dll", "netstandard.dll", "Facades"].iter().any(|f| dir.join(f).exists()) {
-        return Vec::new();
-    }
-    let framework = |n: &str| ["System", "mscorlib", "Mono.", "Microsoft.", "MonoGame.", "FNA", "OpenTK", "Tao.", "SDL2-CS"].iter().any(|p| n.starts_with(p));
-    let mut out: Vec<String> = std::fs::read_dir(dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|e| {
-            let name = e.file_name().to_string_lossy().into_owned();
-            let ext = name.rsplit('.').next().unwrap_or("").to_lowercase();
-            ((ext == "dll" || ext == "exe") && !framework(&name) && binary::contains_groups(&e.path(), &[&[b"\0System.Runtime\0", b"\0netstandard\0"]])).then_some(name)
-        })
-        .collect();
-    out.sort();
-    out
-}
-
 /// Native libraries a Mono game's .NET parts load by name, as their `.dll.config` files map
 /// them for Linux (`os="linux"` or `"!windows,..."`, 64-bit or any processor; versioned names),
 /// that are neither beside it nor on the system. Mono loads each when first called, so a
@@ -1168,32 +1171,14 @@ fn dotnet_core_version(dir: &Path, main: &Path) -> Option<String> {
     Some(deps[at..].chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect())
 }
 
-/// The .NET version a framework-dependent program asks for: its runtimeconfig.json names
-/// Microsoft.NETCore.App under "framework" ("frameworks" from .NET 7), and libhostfxr.so isn't
-/// beside it (a self-contained one brings it; a single-file one has its own runtimeconfig inside).
+/// The .NET version a framework-dependent program asks for: libhostfxr.so isn't beside it (a
+/// self-contained one brings it; a single-file one has its own runtimeconfig inside).
 fn dotnet_framework(dir: &Path, main: &Path) -> Option<String> {
     let stem = main.file_name()?.to_string_lossy().into_owned();
     if dir.join("libhostfxr.so").is_file() {
         return None;
     }
-    let config = std::fs::read_to_string(dir.join(format!("{stem}.runtimeconfig.json"))).ok()?;
-    let at = config.find("\"Microsoft.NETCore.App\"")?;
-    let rest = &config[at..];
-    let v = rest.find("\"version\"").map(|i| &rest[i + 9..])?;
-    let v = v.trim_start_matches([' ', ':', '\n', '\r', '\t', '"']);
-    Some(v.chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect()).filter(|v: &String| !v.is_empty())
-}
-
-/// Whether a .NET runtime of that major version is in one of the usual places (its default
-/// roll-forward takes a newer minor or patch, not a newer major).
-fn dotnet_installed(version: &str) -> bool {
-    let major = version.split('.').next().unwrap_or("");
-    let mut roots: Vec<PathBuf> = ["/usr/share/dotnet", "/usr/lib64/dotnet", "/usr/lib/dotnet", "/opt/dotnet"].iter().map(PathBuf::from).collect();
-    roots.extend(std::env::var_os("DOTNET_ROOT").map(PathBuf::from));
-    roots.extend(std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".dotnet")));
-    roots.iter().any(|r| {
-        std::fs::read_dir(r.join("shared/Microsoft.NETCore.App")).is_ok_and(|d| d.flatten().any(|e| e.file_name().to_string_lossy().split('.').next() == Some(major)))
-    })
+    crate::dotnet::framework(&dir.join(format!("{stem}.runtimeconfig.json")))
 }
 
 /// Its major version.
@@ -1383,7 +1368,9 @@ impl Report {
                 (Binary::Tic, _) => "TIC-80 cartridge".into(),
                 (Binary::Rom(console), _) => format!("{console} cartridge"),
                 (Binary::Dos, _) => "DOS game".into(),
+                (Binary::Pe(_), _) if f.path.extension().is_some_and(|e| e.eq_ignore_ascii_case("dll")) => ".NET game for any system".into(),
                 (Binary::Pe(_), _) => ".NET game for Mono on Linux".into(),
+                (Binary::RpgMaker, _) => "RPG Maker 2000/2003 game".into(),
                 (Binary::Script, _) if scan::install4j_script(&game.root, &f.path) => "Java game, install4j launcher".into(),
                 (Binary::Script, _) => "Processing game, runs with Java".into(),
                 _ => "Python game".into(),
@@ -1566,7 +1553,11 @@ impl Report {
                     let _ = writeln!(out, "    Fix: TIC-80 from Flathub (com.tic80.TIC_80) plays it: gamefix setup offers to install it,");
                     let _ = writeln!(out, "    then adds the game to the app menu or Steam.");
                 }
-                Problem::Mono { file, mono, libs } => {
+                Problem::Mono { file, mono, libs, standard } => {
+                    if !standard.is_empty() {
+                        let _ = writeln!(out, "• Part of the game was built for .NET Standard, which the Mono it brings (MonoKickstart) can't");
+                        let _ = writeln!(out, "  load, so its own program quits at start ({}); a current Mono has those parts.", standard.join(", "));
+                    }
                     match mono {
                         Some(mono) => {
                             let _ = writeln!(out, "• This is a .NET game built to run with Mono on Linux; Mono is installed, so it runs with:");
@@ -1985,12 +1976,6 @@ impl Report {
                     let _ = writeln!(out, "  (\"{} not found!\"). Only the developer can add them (Puzzle Kids left them out).", files[0]);
                     let _ = writeln!(out, "    Fix: the game's .exe with Proton, or a Windows download.");
                 }
-                Problem::NetStandard(libs) => {
-                    let _ = writeln!(out, "✗ Part of the game was built for .NET Standard, which the Mono it brings can't load");
-                    let _ = writeln!(out, "  (its folder has no System.Runtime or netstandard), so it quits at start: {}.", libs.join(", "));
-                    let _ = writeln!(out, "  That's how the developer packaged it; nothing on this system can fill it in.");
-                    let _ = writeln!(out, "    Fix: the game's .exe with Proton (Proton's Mono has those), or a Windows download.");
-                }
                 Problem::Shadowed(copy, user, example, preload) => {
                     let _ = writeln!(out, "✗ The game's own {} is older than the system's {user} expects", copy.display());
                     let _ = writeln!(out, "  ({example} is missing from it). Loaded first, it makes {user} fail to load, and the game");
@@ -2035,9 +2020,58 @@ impl Report {
                 Problem::DotnetRuntime(version) => {
                     let _ = writeln!(out, "✗ It was published without .NET: it needs Microsoft's .NET runtime {version} installed, and");
                     let _ = writeln!(out, "  there's none here, so it quits at once (\"libhostfxr.so could not be found\").");
-                    let _ = writeln!(out, "    Fix: Microsoft's dotnet-install script (dot.net/v1/dotnet-install.sh, --runtime dotnet");
-                    let _ = writeln!(out, "    --version {version}) puts it in ~/.dotnet, and the game starts with DOTNET_ROOT=~/.dotnet.");
+                    let _ = writeln!(out, "    Fix: gamefix setup downloads that runtime from Microsoft into ~/.local/share/gamefix/dotnet");
+                    let _ = writeln!(out, "    (30-100 MB, shared by every game of that version) and starts the game with DOTNET_ROOT set.");
                     let _ = writeln!(out, "    Older versions get no security fixes; a Windows build with Proton avoids that.");
+                }
+                Problem::RpgMaker { dir, easyrpg, rtp } => {
+                    let shown = if dir.as_os_str().is_empty() { ".".into() } else { dir.display().to_string() };
+                    match easyrpg {
+                        Some(easyrpg) => {
+                            let _ = writeln!(out, "• This is an RPG Maker 2000/2003 game ({shown}); EasyRPG Player, which plays them, is installed:");
+                            let _ = writeln!(out, "  {} --project-path \"{shown}\"", easyrpg.join(" "));
+                            let _ = writeln!(out, "  gamefix setup adds that to the app menu.");
+                        }
+                        None => {
+                            let _ = writeln!(out, "✗ This is an RPG Maker 2000/2003 game ({shown}): data for RPG Maker's player, which is a Windows program.");
+                            let _ = writeln!(out, "    Fix: EasyRPG Player from Flathub (org.easyrpg.player) plays it natively: gamefix setup");
+                            let _ = writeln!(out, "    offers to install it, then adds the game to the app menu or Steam.");
+                        }
+                    }
+                    if *rtp {
+                        let _ = writeln!(out, "  It uses graphics and music from RPG Maker's runtime package (RPG_RT.ini has no");
+                        let _ = writeln!(out, "  FullPackageFlag=1); EasyRPG plays it without, but those may be missing ({}).", crate::rpgmaker::RTP_PAGE);
+                    }
+                }
+                Problem::RpgMakerPacked { file, kind, dest } => {
+                    let _ = writeln!(out, "✗ The game ({kind}) is still packed in {}: a self-extracting package", file.display());
+                    let _ = writeln!(out, "  whose Windows setup wants RPG Maker's own files installed first.");
+                    let _ = writeln!(out, "    Fix (once): gamefix setup unpacks it into \"{dest}\" beside it and sets that up.");
+                }
+                Problem::RgssRtp(kind) => {
+                    let _ = writeln!(out, "✗ It's an RPG Maker {kind} game that uses RPG Maker {kind}'s runtime package (its RGSS library,");
+                    let _ = writeln!(out, "  graphics and music aren't in its folder): it can't start until that's installed where it runs.");
+                    if *kind == "XP" {
+                        let _ = writeln!(out, "    Fix (once): gamefix setup --steam installs the package (from rpgmakerweb.com) into a Proton");
+                        let _ = writeln!(out, "    prefix shared by RPG Maker XP games, and has Steam run the game there.");
+                    } else {
+                        let _ = writeln!(out, "    Fix: install RPG Maker {kind}'s runtime package ({}) into the game's Proton prefix", crate::rpgmaker::RTP_PAGE);
+                        let _ = writeln!(out, "    (gamefix does that for RPG Maker XP only so far).");
+                    }
+                }
+                Problem::Dotnet { file, version, dotnet: Some(dotnet) } => {
+                    let _ = writeln!(out, "• This is a .NET {version} game built for any system, with its Linux libraries; Microsoft's .NET");
+                    let _ = writeln!(out, "  is installed in {}, so it runs with:", dotnet.display());
+                    let _ = writeln!(out, "  {}/dotnet \"{}\"", dotnet.display(), file.display());
+                    let _ = writeln!(out, "  gamefix setup adds that to the app menu.");
+                }
+                Problem::Dotnet { file, version, dotnet: None } => {
+                    let channel = crate::dotnet::channel(version);
+                    let _ = writeln!(out, "✗ This is a .NET {version} game built for any system ({}), with its Linux libraries;", file.display());
+                    let _ = writeln!(out, "  it needs Microsoft's .NET runtime {channel}, which isn't installed (its .exe only starts .NET on Windows).");
+                    let _ = writeln!(out, "    Fix: gamefix setup downloads that runtime from Microsoft into ~/.local/share/gamefix/dotnet");
+                    let _ = writeln!(out, "    (30-100 MB, shared by every game of that version) and adds the game to the app menu.");
+                    let _ = writeln!(out, "    Older versions get no security fixes; the Windows build with Proton avoids that.");
                 }
                 Problem::DotnetIcu(version) => {
                     let _ = writeln!(out, "✗ It's built on .NET Core {version}, which only looks for older versions of the ICU library");
