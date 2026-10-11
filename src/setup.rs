@@ -112,10 +112,9 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
     }
     let Some((main, _)) = game.main() else {
         // A game another program runs: that program and the file to give it.
-        let java_audio = crate::check::uses_java_sound(game);
         let runner = report.problems.iter().find_map(|p| match p {
             Problem::Java { file, java: Some(java) } if file.extension().is_some_and(|e| e == "jar") => {
-                let mut command = java_sound(vec![java.display().to_string(), "-jar".into()], java_audio);
+                let mut command = java_sound(vec![java.display().to_string(), "-jar".into()]);
                 let mut setting = |s: String| {
                     command = match command[0].as_str() {
                         "env" => [vec!["env".into(), s], command[1..].to_vec()].concat(),
@@ -138,7 +137,7 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
             // PATH menu entries get; and its exec bit is often lost.
             Problem::Java { file, java: Some(java) } => {
                 let dir = java.parent().map(|d| d.display().to_string()).unwrap_or_default();
-                Some((java_sound(vec!["env".into(), format!("PATH={dir}:/usr/bin:/bin"), "/bin/sh".into()], java_audio), file, "Java"))
+                Some((java_sound(vec!["env".into(), format!("PATH={dir}:/usr/bin:/bin"), "/bin/sh".into()]), file, "Java"))
             }
             Problem::Love { file, version, love: Some(love) } if !crate::check::old_love(version.as_deref()) => Some((love.clone(), file, "LÖVE")),
             // Flathub's Ruffle sees only the home folder; give it the game's folder too.
@@ -158,6 +157,8 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
                 }
                 Some((command, file, "TIC-80"))
             }
+            Problem::Rom { file, mgba: Some(mgba), .. } => Some((mgba.clone(), file, "mGBA")),
+            Problem::Mono { file, mono: Some(mono), .. } => Some((vec![mono.display().to_string()], file, "Mono")),
             // Flathub's DOSBox likewise, writable: DOS games keep their settings and saves in
             // their folder. Staging quits with the game; the original DOSBox needs -exit for that.
             Problem::Dos { file, dosbox: Some(dosbox) } => {
@@ -202,7 +203,39 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
                         }
                     }
                 }
-                setup_runner(game, command, file, name, targets, extra)
+                // A Mono game's native libraries: Steam's runtime for those it has, the others
+                // fetched (Glanduff: SDL 1.2 from the runtime, libgdiplus from Fedora).
+                let mut command = command;
+                let mut not_fixed = Vec::new();
+                if let Some(Problem::Mono { libs, .. }) = report.problems.iter().find(|p| matches!(p, Problem::Mono { mono: Some(_), .. })) {
+                    let others: Vec<String> = libs.iter().filter(|(_, runtime)| !runtime).map(|(l, _)| l.clone()).collect();
+                    let mut runtime = libs.iter().any(|(_, r)| *r);
+                    if !others.is_empty() {
+                        let dir = data_home().join("gamefix/libs").join(slug(&game.name));
+                        if !dir.is_dir() {
+                            fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+                            extra.record.push(format!("created-dir\t{}", dir.display()));
+                        }
+                        let fetched = crate::fetch::fetch(&others, 64, &dir);
+                        extra.record.extend(fetched.files.iter().map(|f| format!("created\t{}", f.display())));
+                        if !fetched.sources.is_empty() {
+                            extra.done.push(format!("Fetched libraries the system lacks into ~/.local/share/gamefix/libs, from {} (at launch).", fetched.sources.join(", ")));
+                            command = [vec!["env".into(), format!("LD_LIBRARY_PATH={}", dir.display())], command].concat();
+                        }
+                        if !fetched.missing.is_empty() {
+                            not_fixed.push(format!("Libraries no Fedora, Debian or Ubuntu package has, which it may never use: {}.", fetched.missing.join(", ")));
+                        }
+                        runtime |= fetched.needs_runtime;
+                    }
+                    if let (true, Some(run)) = (runtime, &report.old_runtime) {
+                        let at = if command[0] == "env" { 2 } else { 0 };
+                        command.insert(at, run.display().to_string());
+                        extra.done.push("Starts it with Steam's runtime for older games, which has missing libraries.".into());
+                    }
+                }
+                let mut outcome = setup_runner(game, command, file, name, targets, extra)?;
+                outcome.not_fixed.extend(not_fixed);
+                Ok(outcome)
             }
             _ if old_love.is_some() => {
                 let (file, build) = old_love.unwrap();
@@ -222,6 +255,7 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
             None if report.problems.iter().any(|p| matches!(p, Problem::Disc { .. })) => Err("No installer was found on the disc image (see gamefix check).".into()),
             None if report.problems.iter().any(|p| matches!(p, Problem::Archive(_))) => Err("The game is still packed in an archive: unpack it, then set up the folder it makes.".into()),
             None if report.problems.iter().any(|p| matches!(p, Problem::Web(_))) => Err("It's a web game: play it on its itch.io page.".into()),
+            None if report.problems.iter().any(|p| matches!(p, Problem::UnityWeb(_))) => Err("It's a Unity Web Player game, which nothing plays now (see gamefix check).".into()),
             None if report.problems.iter().any(|p| matches!(p, Problem::Source(..))) => Err("This is the game's source code: it has to be built first.".into()),
             None if report.problems.iter().any(|p| matches!(p, Problem::Package(_, "apk"))) => Err("It's an Android app; get the game's Linux or Windows download instead.".into()),
             None if report.problems.iter().any(|p| matches!(p, Problem::Package(..))) => Err("It's a package to install into the system; get the game's .tar.gz, .zip or AppImage download instead.".into()),
@@ -473,7 +507,7 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
             Problem::Alsa32(None) => not_fixed.push("Its 32-bit ALSA sound: needs Steam's runtime (install Steam), which has a plugin that works.".into()),
             Problem::KickFiles(files) => not_fixed.push(format!("Its missing Mono files ({}): only the developer can add them; the .exe with Proton works.", files.join(", "))),
             Problem::FnaLibs(libs) => not_fixed.push(format!("Its missing native libraries ({}): get FNA's fnalibs, or use the Windows download with Proton.", libs.join(", "))),
-            Problem::NoLinuxBuild | Problem::UnityDataMissing(_) | Problem::LinuxInstaller(_) | Problem::OwnWindowsDlls(_) | Problem::MissingWindowsParts(_) | Problem::Source(..) | Problem::Web(_) | Problem::Damaged(_) | Problem::Package(..) | Problem::Flash { .. } | Problem::Tic { .. } | Problem::Dos { .. } | Problem::Disc { .. } | Problem::CdFiles { .. } | Problem::Protected { .. } | Problem::Archive(_) | Problem::WrongMachine(_) | Problem::Love { .. } | Problem::Python { .. } | Problem::Java { .. } => {}
+            Problem::NoLinuxBuild | Problem::UnityDataMissing(_) | Problem::LinuxInstaller(_) | Problem::OwnWindowsDlls(_) | Problem::MissingWindowsParts(_) | Problem::Source(..) | Problem::Web(_) | Problem::UnityWeb(_) | Problem::Damaged(_) | Problem::Package(..) | Problem::Flash { .. } | Problem::Tic { .. } | Problem::Rom { .. } | Problem::Mono { .. } | Problem::Dos { .. } | Problem::Disc { .. } | Problem::CdFiles { .. } | Problem::Protected { .. } | Problem::Archive(_) | Problem::WrongMachine(_) | Problem::Love { .. } | Problem::Python { .. } | Problem::Java { .. } => {}
         }
     }
     if !preload.is_empty() {
@@ -606,6 +640,8 @@ pub fn missing_runner(game: &Game, report: &Report) -> Option<Runner> {
         Problem::Love { love, version, .. } => love.is_some() || crate::check::old_love(version.as_deref()),
         Problem::Flash { ruffle, .. } => ruffle.is_some(),
         Problem::Tic { tic80, .. } => tic80.is_some(),
+        Problem::Rom { mgba, .. } => mgba.is_some(),
+        Problem::Mono { mono, .. } => mono.is_some(),
         Problem::Dos { dosbox, .. } => dosbox.is_some(),
         _ => false,
     });
@@ -616,6 +652,7 @@ pub fn missing_runner(game: &Game, report: &Report) -> Option<Runner> {
         Problem::Love { love: None, .. } => Some(Runner { name: "LÖVE", app: "org.love2d.love2d" }),
         Problem::Flash { ruffle: None, .. } => Some(Runner { name: "Ruffle", app: "rs.ruffle.Ruffle" }),
         Problem::Tic { tic80: None, .. } => Some(Runner { name: "TIC-80", app: "com.tic80.TIC_80" }),
+        Problem::Rom { mgba: None, .. } => Some(Runner { name: "mGBA", app: "io.mgba.mGBA" }),
         Problem::Dos { dosbox: None, .. } => Some(Runner { name: "DOSBox Staging", app: "io.github.dosbox-staging" }),
         _ => None,
     })
@@ -629,6 +666,8 @@ fn runner_needed(report: &Report) -> Option<String> {
         Problem::Love { love: None, version, .. } if !crate::check::old_love(version.as_deref()) => Some(format!("This is a LÖVE game, and LÖVE isn't installed. Install LÖVE from Discover (it's on Flathub), {then}")),
         Problem::Flash { ruffle: None, .. } => Some(format!("This is a Flash game; it plays in Ruffle, which isn't installed. Install Ruffle from Discover (it's on Flathub), {then}")),
         Problem::Tic { tic80: None, .. } => Some(format!("This is a TIC-80 game; it plays in TIC-80, which isn't installed. Install TIC-80 from Discover (it's on Flathub), {then}")),
+        Problem::Mono { mono: None, .. } => Some(format!("This is a .NET game built for Mono, and Mono isn't installed. On Bazzite, run \"brew install mono\" in a terminal, {then}")),
+        Problem::Rom { mgba: None, console, .. } => Some(format!("This is a {console} game; it plays in mGBA, which isn't installed. Install mGBA from Discover (it's on Flathub), {then}")),
         Problem::Dos { dosbox: None, .. } => Some(format!("This is a DOS game; it runs in DOSBox Staging, which isn't installed. Install DOSBox Staging from Discover (it's on Flathub), {then}")),
         Problem::Python { v2: true, .. } => Some("This is a Python 2 game; Python 2 is gone from current systems (see gamefix check).".into()),
         Problem::Love { .. } => Some("This LÖVE game needs an older LÖVE than any gamefix can set up (see gamefix check).".into()),
@@ -745,10 +784,10 @@ fn arial_fonts() -> Result<PathBuf, String> {
 
 /// Java's own sound for a game gamefix starts with Java: the command with the ALSA setting in
 /// front, when PipeWire's plugin is there (else, or if the setting can't be written, as it was).
-fn java_sound(command: Vec<String>, needed: bool) -> Vec<String> {
-    if !needed {
-        return command;
-    }
+/// Every Java game gets it: one carrying OpenAL may still play music through Java's own sound
+/// (Double Down: Slick's easyogg, "Line ... not supported"), and OpenAL's sound doesn't go
+/// through ALSA's settings (Mirrored, libGDX, played with it).
+fn java_sound(command: Vec<String>) -> Vec<String> {
     let Some(conf) = crate::system::System::load().pipewire_alsa(64).and_then(|p| java_sound_conf(&p).ok()) else { return command };
     let setting = format!("ALSA_CONFIG_PATH={conf}");
     match command.first().map(String::as_str) {
@@ -912,6 +951,34 @@ fn setup_runner(game: &Game, command: Vec<String>, file: &Path, name: &str, targ
             command.extend(["-cp".into(), format!("{}:{}/*", file.display(), dir.display())]);
             tail = vec![inner.main_class];
             done.push(format!("Unpacked the {} jars packed inside it into ~/.local/share/gamefix/jars, which its own loader doesn't find on current Java.", inner.jars.len()));
+        }
+    }
+    // A jar with only Windows natives: the Linux ones for the same versions from Maven Central,
+    // on the class path beside it (libGDX and LWJGL 2 look for them there).
+    if command.last().is_some_and(|a| a == "-jar") {
+        let natives = crate::binary::missing_natives(&file);
+        let main_class = Command::new("unzip").arg("-p").arg(&file).arg("META-INF/MANIFEST.MF").output().ok().and_then(|o| {
+            String::from_utf8_lossy(&o.stdout).lines().find_map(|l| l.strip_prefix("Main-Class:").map(|v| v.trim().to_string()))
+        });
+        if let (false, Some(main_class)) = (natives.is_empty(), main_class) {
+            let dir = data_home().join("gamefix/jars").join(slug(&game.name));
+            if !dir.is_dir() {
+                fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+                record.push(format!("created-dir\t{}", dir.display()));
+            }
+            for path in &natives {
+                let target = dir.join(path.rsplit('/').next().unwrap_or(path));
+                let ok = Command::new("curl").args(["-sfL", "--max-time", "60", "-o"]).arg(&target).arg(format!("https://repo1.maven.org/maven2/{path}")).status().is_ok_and(|s| s.success());
+                if !(ok && fs::read(&target).is_ok_and(|b| b.starts_with(b"PK\x03\x04"))) {
+                    let _ = fs::remove_file(&target);
+                    return Err(format!("Couldn't download {} from Maven Central (no network?).", path.rsplit('/').next().unwrap_or(path)));
+                }
+                record.push(format!("created\t{}", target.display()));
+            }
+            command.pop();
+            command.extend(["-cp".into(), format!("{}:{}/*", file.display(), dir.display())]);
+            tail = vec![main_class];
+            done.push(format!("Downloaded the Linux parts of its libraries it lacks ({}, from Maven Central) into ~/.local/share/gamefix/jars.", natives.iter().filter_map(|n| n.rsplit('/').next()).collect::<Vec<_>>().join(", ")));
         }
     }
     if targets.menu {

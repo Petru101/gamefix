@@ -25,6 +25,9 @@ pub enum Binary {
     Tic,
     /// A DOS program (.exe or .com), which Wine won't run; DOSBox does.
     Dos,
+    /// A game console's cartridge image (Game Boy, Game Boy Color, Game Boy Advance: homebrew
+    /// made with GB Studio and the like), named by the console; an emulator runs it.
+    Rom(&'static str),
     /// A CD or DVD image (.iso): usually a Windows game's disc, to install from.
     Disc,
     /// A distribution package (.deb or .rpm): meant to be installed into /usr.
@@ -76,6 +79,11 @@ pub struct Pe {
     pub protection: Option<&'static str>,
 }
 
+/// The start of Nintendo's logo in a Game Boy cartridge's header (at 0x104) and a Game Boy
+/// Advance one's (at 4).
+const GB_LOGO: &[u8] = &[0xCE, 0xED, 0x66, 0x66, 0xCC, 0x0D, 0x00, 0x0B];
+const GBA_LOGO: &[u8] = &[0x24, 0xFF, 0xAE, 0x51, 0x69, 0x9A, 0xA2, 0x21];
+
 pub fn identify(path: &Path) -> Option<Binary> {
     let mut f = File::open(path).ok()?;
     let mut head = [0u8; 64];
@@ -114,6 +122,13 @@ pub fn identify(path: &Path) -> Option<Binary> {
         Some(Binary::Jar)
     } else if ext == "swf" && [&b"FWS"[..], b"CWS", b"ZWS"].iter().any(|m| head.starts_with(m)) {
         Some(Binary::Flash)
+    } else if matches!(ext.as_str(), "gb" | "gbc") && read_at(&mut f, 0x104, 8).as_deref() == Some(GB_LOGO) {
+        // The boot ROM checks Nintendo's logo in the header, so every cartridge carries it; the
+        // byte after the title says whether it's made for the Color.
+        let color = read_at(&mut f, 0x143, 1).is_some_and(|b| b[0] & 0x80 != 0);
+        Some(Binary::Rom(if color { "Game Boy Color" } else { "Game Boy" }))
+    } else if ext == "gba" && head.get(4..12) == Some(GBA_LOGO) {
+        Some(Binary::Rom("Game Boy Advance"))
     } else if ext == "tic" && head.len() >= 4 {
         // Chunks with no file signature: the extension is all there is.
         Some(Binary::Tic)
@@ -358,14 +373,9 @@ pub fn jar_needs(jar: &Path) -> JarNeeds {
     needs
 }
 
-/// Strings in Java class files (CONSTANT_Utf8: tag 1, a two-byte length, the text) that start
-/// with "/".
+/// Strings in Java class files that start with "/".
 fn class_paths(bytes: &[u8]) -> impl Iterator<Item = String> + '_ {
-    bytes.windows(4).enumerate().filter(|(_, w)| w[0] == 1 && w[3] == b'/').filter_map(move |(i, w)| {
-        let len = u16::from_be_bytes([w[1], w[2]]) as usize;
-        let text = bytes.get(i + 3..i + 3 + len)?;
-        (len < 200 && text.iter().all(|&b| (0x20..0x7f).contains(&b))).then(|| String::from_utf8_lossy(text).into_owned())
-    })
+    class_strings(bytes).filter(|s| s.starts_with('/'))
 }
 
 const SHADERS: &[&str] = &[".glsl", ".vert", ".frag", ".vsh", ".fsh", ".vs", ".fs"];
@@ -433,6 +443,48 @@ pub fn jar_in_jar(jar: &Path) -> Option<JarInJar> {
     let jars: Vec<String> = value("Rsrc-Class-Path")?.split_whitespace().filter(|j| j.ends_with(".jar") && inside.lines().any(|l| l == *j)).map(String::from).collect();
     // Astro Defend's export keeps its libraries unpacked ("Rsrc-Class-Path: ./") and runs.
     (!jars.is_empty()).then_some(JarInJar { main_class: value("Rsrc-Main-Class")?, jars })
+}
+
+/// Linux native libraries a jar lacks while carrying the Windows ones (the export was made on
+/// Windows with only its natives: Amphibian's libGDX 1.3.1 jar has gdx64.dll, lwjgl64.dll and
+/// OpenAL64.dll, no .so, and quits with "Couldn't load shared library 'libgdx64.so'"), as Maven
+/// Central paths of the jars holding them for its versions: libGDX's gdx-platform natives,
+/// LWJGL 2's lwjgl-platform natives (liblwjgl64.so, libopenal64.so). The versions are the
+/// ones the jar's Version and Sys classes hold.
+pub fn missing_natives(jar: &Path) -> Vec<String> {
+    let Ok(list) = std::process::Command::new("unzip").arg("-Z1").arg(jar).output() else { return Vec::new() };
+    let all = String::from_utf8_lossy(&list.stdout);
+    let has = |name: &str| all.lines().any(|l| l.rsplit('/').next() == Some(name));
+    let version = |class: &str| {
+        let out = std::process::Command::new("unzip").arg("-p").arg(jar).arg(class).output().ok()?;
+        let found = class_strings(&out.stdout).find(|s| {
+            let parts: Vec<&str> = s.split('.').collect();
+            (2..=3).contains(&parts.len()) && parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+        });
+        found
+    };
+    let mut out = Vec::new();
+    if has("gdx64.dll") && !has("libgdx64.so") {
+        if let Some(v) = version("com/badlogic/gdx/Version.class") {
+            out.push(format!("com/badlogicgames/gdx/gdx-platform/{v}/gdx-platform-{v}-natives-desktop.jar"));
+        }
+    }
+    if has("lwjgl64.dll") && !has("liblwjgl64.so") && all.lines().any(|l| l == "org/lwjgl/Sys.class") {
+        if let Some(v) = version("org/lwjgl/Sys.class") {
+            out.push(format!("org/lwjgl/lwjgl/lwjgl-platform/{v}/lwjgl-platform-{v}-natives-linux.jar"));
+        }
+    }
+    out
+}
+
+/// The text constants in a Java class file (CONSTANT_Utf8: tag 1, a two-byte length, the
+/// text), printable ones only.
+fn class_strings(bytes: &[u8]) -> impl Iterator<Item = String> + '_ {
+    bytes.windows(3).enumerate().filter(|(_, w)| w[0] == 1).filter_map(move |(i, w)| {
+        let len = u16::from_be_bytes([w[1], w[2]]) as usize;
+        let text = bytes.get(i + 3..i + 3 + len)?;
+        (len > 0 && len < 200 && text.iter().all(|&b| (0x20..0x7f).contains(&b))).then(|| String::from_utf8_lossy(text).into_owned())
+    })
 }
 
 /// Lists of library names a program tries in turn with dlopen, kept as one text: D's Derelict
@@ -866,6 +918,31 @@ mod tests {
         let mut found = super::find_any(data, &[(0, b"Arial"), (1, b"Liberation Sans"), (2, b"FreeSans"), (3, b"/usr/share/fonts")]);
         found.sort();
         assert_eq!(found, [0, 2, 3]);
+    }
+
+    #[test]
+    fn game_boy_cartridges() {
+        let dir = std::env::temp_dir().join(format!("gamefix-rom-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut gb = vec![0u8; 0x150];
+        gb[0x104..0x10c].copy_from_slice(super::GB_LOGO);
+        std::fs::write(dir.join("a.gb"), &gb).unwrap();
+        gb[0x143] = 0xC0;
+        std::fs::write(dir.join("b.gbc"), &gb).unwrap();
+        let mut gba = vec![0u8; 0xC0];
+        gba[4..12].copy_from_slice(super::GBA_LOGO);
+        std::fs::write(dir.join("c.gba"), &gba).unwrap();
+        // The extension alone isn't enough.
+        std::fs::write(dir.join("d.gb"), vec![0u8; 0x150]).unwrap();
+        let console = |n: &str| match super::identify(&dir.join(n)) {
+            Some(super::Binary::Rom(c)) => Some(c),
+            _ => None,
+        };
+        assert_eq!(console("a.gb"), Some("Game Boy"));
+        assert_eq!(console("b.gbc"), Some("Game Boy Color"));
+        assert_eq!(console("c.gba"), Some("Game Boy Advance"));
+        assert_eq!(console("d.gb"), None);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

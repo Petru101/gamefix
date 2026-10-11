@@ -126,10 +126,14 @@ pub fn scan(path: &Path) -> Option<Game> {
     let cd_installer = if main.is_none() { cd_installer(&root, &files) } else { None };
     let linux_installer = if main.is_none() { files.iter().position(|f| matches!(&f.binary, Binary::Elf(e) if e.mojosetup)) } else { None };
     let windows = if cd_installer.is_some() || linux_installer.is_some() { None } else { windows };
+    // A .NET program built for Mono on Linux is run by Mono, not Proton (CraftStudio's exports).
+    let mono = windows.filter(|&i| main.is_none() && mono_build(&root, &files[i]));
+    let windows = if mono.is_some() { None } else { windows };
     let portable = match main {
         Some(_) => None,
-        None if chosen.is_some() => chosen.as_ref().and_then(|c| files.iter().position(|f| &f.path == c && matches!(f.binary, Binary::Love | Binary::Jar | Binary::Flash | Binary::Tic | Binary::Python(_) | Binary::Dos))),
+        None if chosen.is_some() => chosen.as_ref().and_then(|c| files.iter().position(|f| &f.path == c && matches!(f.binary, Binary::Love | Binary::Jar | Binary::Flash | Binary::Tic | Binary::Rom(_) | Binary::Python(_) | Binary::Dos))),
         // A DOS program only when nothing else runs: Windows games may carry DOS tools.
+        None if mono.is_some() => mono,
         None => pick_portable(&root, &files).or_else(|| if windows.is_none() { pick_dos(&root, &files) } else { None }),
     };
     let nothing = main.is_none() && windows.is_none() && portable.is_none() && cd_installer.is_none() && linux_installer.is_none();
@@ -147,6 +151,7 @@ pub fn scan(path: &Path) -> Option<Game> {
             };
             Some(Engine { name: "LÖVE", version, guess })
         }
+        Some(i) if matches!(files[i].binary, Binary::Pe(_)) => engine(&root, &files[i].path, &files),
         _ => program.and_then(|i| engine(&root, &files[i].path, &files)),
     };
     let name = program
@@ -196,7 +201,7 @@ fn walk(root: &Path, rel: &Path, depth: usize, out: &mut Vec<Found>) {
                 // A .love is never a library; SHARECART1000 jam games keep it two folders down
                 // (`SHARECART1000/CARTFARMER/cartfarmer.love`).
                 Binary::Love => depth <= 3,
-                Binary::Jar | Binary::Flash | Binary::Tic | Binary::Python(_) | Binary::Archive | Binary::Package(_) => depth <= 1,
+                Binary::Jar | Binary::Flash | Binary::Tic | Binary::Rom(_) | Binary::Python(_) | Binary::Archive | Binary::Package(_) => depth <= 1,
                 Binary::Dos => depth <= 2,
                 Binary::Disc => depth <= 1,
                 Binary::Elf(_) | Binary::Damaged => true,
@@ -259,6 +264,20 @@ fn pick_main(root: &Path, files: &[Found]) -> Option<usize> {
         })
         .max_by_key(|&(score, i)| (score, std::cmp::Reverse(i)))
         .map(|(_, i)| i)
+}
+
+/// A .NET program made to run with Mono on Linux: Linux libraries (`.so`) beside it or in a
+/// lib64/ or x86_64/ folder there. CraftStudio exports `Linux.exe` with libbulletc-linux64.so
+/// and liblua-linux64.so (Glanduff, Spherunner), started with `mono Linux.exe`. A Windows build
+/// of a MonoGame game carries OpenTK.dll.config's Linux names too, but no .so.
+fn mono_build(root: &Path, found: &Found) -> bool {
+    let Binary::Pe(pe) = &found.binary else { return false };
+    let dir = root.join(found.path.parent().unwrap_or(Path::new("")));
+    let has_so = |d: &Path| fs::read_dir(d).into_iter().flatten().flatten().any(|e| {
+        let name = e.file_name().to_string_lossy().into_owned();
+        name.ends_with(".so") || name.contains(".so.")
+    });
+    pe.dotnet && pe.installer.is_none() && [dir.clone(), dir.join("lib64"), dir.join("x86_64")].iter().any(|d| has_so(d))
 }
 
 /// The Windows game program: not an installer, helper or .NET part of a Linux build.
@@ -349,7 +368,7 @@ fn pick_portable(root: &Path, files: &[Found]) -> Option<usize> {
     if let Some((i, _)) = install4j {
         return Some(i);
     }
-    for kind in [|b: &Binary| matches!(b, Binary::Love), |b: &Binary| matches!(b, Binary::Jar), |b: &Binary| matches!(b, Binary::Flash), |b: &Binary| matches!(b, Binary::Tic)] {
+    for kind in [|b: &Binary| matches!(b, Binary::Love), |b: &Binary| matches!(b, Binary::Jar), |b: &Binary| matches!(b, Binary::Flash), |b: &Binary| matches!(b, Binary::Tic), |b: &Binary| matches!(b, Binary::Rom(_))] {
         if let Some((i, _)) = files.iter().enumerate().filter(|(_, f)| kind(&f.binary)).min_by_key(|(_, f)| f.path.components().count()) {
             return Some(i);
         }
@@ -461,14 +480,25 @@ fn love_guess_code(code: &str) -> Option<(&'static str, String)> {
     const NEW11: &[&str] = &["filesystem.getInfo", "graphics.captureScreenshot", "getDPIScale", "math.colorFromBytes", "graphics.applyTransform", "data.compress", "data.decompress", "data.encode", "data.decode", "data.newByteData", "data.hash", "data.pack", "data.unpack"];
     const NEW10: &[&str] = &["graphics.stencil", "graphics.points"];
     const OLD9: &[&str] = &["graphics.setStencil", "graphics.setInvertedStencil", "graphics.newStencil", "graphics.point", "graphics.setPointStyle", "graphics.getMaxImageSize", "graphics.isSupported", "window.getWidth", "window.getHeight", "window.getDimensions"];
+    // Gone in 0.9, which moved the window into love.window.
+    const OLD8: &[&str] = &["graphics.setMode", "graphics.getMode", "graphics.checkMode", "graphics.getModes", "graphics.setCaption", "graphics.getCaption", "graphics.toggleFullscreen", "graphics.drawq", "graphics.setDefaultImageFilter"];
     const OLD10: &[&str] = &["filesystem.exists", "filesystem.isFile", "filesystem.isDirectory", "filesystem.isSymlink", "filesystem.getLastModified", "filesystem.getSize", "graphics.newScreenshot", "window.getPixelScale"];
     if NEW11.iter().any(|f| calls(&code, f)) {
         return None;
     }
+    if !code.contains("love.window.") {
+        if let Some(f) = OLD8.iter().find(|f| calls(&code, f)) {
+            return Some(("0.8", format!("love.{f}, which LÖVE 0.9 removed")));
+        }
+    }
     let added10 = NEW10.iter().any(|f| calls(&code, f)) || code.contains("love.wheelmoved") || code.contains("love.touch.") || call_args(&code, "isDown").any(|a| quoted(a).any(|s| s == "space"));
     let old9 = OLD9.iter().find(|f| calls(&code, f)).map(|f| format!("love.{f}, which LÖVE 0.10 removed"))
         .or_else(|| call_args(&code, "isDown").any(|a| quoted(a).any(|s| s == " ")).then(|| "the 0.9 name for the space key (\" \"; \"space\" since 0.10)".to_string()))
-        .or_else(|| call_args(&code, "mouse.isDown").any(|a| quoted(a).any(|s| matches!(s, "l" | "r" | "m"))).then(|| "the 0.9 names for mouse buttons (\"l\", \"r\"; numbers since 0.10)".to_string()));
+        .or_else(|| call_args(&code, "mouse.isDown").any(|a| quoted(a).any(|s| matches!(s, "l" | "r" | "m"))).then(|| "the 0.9 names for mouse buttons (\"l\", \"r\"; numbers since 0.10)".to_string()))
+        // Sun Slayer: "Invalid blend mode: additive" on 0.10, which calls it "add".
+        .or_else(|| call_args(&code, "setBlendMode").any(|a| quoted(a).any(|s| matches!(s, "additive" | "subtractive" | "multiplicative" | "premultiplied"))).then(|| "a 0.9 blend mode name (\"additive\"; \"add\" since 0.10)".to_string()))
+        // Picodyne: `stream:clear()` on a canvas, "attempt to call method 'clear'" on 0.10.
+        .or_else(|| canvases(&code).iter().any(|c| calls(&code, &format!("{c}:clear"))).then(|| "Canvas:clear(), which LÖVE 0.10 removed".to_string()));
     if let (Some(why), false) = (&old9, added10) {
         return Some(("0.9", why.clone()));
     }
@@ -476,6 +506,16 @@ fn love_guess_code(code: &str) -> Option<(&'static str, String)> {
         .or_else(|| ["setColor", "setBackgroundColor", "graphics.clear"].iter().any(|f| call_args(&code, f).any(|a| byte_colour(a))).then(|| "colours from 0 to 255 (0 to 1 since LÖVE 11)".to_string()))
         .or(old9)?;
     Some(("0.10", old))
+}
+
+/// Names the code gives canvases it makes (`stream = love.graphics.newCanvas(...)`).
+fn canvases(code: &str) -> Vec<&str> {
+    code.match_indices("newCanvas").filter_map(|(i, _)| {
+        let line = code[..i].rsplit('\n').next()?;
+        let (name, _) = line.split_once('=')?;
+        let name = name.trim().strip_prefix("local ").unwrap_or(name.trim()).trim();
+        (!name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.')).then_some(name)
+    }).collect()
 }
 
 /// Lua code with its comments (`--` to the end of the line, `--[[ ... ]]`, `--[==[ ... ]==]`)
@@ -634,6 +674,13 @@ mod tests {
         assert_eq!(series("love.filesystem.getInfo('a')\nlove.graphics.setColor(255, 255, 255)"), None);
         // Colours as fractions, variables, divisions, comments: nothing to go on.
         assert_eq!(series("love.graphics.setColor(1, 1, 1)\nsetColor(r, g, b)\nsetColor(255/255, 0, 0)\n-- love.graphics.setColor(255, 0, 0)\n--[[ love.filesystem.exists(x) ]]"), None);
+        // 0.8's window functions in love.graphics, unless the code also uses love.window.
+        assert_eq!(series("love.graphics.setMode(800, 600, false)\nlove.graphics.drawq(img, q, 0, 0)"), Some("0.8"));
+        assert_eq!(series("if love.window then love.window.setMode(800, 600) else love.graphics.setMode(800, 600) end"), None);
+        // 0.9's blend mode names and Canvas:clear() (Sun Slayer, Picodyne), beside 0-255 colours.
+        assert_eq!(series("love.graphics.setColor(255, 0, 0)\nlove.graphics.setBlendMode('additive')"), Some("0.9"));
+        assert_eq!(series("stream = love.graphics.newCanvas(w, h)\nlove.filesystem.isDirectory('a')\nstream:clear()"), Some("0.9"));
+        assert_eq!(series("local c = lg.newCanvas(w, h)\nother:clear()\nlove.graphics.setColor(255, 0, 0)"), Some("0.10"));
         // `points(` isn't `point(`.
         assert_eq!(series("love.graphics.points(1, 2)"), None);
     }

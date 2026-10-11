@@ -111,6 +111,13 @@ impl System {
         std::env::split_paths(&path).chain([PathBuf::from("/home/linuxbrew/.linuxbrew/bin")]).map(|d| d.join("java")).find(|j| j.is_file())
     }
 
+    /// Mono, for .NET games built to run with it on Linux: on the PATH, or Homebrew's (`brew
+    /// install mono`), which menu entries' PATH lacks.
+    pub fn mono(&self) -> Option<PathBuf> {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        std::env::split_paths(&path).chain([PathBuf::from("/home/linuxbrew/.linuxbrew/bin")]).map(|d| d.join("mono")).find(|m| m.is_file())
+    }
+
     /// Homebrew's newest openjdk@N up to 25: version strings with dots and applets still in,
     /// which old Processing games need (Java 26 removed applets; "27" has no dot).
     pub fn java_lts(&self) -> Option<PathBuf> {
@@ -182,6 +189,19 @@ impl System {
         }
         let path = std::env::var_os("PATH").unwrap_or_default();
         std::env::split_paths(&path).map(|d| d.join("tic80")).find(|l| l.is_file()).map(|l| vec![l.display().to_string(), "--skip".into()])
+    }
+
+    /// How to start mGBA, which plays Game Boy (Color, Advance) cartridges: Flathub's (it may
+    /// read and write the whole file system, so its saves land beside the cartridge as on a
+    /// desktop install), else an `mgba-qt` on the PATH.
+    pub fn mgba(&self) -> Option<Vec<String>> {
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+        let flatpak = [PathBuf::from("/var/lib/flatpak"), home.join(".local/share/flatpak")].iter().any(|d| d.join("app/io.mgba.mGBA/current").exists());
+        if flatpak {
+            return Some(vec!["flatpak".into(), "run".into(), "io.mgba.mGBA".into()]);
+        }
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        std::env::split_paths(&path).map(|d| d.join("mgba-qt")).find(|l| l.is_file()).map(|l| vec![l.display().to_string()])
     }
 
     /// How to start DOSBox: Flathub's DOSBox Staging (it can read the home folder only, so

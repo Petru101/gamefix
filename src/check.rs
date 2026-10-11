@@ -23,6 +23,8 @@ pub enum Problem {
     /// Nothing to run but an HTML5 export (index.html with the engine's scripts): a game for a
     /// browser (Ferryman, Construct 2: c2runtime.js, data.js).
     Web(PathBuf),
+    /// A Unity Web Player build (`.unity3d` for the browser plugin), which nothing plays now.
+    UnityWeb(PathBuf),
     /// Nothing to run, but an archive the game may still be packed in (C-Dogs SDL: a .tar.gz
     /// inside the .zip).
     Archive(PathBuf),
@@ -42,6 +44,12 @@ pub enum Problem {
     Flash { file: PathBuf, ruffle: Option<Vec<String>> },
     /// A TIC-80 cartridge; `tic80` is how to start an installed TIC-80.
     Tic { file: PathBuf, tic80: Option<Vec<String>> },
+    /// A .NET program built for Mono on Linux; `mono` is the installed Mono. `libs`: native
+    /// libraries its .NET parts load by name that the system lacks (see `mono_libs`), and
+    /// whether Steam's old runtime has each.
+    Mono { file: PathBuf, mono: Option<PathBuf>, libs: Vec<(String, bool)> },
+    /// A console cartridge (`console` names it); `mgba` is how to start an installed mGBA.
+    Rom { file: PathBuf, console: &'static str, mgba: Option<Vec<String>> },
     /// A CD's files, with the installer among them.
     CdFiles { installer: PathBuf },
     /// Disc copy protection (SafeDisc, SecuROM) around the game's program, which Wine can't
@@ -300,11 +308,26 @@ fn web_export(root: &Path) -> Option<PathBuf> {
         .map(|d| d.join("index.html").strip_prefix(root).map(Path::to_path_buf).unwrap_or_default())
 }
 
+/// A Unity Web Player build at the top or one folder down: a `.unity3d` file of the plugin's
+/// own format ("UnityWeb", or "UnityRaw" uncompressed), with the page that embedded it (Caged).
+fn unity_web(root: &Path) -> Option<PathBuf> {
+    let dirs = std::iter::once(root.to_path_buf()).chain(std::fs::read_dir(root).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.is_dir()));
+    dirs.flat_map(|d| std::fs::read_dir(d).into_iter().flatten().flatten().map(|e| e.path()))
+        .find(|p| p.extension().is_some_and(|x| x == "unity3d") && (binary::head_contains(p, b"UnityWeb", 8) || binary::head_contains(p, b"UnityRaw", 8)))
+        .map(|p| p.strip_prefix(root).map(Path::to_path_buf).unwrap_or_default())
+}
+
 /// A project's build file at the top or one folder down, when there's nothing to run.
 fn source_project(root: &Path) -> Option<(PathBuf, &'static str)> {
     const MARKERS: [(&str, &str); 6] = [("project.godot", "a Godot project"), ("CMakeLists.txt", "a CMake project"), ("Cargo.toml", "a Rust project"), ("meson.build", "a Meson project"), ("configure.ac", "an Autotools project"), ("Makefile", "a Makefile project")];
     let dirs = std::iter::once(root.to_path_buf()).chain(std::fs::read_dir(root).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.is_dir()));
-    dirs.flat_map(|d| MARKERS.iter().map(move |(m, kind)| (d.join(m), *kind))).find(|(p, _)| p.is_file()).map(|(p, kind)| (p.strip_prefix(root).unwrap_or(&p).to_path_buf(), kind))
+    dirs.flat_map(|d| {
+        // A Processing sketch is a folder holding <folder name>.pde (Shooting Gallery).
+        let sketch = d.file_name().map(|n| d.join(format!("{}.pde", n.to_string_lossy())));
+        MARKERS.iter().map(move |(m, kind)| (d.join(m), *kind)).chain(sketch.map(|s| (s, "a Processing sketch")))
+    })
+    .find(|(p, _)| p.is_file())
+    .map(|(p, kind)| (p.strip_prefix(root).unwrap_or(&p).to_path_buf(), kind))
 }
 
 fn optional_plugin(path: &std::path::Path) -> Option<&'static str> {
@@ -322,7 +345,7 @@ pub fn check(game: &Game, system: &System) -> Report {
                 // Ren'Py keeps its Windows Python and helpers in lib/windows-* (8: lib/py3-windows-*):
                 // not a Windows build.
                 None if f.path.components().any(|c| c.as_os_str().to_string_lossy().trim_start_matches("py3-").trim_start_matches("py2-").starts_with("windows-")) && game.main.is_some() => {}
-                None if !scan::not_the_game(&f.path) && !(pe.dotnet && game.main.is_some()) => windows.push((f.path.clone(), pe.bits)),
+                None if !scan::not_the_game(&f.path) && !(pe.dotnet && (game.main.is_some() || game.portable.is_some())) => windows.push((f.path.clone(), pe.bits)),
                 None => {}
             }
         }
@@ -352,7 +375,16 @@ pub fn check(game: &Game, system: &System) -> Report {
             }
             Some(f) if matches!(f.binary, Binary::Flash) => problems.push(Problem::Flash { file: f.path.clone(), ruffle: system.ruffle() }),
             Some(f) if matches!(f.binary, Binary::Tic) => problems.push(Problem::Tic { file: f.path.clone(), tic80: system.tic80() }),
+            Some(scan::Found { path, binary: Binary::Rom(console) }) => problems.push(Problem::Rom { file: path.clone(), console, mgba: system.mgba() }),
             Some(f) if matches!(f.binary, Binary::Dos) => problems.push(Problem::Dos { file: f.path.clone(), dosbox: system.dosbox() }),
+            Some(f) if matches!(f.binary, Binary::Pe(_)) => {
+                let mono = system.mono();
+                let libs = mono_libs(game, f, mono.as_deref(), system).into_iter().map(|l| {
+                    let runtime = system.old_runtime.as_ref().is_some_and(|r| r.has(&l, 64));
+                    (l, runtime)
+                });
+                problems.push(Problem::Mono { file: f.path.clone(), libs: libs.collect(), mono });
+            }
             Some(f) => {
                 let python = game.files.iter().filter_map(|f| match &f.binary {
                     Binary::Python(p) => Some(p),
@@ -370,6 +402,7 @@ pub fn check(game: &Game, system: &System) -> Report {
                 });
                 let source = if game.windows.is_none() { source_project(&game.root) } else { None };
                 let web = if game.windows.is_none() { web_export(&game.root) } else { None };
+                let unity_web = if game.windows.is_none() { unity_web(&game.root) } else { None };
                 problems.push(match (damaged, game.archive, package) {
                     (Some(f), _, _) => Problem::Damaged(f.path.clone()),
                     _ if game.linux_installer.is_some() => Problem::LinuxInstaller(game.files[game.linux_installer.unwrap()].path.clone()),
@@ -386,6 +419,7 @@ pub fn check(game: &Game, system: &System) -> Report {
                         Problem::Source(file, kind)
                     }
                     _ if web.is_some() => Problem::Web(web.unwrap()),
+                    _ if unity_web.is_some() => Problem::UnityWeb(unity_web.unwrap()),
                     (None, Some(i), _) => Problem::Archive(game.files[i].path.clone()),
                     (None, None, Some((path, kind))) => Problem::Package(path, kind),
                     (None, None, None) => Problem::NoLinuxBuild,
@@ -688,7 +722,7 @@ pub fn check(game: &Game, system: &System) -> Report {
     // needs it) is also what the system's libraries loaded alongside get. If one of those needs
     // a function only the system's newer copy has, it fails to load (Darkness Looming's old
     // libgmodule vs the system's libgio: g_module_open_full).
-    let first: Vec<(&String, &PathBuf)> = by_name
+    let mut first: Vec<(&String, &PathBuf)> = by_name
         .iter()
         .filter_map(|(n, (p, _))| {
             let name = n.to_str()?;
@@ -697,6 +731,8 @@ pub fn check(game: &Game, system: &System) -> Report {
         })
         .filter_map(|(n, p)| n.map(|n| (n, p)))
         .collect();
+    // In name order: the report came out differently from run to run (Because).
+    first.sort();
     if !first.is_empty() {
         let mut users: BTreeSet<String> = BTreeSet::new();
         for (_, e) in &same {
@@ -976,6 +1012,38 @@ fn net_standard(dir: &Path) -> Vec<String> {
         })
         .collect();
     out.sort();
+    out
+}
+
+/// Native libraries a Mono game's .NET parts load by name, as their `.dll.config` files map
+/// them for Linux (`os="linux"` or `"!windows,..."`, 64-bit or any processor; versioned names),
+/// that are neither beside it nor on the system. Mono loads each when first called, so a
+/// missing one stops the game there: Glanduff's Tao.Sdl maps SDL.dll to libSDL-1.2.so.0,
+/// called at start for the joystick. Some are never called (Tao.Sdl also maps smpeg and
+/// SDL_gfx). Plus libgdiplus.so.0 when one of its files names System.Drawing (OpenTK sets the
+/// window's icon with it: "DllNotFoundException: libgdiplus.so.0") and neither the system nor
+/// Mono's own lib folder has it (Homebrew's mono doesn't).
+fn mono_libs(game: &Game, exe: &scan::Found, mono: Option<&Path>, system: &System) -> Vec<String> {
+    let dir = game.root.join(exe.path.parent().unwrap_or(Path::new("")));
+    let files: Vec<PathBuf> = std::fs::read_dir(&dir).into_iter().flatten().flatten().map(|e| e.path()).collect();
+    let attr = |line: &str, name: &str| line.split(&format!("{name}=\"")).nth(1).and_then(|v| v.split('"').next()).map(String::from);
+    let mut out: Vec<String> = files
+        .iter()
+        .filter(|p| p.to_string_lossy().ends_with(".dll.config"))
+        .filter_map(|p| std::fs::read_to_string(p).ok())
+        .flat_map(|text| text.lines().filter(|l| l.contains("<dllmap")).map(String::from).collect::<Vec<_>>())
+        .filter(|l| attr(l, "os").is_none_or(|os| os == "linux" || (os.starts_with('!') && !os.contains("linux"))))
+        .filter(|l| attr(l, "cpu").is_none_or(|c| c == "x86-64"))
+        .filter_map(|l| attr(&l, "target"))
+        .filter(|t| t.starts_with("lib") && t.contains(".so.") && !dir.join(t).exists() && !system.has(t, 64))
+        .collect();
+    let drawing = files.iter().filter(|p| p.extension().is_some_and(|x| x == "dll" || x == "exe")).any(|p| binary::contains(p, b"System.Drawing"));
+    let in_mono = mono.and_then(|m| std::fs::canonicalize(m).ok()).and_then(|m| m.parent()?.parent().map(|p| p.join("lib/libgdiplus.so.0"))).is_some_and(|l| l.exists());
+    if drawing && !in_mono && !system.has("libgdiplus.so.0", 64) {
+        out.push("libgdiplus.so.0".into());
+    }
+    out.sort();
+    out.dedup();
     out
 }
 
@@ -1285,7 +1353,9 @@ impl Report {
                 (Binary::Jar, _) => "Java game".into(),
                 (Binary::Flash, _) => "Flash game".into(),
                 (Binary::Tic, _) => "TIC-80 cartridge".into(),
+                (Binary::Rom(console), _) => format!("{console} cartridge"),
                 (Binary::Dos, _) => "DOS game".into(),
+                (Binary::Pe(_), _) => ".NET game for Mono on Linux".into(),
                 (Binary::Script, _) if scan::install4j_script(&game.root, &f.path) => "Java game, install4j launcher".into(),
                 (Binary::Script, _) => "Processing game, runs with Java".into(),
                 _ => "Python game".into(),
@@ -1399,6 +1469,12 @@ impl Report {
                     let _ = writeln!(out, "  file from loading the rest of the game.");
                     let _ = writeln!(out, "    Fix: play it on its itch.io page, where it runs in the browser as made.");
                 }
+                Problem::UnityWeb(file) => {
+                    let _ = writeln!(out, "✗ This is a Unity Web Player game ({}): it ran inside a browser plugin that Unity", file.display());
+                    let _ = writeln!(out, "  and the browsers dropped in 2015-2017, and nothing else plays it.");
+                    let _ = writeln!(out, "    Fix: none here; the game's page may have a download for Windows or Linux, or a WebGL");
+                    let _ = writeln!(out, "    version that plays in the browser.");
+                }
                 Problem::NoLinuxBuild => {
                     let _ = writeln!(out, "✗ There is no Linux version of this game.");
                     let anticheat = crate::proton::anticheat(&game.root);
@@ -1460,6 +1536,37 @@ impl Report {
                 Problem::Tic { file, tic80: None } => {
                     let _ = writeln!(out, "✗ This is a TIC-80 game ({}): a cartridge for that fantasy console, not a program.", file.display());
                     let _ = writeln!(out, "    Fix: TIC-80 from Flathub (com.tic80.TIC_80) plays it: gamefix setup offers to install it,");
+                    let _ = writeln!(out, "    then adds the game to the app menu or Steam.");
+                }
+                Problem::Mono { file, mono, libs } => {
+                    match mono {
+                        Some(mono) => {
+                            let _ = writeln!(out, "• This is a .NET game built to run with Mono on Linux; Mono is installed, so it runs with:");
+                            let _ = writeln!(out, "  {} \"{}\"", mono.display(), file.display());
+                            let _ = writeln!(out, "  gamefix setup adds that to the app menu.");
+                        }
+                        None => {
+                            let _ = writeln!(out, "✗ This is a .NET game built to run with Mono on Linux ({}), and Mono isn't installed.", file.display());
+                            let _ = writeln!(out, "    Fix: on Bazzite, run \"brew install mono\" in a terminal; then gamefix setup adds it to the app menu.");
+                        }
+                    }
+                    if !libs.is_empty() {
+                        let names: Vec<String> = libs.iter().map(|(l, runtime)| if *runtime { format!("{l} (Steam's runtime has it)") } else { l.clone() }).collect();
+                        let _ = writeln!(out, "\n✗ Native libraries its .NET parts load by name aren't installed: {}.", names.join(", "));
+                        let _ = writeln!(out, "  Mono loads each when it's first used, and the game quits there if it's missing (Glanduff:");
+                        let _ = writeln!(out, "  libgdiplus.so.0, then libSDL-1.2.so.0); some may never be used.");
+                        let _ = writeln!(out, "    Fix (at launch): gamefix setup starts it through Steam's runtime for the ones that has, and");
+                        let _ = writeln!(out, "    fetches the others into ~/.local/share/gamefix/libs.");
+                    }
+                }
+                Problem::Rom { file, console, mgba: Some(mgba) } => {
+                    let _ = writeln!(out, "• This is a {console} game (a cartridge image); mGBA, which plays them, is installed:");
+                    let _ = writeln!(out, "  {} \"{}\"", mgba.join(" "), file.display());
+                    let _ = writeln!(out, "  gamefix setup adds that to the app menu.");
+                }
+                Problem::Rom { file, console, mgba: None } => {
+                    let _ = writeln!(out, "✗ This is a {console} game ({}): a cartridge image for that console, not a program.", file.display());
+                    let _ = writeln!(out, "    Fix: mGBA from Flathub (io.mgba.mGBA) plays it: gamefix setup offers to install it,");
                     let _ = writeln!(out, "    then adds the game to the app menu or Steam.");
                 }
                 Problem::CdFiles { installer } => {
@@ -1728,6 +1835,14 @@ impl Report {
                         let _ = writeln!(out, "  Its libraries are jars packed inside it (Eclipse's jar-in-jar export), and the loader it");
                         let _ = writeln!(out, "  starts with doesn't find them on current Java (NoClassDefFoundError: Wobble, Art Treachery);");
                         let _ = writeln!(out, "  setup unpacks them into ~/.local/share/gamefix/jars and starts the game with them.");
+                    }
+                    let natives = binary::missing_natives(&game.root.join(file));
+                    if !natives.is_empty() {
+                        let names: Vec<&str> = natives.iter().filter_map(|n| n.rsplit('/').next()).collect();
+                        let _ = writeln!(out, "\n✗ It carries only the Windows parts of its libraries (.dll, no .so), so on Linux it quits at");
+                        let _ = writeln!(out, "  start (\"Couldn't load shared library 'libgdx64.so'\": Amphibian).");
+                        let _ = writeln!(out, "    Fix: the Linux parts of the same versions from Maven Central, which gamefix setup downloads");
+                        let _ = writeln!(out, "    into ~/.local/share/gamefix/jars and starts the game with: {}.", names.join(", "));
                     }
                     let needs = binary::jar_needs(&game.root.join(file));
                     let major = System::java_major(java);

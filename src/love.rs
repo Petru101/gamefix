@@ -1,9 +1,9 @@
 //! LÖVE for games made before LÖVE 11, which changed its API so 0.x games mostly fail on it
-//! (Flathub has only 11). LÖVE's own Linux builds of 0.9.2 and 0.10.2 (the .deb packages on its
-//! GitHub releases, built for Ubuntu then) are unpacked once into
+//! (Flathub has only 11). LÖVE's own Linux builds of 0.8.0, 0.9.2 and 0.10.2 (the .deb packages
+//! on its GitHub releases, built for Ubuntu then) are unpacked once into
 //! ~/.local/share/gamefix/love/<version>/, with the libraries they need that the system lacks
-//! fetched into its lib/ folder (PhysFS 1; DevIL for 0.9), and shared by every game of that
-//! series. Undo leaves them for the others.
+//! fetched into its lib/ folder (PhysFS 1; DevIL for 0.8/0.9; Lua 5.1, SDL 1.2 and libmodplug
+//! for 0.8), and shared by every game of that series. Undo leaves them for the others.
 
 use crate::binary::{self, Binary};
 use crate::system::System;
@@ -14,11 +14,11 @@ use std::process::Command;
 const RELEASES: &str = "https://github.com/love2d/love/releases/download";
 
 /// (version prefix games declare, the build, its packages with their SHA-256).
-const BUILDS: [(&str, &str, [(&str, &str); 2]); 2] = [
+const BUILDS: [(&str, &str, &[(&str, &str)]); 3] = [
     (
         "0.10.",
         "0.10.2",
-        [
+        &[
             ("love_0.10.2ppa1_amd64.deb", "b8d86dd07c70642e31515b6abdc7f16bf3e9b104931a46a92cc06aaa8f1b5536"),
             ("liblove0_0.10.2ppa1_amd64.deb", "3cb507a992fd3523855e1a449a445e537df39a5080d7e1875e5a5ba0c8272c86"),
         ],
@@ -26,11 +26,13 @@ const BUILDS: [(&str, &str, [(&str, &str); 2]); 2] = [
     (
         "0.9.",
         "0.9.2",
-        [
+        &[
             ("love_0.9.2ppa1_amd64.deb", "0f107827b27fe193bdf63d32eb64907ec21c85f3431f602d90e7b270530400cb"),
             ("liblove_0.9.2ppa1_amd64.deb", "5d5cf11255ec57176527593b63472b01c9c5a95223d88c7fd6616d2b001635b3"),
         ],
     ),
+    // One package, the program with the engine linked in (Ubuntu 12.04's build).
+    ("0.8.", "0.8.0", &[("love_0.8.0-0precise1_amd64.deb", "bae4a32735f9d1cf67c2b67af2be3d3703cb3e5caf90d087b6981ffa3328f8f1")]),
 ];
 
 /// The LÖVE build gamefix can run a game made for this version with (patch releases of a
@@ -65,7 +67,7 @@ pub fn runtime(build: &str) -> Result<(Vec<String>, Option<String>), String> {
     fs::create_dir_all(&libs).map_err(|e| failed(&e.to_string()))?;
     let result = (|| {
         let work = dir.join(".download");
-        for (name, sha) in packages {
+        for (name, sha) in packages.iter() {
             let deb = work.join(name);
             fs::create_dir_all(&work).map_err(|e| failed(&e.to_string()))?;
             let got = Command::new("curl").args(["-sfL", "--max-time", "120", "-o"]).arg(&deb).arg(format!("{RELEASES}/{build}/{name}")).status().is_ok_and(|s| s.success());
@@ -124,7 +126,8 @@ mod tests {
         assert_eq!(build_for("0.10.1"), Some("0.10.2"));
         assert_eq!(build_for("0.10.0"), Some("0.10.2"));
         assert_eq!(build_for("0.9.1"), Some("0.9.2"));
-        assert_eq!(build_for("0.8.0"), None);
+        assert_eq!(build_for("0.8.0"), Some("0.8.0"));
+        assert_eq!(build_for("0.7.2"), None);
         assert_eq!(build_for("11.4"), None);
     }
 }
