@@ -30,6 +30,10 @@ pub enum Problem {
     Damaged(PathBuf),
     /// A Linux installer (MojoSetup) with the game packed inside, and no program besides.
     LinuxInstaller(PathBuf),
+    /// Unity 2018.2-2018.3 with its resolution window enabled starts at 1x1 pixels when the
+    /// window can't open (ScreenSelector.so needs GTK 2): one colour fills the screen (Baldi's
+    /// Basics, Brownie Cove, Precedence). Steam's runtime has GTK 2; its run.sh, if any.
+    UnityResolution(Option<PathBuf>),
     /// A Unity program without its `<name>_Data` folder: the upload is incomplete (PicoPico's
     /// is the Linux program alone; ESCAPE's the Windows one; Car Crash's the .exe and a loose
     /// mainData), and Unity quits with "There is no data folder".
@@ -214,6 +218,16 @@ fn unity_data_missing(game: &Game, program: &scan::Found) -> bool {
         _ => true,
     };
     plain && std::fs::metadata(&full).is_ok_and(|m| m.len() < 64 << 20) && binary::contains(&full, b"UnityPlayer/")
+}
+
+/// Unity versions whose player starts at 1x1 when its resolution window can't open: seen in
+/// 2018.2.14 to 2018.3.0b12; 2018.2.1 and 2018.4 start at the desktop's size. The edges in
+/// between are a guess.
+fn unity_tiny_start(version: &str) -> bool {
+    let mut parts = version.split('.');
+    let (Some(major), Some(minor), Some(patch)) = (parts.next(), parts.next(), parts.next()) else { return false };
+    let patch: u32 = patch.chars().take_while(char::is_ascii_digit).collect::<String>().parse().unwrap_or(0);
+    major == "2018" && (minor == "3" || (minor == "2" && patch >= 2))
 }
 
 /// glibc's own libraries, always there.
@@ -537,6 +551,11 @@ pub fn check(game: &Game, system: &System) -> Report {
     }
     // A library missing at start and later is a start problem.
     later.retain(|lib, _| !missing.contains_key(lib));
+    let screen = "Unity's start-up resolution window";
+    if optional.contains_key(screen) && game.engine.as_ref().and_then(|e| e.version.as_deref()).is_some_and(unity_tiny_start) {
+        optional.remove(screen);
+        problems.push(Problem::UnityResolution(system.old_runtime.as_ref().map(|r| r.run.clone())));
+    }
     report.libs_checked = same.iter().filter(|(_, e)| !e.program).count();
     report.harmless = optional
         .into_iter()
@@ -1266,6 +1285,21 @@ impl Report {
                     let _ = writeln!(out, "• {} is an installer (MojoSetup) with the game packed inside it.", file.display());
                     let _ = writeln!(out, "  gamefix setup unpacks the game into the folder \"{}\" next to it and sets that up.", crate::setup::unpacked_name(file));
                 }
+                Problem::UnityResolution(run) => {
+                    let _ = writeln!(out, "✗ When its start-up resolution window is on (most games), this Unity version (2018.2-2018.3)");
+                    let _ = writeln!(out, "  starts at 1x1 pixels, one colour filling the screen, if the window can't open; it needs");
+                    let _ = writeln!(out, "  GTK 2, which this system lacks (Baldi's Basics, Brownie Cove, Precedence). A game that");
+                    let _ = writeln!(out, "  already started that way keeps 1x1 in its settings until the window replaces it.");
+                    match run {
+                        Some(run) => {
+                            let _ = writeln!(out, "    Fix (at launch): start it through {} (Steam's runtime has GTK 2),", run.display());
+                            let _ = writeln!(out, "    so the window opens, as on Windows. gamefix setup does that.");
+                        }
+                        None => {
+                            let _ = writeln!(out, "    Fix: Steam's runtime for older games has GTK 2: install Steam, then set it up with gamefix.");
+                        }
+                    }
+                }
                 Problem::UnityDataMissing(file) => {
                     let stem = file.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
                     let _ = writeln!(out, "✗ {} is a Unity game's program, but its data folder ({stem}_Data) isn't in", file.display());
@@ -1610,6 +1644,12 @@ impl Report {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unity_versions_starting_tiny() {
+        assert!(unity_tiny_start("2018.2.14f1") && unity_tiny_start("2018.3.0b12") && unity_tiny_start("2018.2.21f1"));
+        assert!(!unity_tiny_start("2018.2.1f1") && !unity_tiny_start("2018.4.26f1") && !unity_tiny_start("2019.2.6f1"));
+    }
 
     #[test]
     fn renamed_copies_are_the_same_library() {

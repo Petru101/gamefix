@@ -178,6 +178,10 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
     };
     if record_path(game).exists() {
         undo(game)?;
+        // The report saw the game as the last setup left it: undo takes back the exec bit and
+        // the converted launcher, which this setup must then redo (Brownie Cove, set up twice,
+        // got "Permission denied").
+        return setup(game, &crate::check::check(game, &crate::system::System::load()), targets);
     }
 
     let program = game.full(main);
@@ -263,6 +267,13 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
             Problem::OwnHarfbuzz(_, None, false) => not_fixed.push("Its built-in HarfBuzz: the system's libharfbuzz.so.0 to preload wasn't found.".into()),
             Problem::OwnHarfbuzz(_, None, true) => not_fixed.push("Its built-in HarfBuzz: Steam's runtime, whose old pango avoids it, wasn't found.".into()),
             Problem::OwnLibstdcxx(None) => not_fixed.push("Its built-in C++ library: the system's libstdc++.so.6 to preload wasn't found.".into()),
+            Problem::UnityResolution(Some(run)) => {
+                if old_runtime.is_none() {
+                    old_runtime = Some(run.clone());
+                }
+                done.push("Starts it with Steam's runtime for older games, whose GTK 2 lets Unity's resolution window open (it started at 1x1 without).".into());
+            }
+            Problem::UnityResolution(None) => not_fixed.push("Unity's resolution window needs GTK 2, which only Steam's runtime has here: install Steam, then set it up again.".into()),
             Problem::Sdl2Mix(path) => {
                 preload.push(path.clone());
                 done.push("Loads the runtime's own SDL2, to match its SDL2 add-ons (at launch).".into());
