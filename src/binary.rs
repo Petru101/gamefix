@@ -279,13 +279,18 @@ pub struct JarNeeds {
     /// removed in Java 15, and getEngineByName("JavaScript") then gives null (Tikotep:
     /// NullPointerException in its ScriptSystem).
     pub nashorn: bool,
+    /// LWJGL 3 from before 3.1 (its `org/lwjgl/system/MemoryAccess`, 2015-2016): on Java 21
+    /// and 27 its shader text overflows its buffer (Homorium: IndexOutOfBoundsException in
+    /// glShaderSource); Java 11 runs it. Where between them it breaks isn't known.
+    pub old_lwjgl3: bool,
 }
 
 pub fn jar_needs(jar: &Path) -> JarNeeds {
     const LIBRARIES: &[&str] = &["org/lwjgl/", "org/newdawn/", "com/badlogic/", "net/java/", "com/jcraft/", "javazoom/", "paulscode/", "de/matthiasmann/", "org/jogamp/", "com/jogamp/", "jogamp/", "javax/", "kotlin/", "org/apache/", "com/google/", "org/json/", "com/esotericsoftware/", "org/ninjacave/"];
-    let mut needs = JarNeeds { applet: false, nashorn: false };
+    let mut needs = JarNeeds { applet: false, nashorn: false, old_lwjgl3: false };
     let Ok(list) = std::process::Command::new("unzip").arg("-Z1").arg(jar).output() else { return needs };
     let all = String::from_utf8_lossy(&list.stdout);
+    needs.old_lwjgl3 = all.lines().any(|n| n.starts_with("org/lwjgl/system/MemoryAccess"));
     let engine = all.lines().any(|n| n.starts_with("org/mozilla/javascript/") || n.starts_with("org/openjdk/nashorn/"));
     let names: Vec<&str> = all.lines().filter(|n| n.ends_with(".class") && !LIBRARIES.iter().any(|l| n.starts_with(l))).collect();
     for chunk in names.chunks(500) {

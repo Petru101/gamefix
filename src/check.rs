@@ -320,6 +320,8 @@ pub fn check(game: &Game, system: &System) -> Report {
                 let needs = binary::jar_needs(&game.full(f));
                 let java = if needs.nashorn {
                     system.java_up_to(14).or_else(|| system.java())
+                } else if needs.old_lwjgl3 {
+                    system.java_up_to(16).or_else(|| system.java())
                 } else if needs.applet {
                     system.java_lts().or_else(|| system.java())
                 } else {
@@ -1452,6 +1454,10 @@ impl Report {
                     if needs.nashorn && !major.is_some_and(|v| v <= 14) {
                         let _ = writeln!(out, "  It runs JavaScript through Java's own engine (Nashorn), which Java 15 removed: it needs");
                         let _ = writeln!(out, "  Java 14 or older (\"brew install openjdk@11\"; gamefix uses that one when it's there).");
+                    } else if needs.old_lwjgl3 && !major.is_some_and(|v| v <= 16) {
+                        let _ = writeln!(out, "  It brings LWJGL 3 from before 3.1 (2015-2016), which fails on current Java when it draws");
+                        let _ = writeln!(out, "  (IndexOutOfBoundsException: Homorium); Java 11 runs it (\"brew install openjdk@11\"; gamefix");
+                        let _ = writeln!(out, "  uses that one when it's there).");
                     } else if needs.applet && major.is_none() {
                         let _ = writeln!(out, "  It uses Java applets, which Java 26 removed: it needs Java 25 or older (\"brew install");
                         let _ = writeln!(out, "  openjdk@21\"; gamefix uses that one when it's there).");
