@@ -1,0 +1,14 @@
+// gamefix's server: bug reports and feedback from gamefix (CLAUDE.md, "Bug reports"). Deploy
+// with `npx wrangler deploy` from this folder.
+{
+  "name": "gamefix",
+  "main": "src/index.js",
+  "compatibility_date": "2026-10-01",
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "gamefix",
+      "database_id": "bcaf1f02-9a02-4fb7-ba08-a0f6b8f555a6"
+    }
+  ]
+}

@@ -2,6 +2,7 @@ mod binary;
 mod check;
 mod disc;
 mod dotnet;
+mod feedback;
 mod fetch;
 mod font;
 mod love;
@@ -24,6 +25,7 @@ const USAGE: &str = "usage: gamefix check <game>
        gamefix undo <game>
        gamefix right-click [on|off]              Dolphin's right-click menu
        gamefix games-folder [<folder>]           where installed Windows games go
+       gamefix feedback [<game>]                 report a problem to gamefix's developer
 <game> is the game's folder or its program; --dialog shows the result in a window";
 
 /// What a command has to say, and whether it went well.
@@ -53,6 +55,11 @@ fn main() -> ExitCode {
         ["right-click"] => said("gamefix", Ok(vec![format!("The right-click menu is {}.", if rightclick::enabled() { "on" } else { "off" })])),
         ["games-folder"] => said("gamefix", Ok(vec![format!("Windows games gamefix installs go into {}.", setup::games_folder().display())])),
         ["games-folder", path] => said("gamefix", setup::set_games_folder(std::path::Path::new(path))),
+        ["feedback", rest @ ..] if rest.len() <= 1 => match feedback(rest.first().copied(), dialog) {
+            Some(said) => said,
+            // Cancelled: nothing to say.
+            None => return ExitCode::SUCCESS,
+        },
         [command @ ("check" | "setup" | "undo"), rest @ ..] => {
             // Dolphin passes the path last, after the flags.
             let (flags, paths): (Vec<&str>, Vec<&str>) = rest.iter().partition(|a| a.starts_with("--"));
@@ -64,7 +71,13 @@ fn main() -> ExitCode {
             let path = PathBuf::from(paths[0]);
             match scan::scan(&path) {
                 None => said("gamefix", Err(format!("{}: not a folder or a file that can be read", path.display()))),
-                Some(game) => run(command, &game, &setup::Targets { menu: menu || !steam, steam }, dialog),
+                Some(game) => {
+                    let said = run(command, &game, &setup::Targets { menu: menu || !steam, steam }, dialog);
+                    if *command != "check" {
+                        feedback::remember(&game.name, command, &said.text);
+                    }
+                    said
+                }
             }
         }
         _ => {
@@ -131,6 +144,69 @@ fn run(command: &str, game: &scan::Game, targets: &setup::Targets, dialog: bool)
         _ => setup::undo(game).map(|undone| undone.iter().map(|l| format!("✓ {l}")).collect()),
     };
     said(&title, result)
+}
+
+/// A bug report or feedback, about a game when one is given: what the person writes, then
+/// everything that goes, then a yes or no. In windows from the right-click menu; on a terminal
+/// otherwise (from a script, the message comes on stdin and is sent as it is). None: cancelled.
+fn feedback(path: Option<&str>, dialog: bool) -> Option<Said> {
+    let game = match path.map(|p| scan::scan(std::path::Path::new(p))) {
+        Some(None) => return Some(said("gamefix", Err(format!("{}: not a folder or a file that can be read", path.unwrap())))),
+        Some(Some(game)) => Some(game),
+        None => None,
+    };
+    let checked = game.as_ref().map(|g| check::check(g, &system::System::load()).render(g));
+    let mut report = feedback::Report::new(game.as_ref(), checked);
+    let title = match &game {
+        Some(g) => format!("gamefix: report a problem with {}", g.name),
+        None => "gamefix: report a problem".into(),
+    };
+    let sent = |report: &feedback::Report| match report.send() {
+        Ok(()) => said(&title, Ok(vec![format!("Sent, thank you. Its id is {}: mention it if you write about it elsewhere.", report.id)])),
+        Err(e) => said(&title, Err(format!("{e}\nNothing was sent."))),
+    };
+    let along = if game.is_some() { "gamefix's report on the game and what it changed for it go along with it" } else { "your system's name and graphics card maker go along with it" };
+    if dialog {
+        let input = |kind: &str, text: &str| {
+            let out = Command::new("kdialog").args(["--title", &title, kind, text, ""]).output().ok().filter(|o| o.status.success())?;
+            Some(String::from_utf8_lossy(&out.stdout).trim_end().to_owned())
+        };
+        report.message = input("--textinputbox", &format!("What went wrong, or what would you like to tell the developer?\n({along}; you'll see everything before it's sent.)"))?;
+        if report.message.trim().is_empty() {
+            return None;
+        }
+        report.contact = input("--inputbox", "If you'd like an answer: how can the developer reach you? (optional: an email address, a Reddit or Discord name)")?;
+        let preview = PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".cache/gamefix/report-preview.txt");
+        let _ = std::fs::create_dir_all(preview.parent().unwrap());
+        std::fs::write(&preview, report.preview()).ok()?;
+        let _ = Command::new("kdialog").args(["--title", "What will be sent"]).arg("--textbox").arg(&preview).args(["800", "600"]).status();
+        let _ = std::fs::remove_file(&preview);
+        let question = format!("Send this report to gamefix's developer?\n\nWhat the server keeps: {}", feedback::privacy_url());
+        return ask(&title, &question).then(|| sent(&report));
+    }
+    let stdin = std::io::stdin();
+    if !stdin.is_terminal() {
+        report.message = std::io::read_to_string(stdin).unwrap_or_default();
+        print!("{}", report.preview());
+        return Some(sent(&report));
+    }
+    println!("What went wrong, or what would you like to tell the developer? ({along}.)\nEnd with an empty line:");
+    for line in stdin.lock().lines() {
+        let Ok(line) = line else { break };
+        if line.trim().is_empty() {
+            break;
+        }
+        report.message += &format!("{line}\n");
+    }
+    if report.message.trim().is_empty() {
+        return Some(said(&title, Err("Nothing written, nothing sent.".into())));
+    }
+    print!("If you'd like an answer: how can the developer reach you? (optional, Enter to skip) ");
+    let _ = std::io::stdout().flush();
+    let _ = stdin.lock().read_line(&mut report.contact);
+    println!("\n{}", report.preview());
+    let question = format!("Send this report to gamefix's developer? (What the server keeps: {})", feedback::privacy_url());
+    Some(if confirm(&title, &question, false) { sent(&report) } else { said(&title, Err("Nothing was sent.".into())) })
 }
 
 /// KDE's own dialogs; without kdialog (another desktop), a notification instead.

@@ -20,15 +20,18 @@ fn installed_binary() -> PathBuf {
     home().join(".local/bin/gamefix")
 }
 
-/// Game folders, Linux programs (some games' are marked as libraries) and Windows programs.
-const MIME_TYPES: &str = "inode/directory;application/x-executable;application/x-pie-executable;application/x-sharedlib;application/vnd.microsoft.portable-executable;application/x-ms-dos-executable;application/x-msdownload;application/x-cd-image;application/vnd.efi.iso;";
+/// Game folders, Linux programs (some games' are marked as libraries), Windows programs and
+/// installers, disc images, and one-file games another program runs (AppImages, Java, Flash,
+/// Game Boy). A .love file is just a zip to KDE, so it's set up through its folder.
+const MIME_TYPES: &str = "inode/directory;application/x-executable;application/x-pie-executable;application/x-sharedlib;application/vnd.microsoft.portable-executable;application/x-ms-dos-executable;application/x-msdownload;application/x-cd-image;application/vnd.efi.iso;application/vnd.appimage;application/x-iso9660-appimage;application/java-archive;application/vnd.adobe.flash.movie;application/x-gameboy-rom;application/x-gameboy-color-rom;application/x-gba-rom;";
 
-const ACTIONS: [(&str, &str, &str, &str); 5] = [
+const ACTIONS: [(&str, &str, &str, &str); 6] = [
     ("check", "Check what's wrong", "dialog-information", "check"),
     ("menu", "Fix and add to the app menu", "applications-games", "setup --menu"),
     ("steam", "Fix and add to Steam", "steam", "setup --steam"),
     ("both", "Fix and add to the app menu and Steam", "applications-games", "setup --menu --steam"),
     ("undo", "Undo gamefix's changes", "edit-undo", "undo"),
+    ("feedback", "Report a problem…", "tools-report-bug", "feedback"),
 ];
 
 pub fn enabled() -> bool {

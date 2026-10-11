@@ -60,13 +60,13 @@ fn data_home() -> PathBuf {
 
 /// File-name-safe form of a game's name. Letters of any alphabet stay ("ᗢ" is a game), and a
 /// name with nothing usable falls back to a number, so records never collide on an empty name.
-fn slug(name: &str) -> String {
+pub fn slug(name: &str) -> String {
     let s: String = name.chars().map(|c| if c.is_alphanumeric() { c.to_lowercase().next().unwrap_or(c) } else { '-' }).collect();
     let s = s.split('-').filter(|p| !p.is_empty()).collect::<Vec<_>>().join("-");
     if s.is_empty() { format!("game-{:08x}", name.bytes().fold(0u32, |h, b| h.wrapping_mul(31).wrapping_add(b as u32))) } else { s }
 }
 
-fn record_path(game: &Game) -> PathBuf {
+pub fn record_path(game: &Game) -> PathBuf {
     data_home().join("gamefix/games").join(format!("{}.log", slug(&game.name)))
 }
 

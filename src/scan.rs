@@ -106,19 +106,44 @@ pub fn scan(path: &Path) -> Option<Game> {
         (path.parent()?.to_path_buf(), Some(PathBuf::from(path.file_name()?)))
     };
     let mut files = Vec::new();
+    // Pointed at a file in a folder of other downloads (other installers, discs, archives or
+    // games beside it): the file is named after itself, so two games there don't share a
+    // record, and the other downloads are left out of its report.
+    let mut among_others = false;
     match &chosen {
-        // A loose download among others: the file is the whole game.
-        Some(c) if shared_folder(&root) => {
-            if let Some(binary) = binary::identify(&root.join(c)) {
-                files.push(Found { path: c.clone(), binary });
+        Some(c) => {
+            let binary = binary::identify(&root.join(c));
+            // A loose download among others, or one that holds the whole download by itself
+            // (an installer, a disc image): the file alone. Setting up an installer runs it.
+            if shared_folder(&root) || binary.as_ref().is_some_and(self_contained) {
+                among_others = shared_folder(&root) || other_downloads_beside(&root, c);
+                files.extend(binary.map(|binary| Found { path: c.clone(), binary }));
+            } else {
+                walk(&root, Path::new(""), 0, &mut files);
+                let own = pick_main(&root, &files).or_else(|| pick_windows(&root, &files)).map(|i| files[i].path.clone());
+                // The folder's own pick is another program, or another download sits on top.
+                among_others = own.is_some_and(|own| &own != c)
+                    || files.iter().any(|f| &f.path != c && f.path.components().count() == 1 && self_contained(&f.binary) && !not_the_game(&f.path));
+                if among_others {
+                    files.retain(|f| &f.path == c || f.path.components().count() > 1 || !(self_contained(&f.binary) || program_file(&f.path, &f.binary)));
+                }
             }
         }
-        _ => walk(&root, Path::new(""), 0, &mut files),
+        None => walk(&root, Path::new(""), 0, &mut files),
     }
 
+    // The file pointed at, if it's the kind wanted; never an installer, which is only run to
+    // install the game (it used to be added to Steam as the game).
     let picked = |want_elf: bool| {
         let c = chosen.as_ref()?;
-        files.iter().position(|f| &f.path == c && matches!((&f.binary, want_elf), (Binary::Elf(_), true) | (Binary::Pe(_), false)))
+        files.iter().position(|f| {
+            &f.path == c
+                && match (&f.binary, want_elf) {
+                    (Binary::Elf(e), true) => !e.mojosetup,
+                    (Binary::Pe(pe), false) => pe.installer.is_none(),
+                    _ => false,
+                }
+        })
     };
     let main = if chosen.is_some() { picked(true) } else { pick_main(&root, &files) };
     // A MonoKickstart game whose own parts need .NET Standard, which the Mono it brings lacks
@@ -185,10 +210,68 @@ pub fn scan(path: &Path) -> Option<Game> {
     };
     let name = program
         .and_then(|i| unity_product(&root, &files[i].path))
-        .or_else(|| chosen.as_ref().filter(|_| shared_folder(&root)).map(|c| stem(c)))
+        .or_else(|| chosen.as_ref().filter(|_| among_others).map(|c| file_title(&root, c)))
+        .or_else(|| chosen.as_ref().and_then(|_| folder_title(&root)))
         .or_else(|| root.file_name().map(|n| n.to_string_lossy().into_owned()))
         .unwrap_or_else(|| root.display().to_string());
     Some(Game { root, name, files, main, windows, portable, cd_installer, linux_installer, packed, disc, archive, engine })
+}
+
+/// Files that hold a whole download by themselves: an installer, a disc image, an archive, a
+/// distribution package. Pointed at one, gamefix looks at it alone: what's beside it may be
+/// other downloads (two .iso files in one folder: the other was installed).
+fn self_contained(binary: &Binary) -> bool {
+    match binary {
+        Binary::Pe(pe) => pe.installer.is_some(),
+        Binary::Elf(e) => e.mojosetup,
+        Binary::Disc | Binary::Archive | Binary::Package(_) => true,
+        _ => false,
+    }
+}
+
+/// A program that could be a game of its own (an .exe, a Linux program), not a helper.
+fn program_file(path: &Path, binary: &Binary) -> bool {
+    !not_the_game(path)
+        && match binary {
+            Binary::Pe(_) | Binary::Dos => path.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe")),
+            Binary::Elf(e) => e.program,
+            _ => false,
+        }
+}
+
+/// Whether the folder holding a self-contained file also holds other downloads or programs
+/// (a folder of downloads), rather than just that file and its pictures and notes.
+fn other_downloads_beside(root: &Path, file: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(root) else { return false };
+    entries.flatten().take(500).any(|e| {
+        let name = PathBuf::from(e.file_name());
+        name != file
+            && e.file_type().is_ok_and(|t| t.is_file())
+            && binary::identify(&e.path()).is_some_and(|b| (self_contained(&b) && !not_the_game(&name)) || program_file(&name, &b))
+    })
+}
+
+/// Names that say what a file or folder is for, not which game it is.
+const GENERIC: &[&str] = &["setup", "install", "installer", "autorun", "launcher", "launch", "start", "game", "play", "run", "bin", "system", "data", "disk1", "disc1", "cd", "cd1", "dvd"];
+
+fn generic(name: &str) -> bool {
+    let name: String = name.to_lowercase().chars().filter(|c| c.is_alphanumeric()).collect();
+    GENERIC.contains(&name.as_str())
+}
+
+/// The name of the folder a file is in, or of the nearest folder above with a name that isn't
+/// generic (Harry Potter's CD: `HARRY_POTTER/setup/Setup.exe`).
+fn folder_title(dir: &Path) -> Option<String> {
+    dir.ancestors().filter_map(|d| d.file_name()).map(|n| n.to_string_lossy().into_owned()).find(|n| !generic(n))
+}
+
+/// A file's name as the game's, with its folder's before a generic one ("Downloads setup").
+fn file_title(dir: &Path, file: &Path) -> String {
+    let s = stem(file);
+    match folder_title(dir) {
+        Some(folder) if generic(&s) => format!("{folder} {s}"),
+        _ => s,
+    }
 }
 
 /// Folders that hold unrelated downloads rather than one game.
@@ -766,7 +849,16 @@ fn unity_product(root: &Path, main: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::love_guess_code;
+    use super::{file_title, folder_title, love_guess_code};
+    use std::path::Path;
+
+    #[test]
+    fn names_files_and_folders() {
+        // Harry Potter's CD: the folder above a generic one.
+        assert_eq!(folder_title(Path::new("/d/HARRY_POTTER/setup")).as_deref(), Some("HARRY_POTTER"));
+        assert_eq!(file_title(Path::new("/home/u/Downloads"), Path::new("setup.exe")), "Downloads setup");
+        assert_eq!(file_title(Path::new("/home/u/Downloads"), Path::new("xmoon.exe")), "xmoon");
+    }
 
     #[test]
     fn love_series_from_code() {
