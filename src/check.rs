@@ -106,6 +106,11 @@ pub enum Problem {
     /// with it doesn't show (Zandvox, Sector Plural Zed: Unity 4.3, buttons without labels).
     /// The names it tries.
     UnityFont(Vec<&'static str>),
+    /// A Unity 4/5.0 player compiles every shader variant through the graphics driver before it
+    /// draws anything, and this game has that many (GLSL programs counted in its data files): the
+    /// first start stays black for minutes (The Asylum: 4,928, 1½-3 minutes on an RTX 3090). The
+    /// driver keeps what it compiled, so later starts are quick (10 s).
+    UnityShaders(usize),
     /// The program has the C++ standard library built in and exports it; the system's copy,
     /// loaded later by the graphics driver, then gets the old functions and crashes (2:22AM).
     /// The system's libstdc++ to preload, if found.
@@ -852,6 +857,10 @@ pub fn check(game: &Game, system: &System) -> Report {
         if let Some(names) = player.and_then(|p| unity_missing_font(&p)) {
             problems.push(Problem::UnityFont(names));
         }
+        let shaders = unity_shaders(&game.root, &main.path);
+        if shaders >= UNITY_MANY_SHADERS {
+            problems.push(Problem::UnityShaders(shaders));
+        }
         let videos = h264_videos(&game.root, &main.path);
         if !videos.is_empty() {
             problems.push(Problem::UnityH264(videos));
@@ -1190,6 +1199,25 @@ fn dotnet_installed(version: &str) -> bool {
 /// Its major version.
 fn dotnet_core(dir: &Path, main: &Path) -> Option<u32> {
     dotnet_core_version(dir, main)?.split('.').next()?.parse().ok()
+}
+
+/// Shader programs from which a Unity 4/5.0 game's first start is noticeably slow: the VM's
+/// Unity 4 games have up to 1,501 (For Science), The Asylum 4,928 (black for 1½-3 minutes).
+const UNITY_MANY_SHADERS: usize = 1000;
+
+/// GLSL programs in a Unity game's data files: Unity 4 keeps each as text with both halves in
+/// it, `#ifdef VERTEX` starting the first. Textures and sounds (.resS, .resource) are skipped.
+fn unity_shaders(root: &Path, main: &Path) -> usize {
+    let stem = main.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let data = root.join(main.parent().unwrap_or(Path::new(""))).join(format!("{stem}_Data"));
+    std::fs::read_dir(data)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .filter(|e| !e.path().extension().is_some_and(|x| x == "resS" || x == "resource"))
+        .map(|e| binary::count(&e.path(), b"#ifdef VERTEX"))
+        .sum()
 }
 
 /// The start of an MP4 file: its "ftyp" box with a common brand.
@@ -2048,6 +2076,11 @@ impl Report {
                     let _ = writeln!(out, "  Menus and labels drawn with it come out blank (Zandvox, Sector Plural Zed).");
                     let _ = writeln!(out, "    Fix (at launch): a copy of Liberation Sans named Arial, shown to the game in that folder");
                     let _ = writeln!(out, "    (gamefix setup does that with bwrap; /usr itself isn't changed).");
+                }
+                Problem::UnityShaders(n) => {
+                    let _ = writeln!(out, "• Its first start stays black for a while, maybe minutes: this old Unity has the graphics");
+                    let _ = writeln!(out, "  driver compile all its {n} shaders before it draws anything. Let it be; the driver");
+                    let _ = writeln!(out, "  keeps them, so later starts are quick.");
                 }
                 Problem::Terminal { .. } => {
                     let _ = writeln!(out, "• It's a text game: it draws in a terminal, not a window, so started without one it");
