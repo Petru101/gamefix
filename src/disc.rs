@@ -178,7 +178,8 @@ fn find_installed(pfx: &Path, name: &str) -> Option<(PathBuf, String)> {
             }
         }
         let exe = exes.into_iter().filter(|e| !unwanted(e)).max_by_key(|e| size(e))?;
-        let label = exe.parent()?.file_name()?.to_string_lossy().into_owned();
+        // Named after its folder, or the one above a System/Bin one (Harry Potter\System\HP.exe).
+        let label = exe.ancestors().skip(1).filter_map(|d| d.file_name()).map(|n| n.to_string_lossy().into_owned()).find(|n| !["system", "bin", "binaries", "win32", "win64", "x86", "x64", "exe"].contains(&n.to_lowercase().as_str()))?;
         Some((exe, label))
     })?;
     Some((exe, label))
@@ -219,12 +220,28 @@ fn link_target(data: &[u8]) -> Option<String> {
 }
 
 /// A Windows path (`Program Files\Game\game.exe`) under `root`, each part matched ignoring
-/// case as Windows does.
+/// case as Windows does. A short 8.3 name (`HARR~FNR` in Harry Potter's shortcut: Wine makes
+/// up the part after the ~) matches the one name starting like it, with the same extension.
 fn resolve(root: &Path, win: &str) -> Option<PathBuf> {
     let mut path = root.to_path_buf();
     for part in win.split('\\').filter(|p| !p.is_empty()) {
         let exact = path.join(part);
-        path = if exact.exists() { exact } else { fs::read_dir(&path).ok()?.flatten().find(|e| e.file_name().to_string_lossy().eq_ignore_ascii_case(part))?.path() };
+        if exact.exists() {
+            path = exact;
+            continue;
+        }
+        let mut names: Vec<_> = fs::read_dir(&path).ok()?.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        let lower = part.to_lowercase();
+        let found = names.iter().find(|n| n.eq_ignore_ascii_case(part)).or_else(|| {
+            let (stem, ext) = lower.split_once('.').map_or((lower.as_str(), ""), |(s, e)| (s, e));
+            let head = stem.split_once('~')?.0;
+            let ext_of = |n: &str| n.rsplit_once('.').map_or(String::new(), |(_, e)| e.to_lowercase());
+            let mut like = names.iter().filter(|n| n.to_lowercase().starts_with(head) && ext_of(n) == ext);
+            let first = like.next();
+            if like.next().is_some() { None } else { first }
+        })?;
+        path = path.join(found);
     }
     Some(path)
 }
@@ -241,6 +258,15 @@ mod tests {
         let wide: Vec<u8> = "C:\\Games\\HP.exe\0".encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
         assert_eq!(link_target(&wide).as_deref(), Some("C:\\Games\\HP.exe"));
         assert_eq!(link_target(b"C:\\readme.txt\0"), None);
+    }
+
+    #[test]
+    fn short_names() {
+        let root = std::env::temp_dir().join(format!("gamefix-short-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("Games/Harry Potter/System")).unwrap();
+        std::fs::write(root.join("Games/Harry Potter/System/HP.exe"), b"").unwrap();
+        assert_eq!(resolve(&root, "Games\\HARR~FNR\\SYSTEM\\HP.exe"), Some(root.join("Games/Harry Potter/System/HP.exe")));
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
