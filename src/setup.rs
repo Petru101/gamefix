@@ -10,7 +10,7 @@ use crate::steam::{self, Steam};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 pub struct Outcome {
     pub done: Vec<String>,
@@ -160,9 +160,7 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
             None if report.problems.iter().any(|p| matches!(p, Problem::Source(..))) => Err("This is the game's source code: it has to be built first.".into()),
             None if report.problems.iter().any(|p| matches!(p, Problem::Package(_, "apk"))) => Err("It's an Android app; get the game's Linux or Windows download instead.".into()),
             None if report.problems.iter().any(|p| matches!(p, Problem::Package(..))) => Err("It's a package to install into the system; get the game's .tar.gz, .zip or AppImage download instead.".into()),
-            None if report.problems.iter().any(|p| matches!(p, Problem::Love { .. } | Problem::Python { .. } | Problem::Java { .. } | Problem::Flash { .. } | Problem::Dos { .. })) => {
-                Err("This game needs another program to run it (see gamefix check); setting it up isn't supported yet.".into())
-            }
+            None if runner_needed(report).is_some() => Err(runner_needed(report).unwrap()),
             None => Err("No game program in this folder. If it's an installer, install the game first and set up the folder it installs to.".into()),
         };
     };
@@ -478,6 +476,86 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
         refresh_menu();
     }
     Ok(Outcome { done, not_fixed })
+}
+
+/// A program from Flathub that runs a kind of game nothing on the system runs.
+pub struct Runner {
+    pub name: &'static str,
+    pub app: &'static str,
+}
+
+/// The Flathub program this game needs and lacks, if setup has nothing else to start it with
+/// (no Linux program, no Windows one, no other runner installed). Installing it is the
+/// caller's to offer: it asks first.
+pub fn missing_runner(game: &Game, report: &Report) -> Option<Runner> {
+    if game.main().is_some() || game.windows.is_some() {
+        return None;
+    }
+    let runnable = report.problems.iter().any(|p| match p {
+        Problem::Java { java, .. } => java.is_some(),
+        Problem::Love { love, version, .. } => love.is_some() || crate::check::old_love(version.as_deref()),
+        Problem::Flash { ruffle, .. } => ruffle.is_some(),
+        Problem::Dos { dosbox, .. } => dosbox.is_some(),
+        _ => false,
+    });
+    if runnable {
+        return None;
+    }
+    report.problems.iter().find_map(|p| match p {
+        Problem::Love { love: None, .. } => Some(Runner { name: "LÖVE", app: "org.love2d.love2d" }),
+        Problem::Flash { ruffle: None, .. } => Some(Runner { name: "Ruffle", app: "rs.ruffle.Ruffle" }),
+        Problem::Dos { dosbox: None, .. } => Some(Runner { name: "DOSBox Staging", app: "io.github.dosbox-staging" }),
+        _ => None,
+    })
+}
+
+/// What setup says when a game's runner isn't installed and nothing installed it.
+fn runner_needed(report: &Report) -> Option<String> {
+    let then = "then set it up again.";
+    report.problems.iter().find_map(|p| match p {
+        Problem::Java { java: None, .. } => Some(format!("This is a Java game, and Java isn't installed. On Bazzite, run \"brew install openjdk\" in a terminal, {then}")),
+        Problem::Love { love: None, version, .. } if !crate::check::old_love(version.as_deref()) => Some(format!("This is a LÖVE game, and LÖVE isn't installed. Install LÖVE from Discover (it's on Flathub), {then}")),
+        Problem::Flash { ruffle: None, .. } => Some(format!("This is a Flash game; it plays in Ruffle, which isn't installed. Install Ruffle from Discover (it's on Flathub), {then}")),
+        Problem::Dos { dosbox: None, .. } => Some(format!("This is a DOS game; it runs in DOSBox Staging, which isn't installed. Install DOSBox Staging from Discover (it's on Flathub), {then}")),
+        Problem::Python { .. } => Some("This is a Python game; gamefix can't set those up yet (see gamefix check).".into()),
+        Problem::Love { .. } => Some("This LÖVE game needs an older LÖVE than any gamefix can set up (see gamefix check).".into()),
+        _ => None,
+    })
+}
+
+/// Flathub's download size for an app, plus its runtime's when that isn't installed yet, as
+/// flatpak prints them ("145.5 MB").
+pub fn flathub_size(app: &str) -> Option<String> {
+    let info = |r: &str| -> Option<String> {
+        ["--user", "--system"].iter().find_map(|i| {
+            let out = Command::new("flatpak").args(["remote-info", i, "flathub", r]).stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
+            out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+        })
+    };
+    let field = |text: &str, name: &str| text.lines().find_map(|l| l.trim().strip_prefix(name).map(|v| v.trim().to_string()));
+    let text = info(app)?;
+    let size = field(&text, "Download Size:")?;
+    let runtime = field(&text, "Runtime:").map(|r| format!("runtime/{r}"));
+    let installed = |r: &str| Command::new("flatpak").args(["info", r]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success());
+    match runtime.filter(|r| !installed(r)).and_then(|r| info(&r)).and_then(|t| field(&t, "Download Size:")) {
+        Some(more) => Some(format!("{size}, plus {more} for the Flatpak runtime it needs")),
+        None => Some(size),
+    }
+}
+
+/// Installs an app from Flathub for this user (no password; the Flathub remote is added for
+/// the user if only the system has it). Kept on undo, like the LÖVE builds: other games use it.
+pub fn install_flatpak(app: &str) -> Result<(), String> {
+    let flatpak = |args: &[&str]| -> Result<(), String> {
+        let out = Command::new("flatpak").args(args).stdin(Stdio::null()).output().map_err(|e| format!("flatpak: {e}"))?;
+        if out.status.success() {
+            return Ok(());
+        }
+        let err = String::from_utf8_lossy(&out.stderr);
+        Err(err.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("flatpak failed").trim().to_string())
+    };
+    flatpak(&["remote-add", "--user", "--if-not-exists", "flathub", "https://dl.flathub.org/repo/flathub.flatpakrepo"])?;
+    flatpak(&["install", "--user", "--noninteractive", "-y", "flathub", app])
 }
 
 /// A font list for old Chromium (NW.js) that can't handle the system's font rules: just the font

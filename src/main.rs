@@ -11,6 +11,7 @@ mod steam;
 mod system;
 mod vdf;
 
+use std::io::{BufRead, IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 
@@ -80,9 +81,29 @@ fn main() -> ExitCode {
 
 fn run(command: &str, game: &scan::Game, targets: &setup::Targets, dialog: bool) -> Said {
     let title = format!("gamefix: {}", game.name);
-    let report = check::check(game, &system::System::load());
+    let mut report = check::check(game, &system::System::load());
     if command == "check" {
         return Said { ok: true, title, text: report.render(game) };
+    }
+    // A game run by a program from Flathub that isn't installed: offer to install it.
+    let mut installed = None;
+    if command == "setup" {
+        if let Some(runner) = setup::missing_runner(game, &report) {
+            let size = setup::flathub_size(runner.app).map(|s| format!(" ({s} to download)")).unwrap_or_default();
+            let question = format!("{} runs in {}, which isn't installed.\n\ngamefix can install it from Flathub{size}, for you only: no password needed.\n\nInstall {} now?", game.name, runner.name, runner.name);
+            if confirm(&title, &question, dialog) {
+                if dialog {
+                    let _ = Command::new("notify-send").args([title.as_str(), &format!("Installing {} from Flathub…", runner.name)]).status();
+                } else {
+                    println!("Installing {} from Flathub…", runner.name);
+                }
+                if let Err(e) = setup::install_flatpak(runner.app) {
+                    return said(&title, Err(format!("{} couldn't be installed: {e}", runner.name)));
+                }
+                report = check::check(game, &system::System::load());
+                installed = Some(format!("Installed {} from Flathub (it stays after undo: other games can use it).", runner.name));
+            }
+        }
     }
     // From the right-click menu there's no terminal to say "close Steam first" in, so ask.
     let needs_steam = targets.steam || (command == "undo" && setup::touches_steam(game));
@@ -99,7 +120,7 @@ fn run(command: &str, game: &scan::Game, targets: &setup::Targets, dialog: bool)
     }
     let result = match command {
         "setup" => setup::setup(game, &report, targets).map(|o| {
-            let mut lines: Vec<String> = o.done.iter().map(|l| format!("✓ {l}")).collect();
+            let mut lines: Vec<String> = installed.iter().chain(&o.done).map(|l| format!("✓ {l}")).collect();
             lines.extend(o.not_fixed.iter().map(|l| format!("✗ {l}")));
             lines
         }),
@@ -119,4 +140,19 @@ fn show(said: &Said) {
 
 fn ask(title: &str, question: &str) -> bool {
     Command::new("kdialog").args(["--title", title, "--yesno", question]).status().is_ok_and(|s| s.success())
+}
+
+/// A yes/no question: in a window from the right-click menu, else on the terminal (no terminal
+/// to answer on, as from a script: no).
+fn confirm(title: &str, question: &str, dialog: bool) -> bool {
+    if dialog {
+        return ask(title, question);
+    }
+    if !std::io::stdin().is_terminal() {
+        return false;
+    }
+    print!("{}\n[y/N] ", question.replace("\n\n", "\n"));
+    let _ = std::io::stdout().flush();
+    let mut answer = String::new();
+    std::io::stdin().lock().read_line(&mut answer).is_ok() && matches!(answer.trim().to_lowercase().as_str(), "y" | "yes")
 }

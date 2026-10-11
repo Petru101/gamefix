@@ -1202,8 +1202,8 @@ impl Report {
                 }
                 Problem::Flash { file, ruffle: None } => {
                     let _ = writeln!(out, "✗ This is a Flash game ({}): Flash Player was retired in 2020.", file.display());
-                    let _ = writeln!(out, "    Fix: install Ruffle from Flathub (rs.ruffle.Ruffle), which plays most Flash games; then");
-                    let _ = writeln!(out, "    gamefix setup adds it to the app menu.");
+                    let _ = writeln!(out, "    Fix: Ruffle from Flathub (rs.ruffle.Ruffle) plays most Flash games: gamefix setup offers to");
+                    let _ = writeln!(out, "    install it, then adds the game to the app menu or Steam.");
                 }
                 Problem::CdFiles { installer } => {
                     let _ = writeln!(out, "• These are a Windows game CD's files; its installer is {}.", installer.display());
@@ -1240,8 +1240,8 @@ impl Report {
                 }
                 Problem::Dos { file, dosbox: None } => {
                     let _ = writeln!(out, "✗ This is a DOS game ({}): Proton can't run DOS programs.", file.display());
-                    let _ = writeln!(out, "    Fix: install DOSBox Staging from Flathub (io.github.dosbox-staging); then gamefix");
-                    let _ = writeln!(out, "    setup adds it to the app menu or Steam.");
+                    let _ = writeln!(out, "    Fix: DOSBox Staging from Flathub (io.github.dosbox-staging) runs it: gamefix setup offers to");
+                    let _ = writeln!(out, "    install it, then adds the game to the app menu or Steam.");
                 }
                 Problem::Package(file, "apk") => {
                     let _ = writeln!(out, "✗ This download is an Android app ({}), not a game for PCs.", file.display());
@@ -1314,7 +1314,8 @@ impl Report {
                             }
                         }
                     } else {
-                        let _ = writeln!(out, "    Fix: install LÖVE from Flathub (org.love2d.love2d); then gamefix setup adds it to the app menu.");
+                        let _ = writeln!(out, "    Fix: LÖVE from Flathub (org.love2d.love2d): gamefix setup offers to install it, then adds the");
+                        let _ = writeln!(out, "    game to the app menu or Steam.");
                     }
                 }
                 Problem::Python { file, v2: true, .. } => {
