@@ -106,10 +106,37 @@ pub fn wait_for_prefix(prefix: &Path) {
 /// Names of installed programs that aren't the game.
 const NOT_THE_PROGRAM: &[&str] = &["unins", "uninst", "readme", "help", "setup", "install", "regist", "update", "website", "manual", "support", "dxsetup"];
 
-/// The game an installer put into a prefix (`<prefix>/pfx`), relative to that folder, and its
-/// name: what the Start Menu or desktop shortcuts it made point to (their names are the game's),
-/// else the biggest program it installed.
-pub fn installed_program(pfx: &Path, name: &str) -> Option<(PathBuf, String)> {
+/// What an installer left in a prefix (`<prefix>/pfx`).
+pub enum Installed {
+    /// The game's program and its name: what the Start Menu or desktop shortcuts it made point
+    /// to (their names are the game's), on whichever drive (an installer may pick Proton's S:,
+    /// the real folder around the one it was started from), else the biggest program it put
+    /// under Program Files.
+    Program(PathBuf, String),
+    /// Shortcuts, but none to a program that could be found: something was installed.
+    Unknown,
+    Nothing,
+}
+
+pub fn installed_program(pfx: &Path, name: &str) -> Installed {
+    match find_installed(pfx, name) {
+        Some((exe, label)) => Installed::Program(exe, label),
+        None if !links(pfx).is_empty() => Installed::Unknown,
+        None => Installed::Nothing,
+    }
+}
+
+/// The .lnk files in a prefix's Start Menu and desktop folders.
+fn links(pfx: &Path) -> Vec<PathBuf> {
+    let c = pfx.join("drive_c");
+    let mut links = Vec::new();
+    for dir in ["ProgramData/Microsoft/Windows/Start Menu", "users/Public/Desktop", "users/steamuser/Desktop", "users/steamuser/AppData/Roaming/Microsoft/Windows/Start Menu"] {
+        find_files(&c.join(dir), "lnk", 0, &mut links);
+    }
+    links
+}
+
+fn find_installed(pfx: &Path, name: &str) -> Option<(PathBuf, String)> {
     let c = pfx.join("drive_c");
     let words = words(name);
     let unwanted = |p: &Path| {
@@ -117,16 +144,13 @@ pub fn installed_program(pfx: &Path, name: &str) -> Option<(PathBuf, String)> {
         NOT_THE_PROGRAM.iter().any(|n| file.contains(n)) || crate::scan::not_the_game(p)
     };
     let size = |p: &Path| fs::metadata(p).map_or(0, |m| m.len());
-    let mut links = Vec::new();
-    for dir in ["ProgramData/Microsoft/Windows/Start Menu", "users/Public/Desktop", "users/steamuser/Desktop", "users/steamuser/AppData/Roaming/Microsoft/Windows/Start Menu"] {
-        find_files(&c.join(dir), "lnk", 0, &mut links);
-    }
-    let from_links = links
+    let from_links = links(pfx)
         .iter()
         .filter_map(|lnk| {
             let target = link_target(&fs::read(lnk).ok()?)?;
-            let rest = target.strip_prefix("C:\\").or_else(|| target.strip_prefix("c:\\"))?;
-            let exe = resolve(&c, rest)?;
+            // Drives are links in dosdevices ("c:" -> ../drive_c, "s:" -> a real folder).
+            let drive = fs::canonicalize(pfx.join("dosdevices").join(target.get(..2)?.to_lowercase())).ok()?;
+            let exe = resolve(&drive, target.get(3..)?)?;
             if !exe.is_file() || unwanted(&exe) {
                 return None;
             }
@@ -157,7 +181,7 @@ pub fn installed_program(pfx: &Path, name: &str) -> Option<(PathBuf, String)> {
         let label = exe.parent()?.file_name()?.to_string_lossy().into_owned();
         Some((exe, label))
     })?;
-    Some((exe.strip_prefix(pfx.parent()?).ok()?.to_path_buf(), label))
+    Some((exe, label))
 }
 
 fn find_files(dir: &Path, ext: &str, depth: usize, out: &mut Vec<PathBuf>) {

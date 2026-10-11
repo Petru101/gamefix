@@ -18,6 +18,7 @@ const USAGE: &str = "usage: gamefix check <game>
        gamefix setup <game> [--menu] [--steam]   (default: --menu)
        gamefix undo <game>
        gamefix right-click [on|off]              Dolphin's right-click menu
+       gamefix games-folder [<folder>]           where installed Windows games go
 <game> is the game's folder or its program; --dialog shows the result in a window";
 
 /// What a command has to say, and whether it went well.
@@ -45,6 +46,8 @@ fn main() -> ExitCode {
         ["right-click", "on"] => said("gamefix", rightclick::enable()),
         ["right-click", "off"] => said("gamefix", rightclick::disable()),
         ["right-click"] => said("gamefix", Ok(vec![format!("The right-click menu is {}.", if rightclick::enabled() { "on" } else { "off" })])),
+        ["games-folder"] => said("gamefix", Ok(vec![format!("Windows games gamefix installs go into {}.", setup::games_folder().display())])),
+        ["games-folder", path] => said("gamefix", setup::set_games_folder(std::path::Path::new(path))),
         [command @ ("check" | "setup" | "undo"), rest @ ..] => {
             // Dolphin passes the path last, after the flags.
             let (flags, paths): (Vec<&str>, Vec<&str>) = rest.iter().partition(|a| a.starts_with("--"));

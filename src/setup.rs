@@ -628,6 +628,45 @@ enum Installer {
     File(PathBuf),
 }
 
+/// A game's name as a folder name: as it is, but for slashes and control characters
+/// ("Harry Potter", like the user's other game folders).
+fn folder_name(name: &str) -> String {
+    let clean: String = name.chars().map(|c| if c == '/' || c.is_control() { ' ' } else { c }).collect();
+    let clean = clean.trim().trim_start_matches('.').to_string();
+    if clean.is_empty() { "Game".into() } else { clean }
+}
+
+fn games_folder_file() -> PathBuf {
+    std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config")).join("gamefix/games-folder")
+}
+
+/// Where installed Windows games go, each in a folder named after it: what
+/// `gamefix games-folder <path>` set, else ~/Games.
+pub fn games_folder() -> PathBuf {
+    fs::read_to_string(games_folder_file()).ok().map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join("Games"))
+}
+
+/// Sets the games folder. It has to be on a Linux drive: a Wine prefix needs links (its drives
+/// are links named "c:"), Unix permissions and case-sensitive names, which NTFS (here through
+/// ntfs-3g, "fuseblk"), FAT and exFAT drives don't give it properly.
+pub fn set_games_folder(path: &Path) -> Result<Vec<String>, String> {
+    let path = fs::canonicalize(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if !path.is_dir() {
+        return Err(format!("{} isn't a folder.", path.display()));
+    }
+    let kind = std::process::Command::new("stat").args(["-f", "-c", "%T"]).arg(&path).output().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+    if ["fuse", "fuseblk", "ntfs", "ntfs3", "msdos", "vfat", "exfat"].contains(&kind.as_str()) {
+        return Err(format!("{} is on a Windows-format drive ({kind}), which can't hold Wine's files properly: pick a folder on a Linux drive.", path.display()));
+    }
+    let probe = path.join(format!(".gamefix-check-{}-c:", std::process::id()));
+    std::os::unix::fs::symlink("drive_c", &probe).map_err(|_| format!("{} is on a drive that can't hold Wine's files: pick a folder on a Linux drive.", path.display()))?;
+    let _ = fs::remove_file(&probe);
+    let file = games_folder_file();
+    fs::create_dir_all(file.parent().unwrap()).map_err(|e| e.to_string())?;
+    fs::write(&file, format!("{}\n", path.display())).map_err(|e| e.to_string())?;
+    Ok(vec![format!("Windows games gamefix installs now go into {}, each in a folder named after it.", path.display())])
+}
+
 /// In a folder setup_install installed a game into: what from, the program, its name.
 const INSTALL_NOTE: &str = "gamefix-install.txt";
 
@@ -651,8 +690,9 @@ fn setup_install(game: &Game, installer: Installer, targets: &Targets) -> Result
     };
     // A game an earlier setup installed from the same disc or installer (undo leaves it) is
     // used again: its folder in ~/Games names its source in gamefix-install.txt.
-    let games = PathBuf::from(std::env::var_os("HOME").ok_or("No home folder.")?).join("Games");
-    let earlier = fs::read_dir(&games).into_iter().flatten().flatten().find_map(|entry| {
+    let games = games_folder();
+    let home_games = PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join("Games");
+    let earlier = [&games, &home_games].into_iter().flat_map(|g| fs::read_dir(g).into_iter().flatten().flatten()).find_map(|entry| {
         let text = fs::read_to_string(entry.path().join(INSTALL_NOTE)).ok()?;
         let field = |key: &str| text.lines().find_map(|l| l.strip_prefix(key)?.strip_prefix('\t').map(String::from));
         let exe = entry.path().join(field("program")?);
@@ -667,9 +707,11 @@ fn setup_install(game: &Game, installer: Installer, targets: &Targets) -> Result
         Some(found) => found,
         None => {
             let umu = program_path("umu-run").ok_or("umu-run (umu-launcher) is needed to run the installer with Proton.")?;
-            let free = |base: &str| (1..).map(|n| games.join(if n == 1 { base.to_string() } else { format!("{base}-{n}") })).find(|d| !d.exists()).unwrap();
-            let prefix = free(&slug(&game.name));
-            fs::create_dir_all(&prefix).map_err(|e| e.to_string())?;
+            let free = |base: &str| (1..).map(|n| games.join(if n == 1 { base.to_string() } else { format!("{base} {n}") })).find(|d| !d.exists()).unwrap();
+            let prefix = games.join(format!(".gamefix-installing-{}", std::process::id()));
+            fs::create_dir_all(&prefix).map_err(|e| format!("Couldn't make {}: {e}", prefix.display()))?;
+            // Its real path (/var/home, not /home, on Bazzite), as the installed program's will be.
+            let prefix = fs::canonicalize(&prefix).map_err(|e| e.to_string())?;
             let (setup, unpacked) = match &installer {
                 Installer::Disc { iso, inside } => {
                     let dir = std::env::temp_dir().join(format!("gamefix-disc-{}", std::process::id()));
@@ -684,6 +726,10 @@ fn setup_install(game: &Game, installer: Installer, targets: &Targets) -> Result
                 .env("WINEPREFIX", &prefix)
                 .env("PROTONPATH", &tool_dir)
                 .env("GAMEID", "umu-0")
+                // No S: drive (umu points it at the whole disk the installer is on): installers
+                // that pick the drive with the most free space chose it, and Harry Potter went
+                // into the user's Downloads/Games. They get their own C: only.
+                .env("PROTON_SET_GAME_DRIVE", "0")
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status();
@@ -692,18 +738,38 @@ fn setup_install(game: &Game, installer: Installer, targets: &Targets) -> Result
                 let _ = fs::remove_dir_all(dir);
             }
             status.map_err(|e| format!("Couldn't start the installer with umu-run: {e}"))?;
-            let Some((rel, name)) = crate::disc::installed_program(&prefix.join("pfx"), &game.name) else {
-                // Only Wine's own files: the prefix was made just now, for this.
-                let _ = fs::remove_dir_all(&prefix);
-                return Err("The installer finished, but it installed no game (was it cancelled?). Nothing was changed.".into());
+            let (exe, name) = match crate::disc::installed_program(&prefix.join("pfx"), &game.name) {
+                crate::disc::Installed::Program(exe, name) => (exe, name),
+                crate::disc::Installed::Unknown => {
+                    let target = free(&folder_name(&game.name));
+                    let prefix = if fs::rename(&prefix, &target).is_ok() { target } else { prefix };
+                    return Err(format!("The installer made shortcuts, but gamefix couldn't find the program they start. The installed game's Windows folder is {}.", prefix.display()));
+                }
+                crate::disc::Installed::Nothing => {
+                    // Only Wine's own files: the prefix was made just now, for this.
+                    let _ = fs::remove_dir_all(&prefix);
+                    return Err("The installer finished, but it installed no game (was it cancelled?). Nothing was changed.".into());
+                }
             };
             // Named after the game now that its name is known (Bookworm Deluxe, not the download's).
-            let named = free(&slug(&name));
-            let prefix = if fs::rename(&prefix, &named).is_ok() { named } else { prefix };
-            let note = format!("source\t{}\nprogram\t{}\nname\t{name}\n", source.display(), rel.display());
+            let named = free(&folder_name(&name));
+            let renamed = fs::rename(&prefix, &named).is_ok();
+            let exe = match exe.strip_prefix(&prefix) {
+                Ok(rel) if renamed => named.join(rel),
+                _ => exe,
+            };
+            let prefix = if renamed { named } else { prefix };
+            // The program's path from the prefix when it's inside, else as it is (a game the
+            // installer put on another drive stays there).
+            let program = exe.strip_prefix(&prefix).unwrap_or(&exe);
+            let note = format!("source\t{}\nprogram\t{}\nname\t{name}\n", source.display(), program.display());
             fs::write(prefix.join(INSTALL_NOTE), note).map_err(|e| e.to_string())?;
-            done.push(format!("Installed it with {tool} into {}.", prefix.display()));
-            (prefix.clone(), prefix.join(rel), name)
+            done.push(if exe.starts_with(&prefix) {
+                format!("Installed it with {tool} into {}.", prefix.display())
+            } else {
+                format!("Installed it with {tool}: the game is in {}, its Windows settings in {}.", exe.parent().and_then(Path::parent).unwrap_or(&exe).display(), prefix.display())
+            });
+            (prefix.clone(), exe, name)
         }
     };
     let record_file = record_path(game);
