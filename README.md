@@ -86,7 +86,8 @@ gamefix prefers changes that work from any shortcut, made where they belong:
   - rewriting a launcher script saved with Windows line endings (the original is kept)
 - **In the shortcut,** settings and libraries for that game:
   - an app-menu entry in `~/.local/share/applications`
-  - a Steam shortcut, or the Steam game's own launch options
+  - a Steam shortcut, or the Steam game's own launch options (fixes for a game's Linux
+    version turn themselves off if you later switch it to Proton in Steam)
 - **In gamefix's own folders** (`~/.local/share/gamefix`): libraries, runtimes and fonts.
 
 Every change is recorded, and `gamefix undo` takes it back. Shared downloads stay after undo

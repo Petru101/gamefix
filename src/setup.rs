@@ -25,12 +25,13 @@ pub struct Targets {
 
 const BWRAP: &str = "/usr/bin/bwrap";
 
-/// Shell code that leaves `"$@"` as a bwrap command hiding the command line of every program
+/// Shell code that adds to `"$@"` a bwrap command hiding the command line of every program
 /// started as `/proc/self/exe` (Steam's and Chrome's helpers), which old Unity mistakes for
 /// itself. Everything else, Steam included, stays visible: a private PID namespace hid Steam
 /// too, so Steamworks games hung and Steam lost track of them. The helpers' numbers change, so
-/// they are looked up at each launch.
-const HIDE_HELPERS: &str = "set -- /usr/bin/bwrap --dev-bind / /; for p in /proc/[0-9]*; do [ \"$(tr '\\0' '\\n' < $p/cmdline 2>/dev/null | head -n 1)\" = /proc/self/exe ] && set -- \"$@\" --ro-bind /dev/null $p/cmdline; done;";
+/// they are looked up at each launch, by one grep: Steam preloads its overlay into everything
+/// a launch starts, and running a program or two per process took 30-40 s.
+const HIDE_HELPERS: &str = "set -- \"$@\" /usr/bin/bwrap --dev-bind / /; for f in $(grep -lzx /proc/self/exe /proc/[0-9]*/cmdline 2>/dev/null); do set -- \"$@\" --ro-bind /dev/null $f; done;";
 
 /// HIDE_HELPERS with more bwrap arguments (shell-quoted here) after the root's.
 fn hide_helpers_with(extra: &[String]) -> String {
@@ -702,7 +703,7 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
         // A Steam game: its own launch options, keeping whatever was there.
         let file = steam.localconfig();
         let previous = steam::launch_options(&file, appid)?;
-        let options = launch_options(&env, &[], old_runtime.as_deref(), wrap.as_deref(), previous.as_deref().unwrap_or(""));
+        let options = native_options(&env, old_runtime.as_deref(), wrap.as_deref(), previous.as_deref().unwrap_or(""));
         if options != previous.clone().unwrap_or_default() {
             steam::set_launch_options(&file, appid, Some(&options))?;
             let previous = previous.map_or("-".to_string(), |p| format!("={p}"));
@@ -716,7 +717,7 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
             exe: &start,
             start_dir: workdir,
             icon: if icon.starts_with('/') { &icon } else { "" },
-            launch_options: &launch_options(&env, &[], old_runtime.as_deref(), wrap.as_deref(), ""),
+            launch_options: &native_options(&env, old_runtime.as_deref(), wrap.as_deref(), ""),
         };
         let appid = steam::add_shortcut(&file, &shortcut)?;
         record.push(format!("steam-shortcut\t{appid}\t{}", file.display()));
@@ -1362,7 +1363,7 @@ fn setup_install(game: &Game, installer: Installer, targets: &Targets) -> Result
     let own = proton::ignored_dlls(&exe);
     let mut env = vec![("STEAM_COMPAT_DATA_PATH", prefix.display().to_string())];
     add_overrides(&mut env, &own);
-    let line = launch_options(&env, &[], None, None, "");
+    let line = launch_options(&env, &[], "");
     let shortcuts = steam.shortcuts();
     let workdir = exe.parent().unwrap_or(&prefix);
     let shortcut = steam::Shortcut { name: &name, exe: &exe, start_dir: workdir, icon: "", launch_options: &line };
@@ -1489,7 +1490,7 @@ fn setup_windows(game: &Game, report: &Report, exe: &crate::scan::Found, targets
         let args = options.as_ref().map(|o| o.args.clone()).unwrap_or_default();
         let file = steam.localconfig();
         let previous = steam::launch_options(&file, appid)?;
-        let line = launch_options(&env, &args, None, None, previous.as_deref().unwrap_or(""));
+        let line = launch_options(&env, &args, previous.as_deref().unwrap_or(""));
         if line != previous.clone().unwrap_or_default() {
             steam::set_launch_options(&file, appid, Some(&line))?;
             done.push(match &previous {
@@ -1536,7 +1537,7 @@ fn setup_windows(game: &Game, report: &Report, exe: &crate::scan::Found, targets
         None => {}
     }
     add_overrides(&mut env, &own);
-    let line = launch_options(&env, &[], None, None, "");
+    let line = launch_options(&env, &[], "");
     let shortcut = steam::Shortcut { name: &game.name, exe: &program, start_dir: workdir, icon: "", launch_options: &line };
     let appid = steam::add_shortcut(&file, &shortcut)?;
     let mut record = vec![format!("steam-shortcut\t{appid}\t{}", file.display())];
@@ -1606,44 +1607,68 @@ fn dll_files(dlls: &[String]) -> String {
 }
 
 /// Steam runs launch options with `sh -c`, `%command%` standing for its launch helpers and the
-/// game. Settings go first and the wrappers (Steam's old runtime's run.sh, then the helper
-/// hiding) right before `%command%`, so they fit around options already there (`gamemoderun
-/// %command%`, or bare game arguments like `-insecure`). Steam itself preloads its overlay, so
-/// LD_PRELOAD adds to it instead of replacing it. Game arguments go right after `%command%`. A
-/// setting or argument the options already have is left as it is.
-fn launch_options(env: &[(&str, String)], args: &[String], runtime: Option<&Path>, wrap: Option<&str>, existing: &str) -> String {
-    let words: Vec<&str> = existing.split_whitespace().collect();
-    let env: Vec<&(&str, String)> = env.iter().filter(|(k, _)| matches!(*k, "LD_PRELOAD" | "LD_LIBRARY_PATH") || !words.iter().any(|w| w.starts_with(&format!("{k}=")))).collect();
-    let args: Vec<&String> = args.iter().filter(|a| !words.contains(&a.split(' ').next().unwrap_or(""))).collect();
-    let runtime = runtime.map(|r| r.display().to_string()).filter(|r| !existing.contains(r.as_str()));
-    if env.is_empty() && args.is_empty() && runtime.is_none() && wrap.is_none() {
-        return existing.to_string();
-    }
-    let quote = |v: &str| if v.chars().all(|c| c.is_ascii_alphanumeric() || "/-_.=+:,".contains(c)) { v.to_string() } else { format!("'{}'", v.replace('\'', "'\\''")) };
-    let settings: Vec<String> = env
-        .iter()
-        .map(|(k, v)| if matches!(*k, "LD_PRELOAD" | "LD_LIBRARY_PATH") { format!("{k}=\"${{{k}:+${k}:}}{v}\"") } else { format!("{k}={}", quote(v)) })
-        .collect();
-    let command = if wrap.is_some() { "\"$@\" %command%".to_string() } else { "%command%".to_string() };
-    let command = match &runtime {
-        Some(run) => format!("{} {command}", quote(run)),
-        None => command,
-    };
-    let command = args.iter().fold(command, |c, a| format!("{c} {a}"));
-    let command = command.as_str();
+/// game. What gamefix adds fits around options already there (`gamemoderun %command%`, or bare
+/// game arguments like `-insecure`), and a setting the options already have is left as it is.
+fn fit_options(existing: &str, command: &str) -> String {
     let existing = existing.trim();
-    let rest = if existing.contains("%command%") {
+    if existing.contains("%command%") {
         existing.replacen("%command%", command, 1)
     } else if existing.is_empty() {
         command.to_string()
     } else {
         format!("{command} {existing}")
-    };
-    let line = settings.into_iter().chain([rest]).collect::<Vec<_>>().join(" ");
-    match wrap {
-        Some(wrap) => format!("{wrap} {line}"),
-        None => line,
     }
+}
+
+/// `env` as shell settings, leaving out those the options already have. Steam itself preloads
+/// its overlay, so LD_PRELOAD adds to it instead of replacing it.
+fn settings(env: &[(&str, String)], existing: &str) -> Vec<String> {
+    let words: Vec<&str> = existing.split_whitespace().collect();
+    env.iter()
+        .filter(|(k, _)| matches!(*k, "LD_PRELOAD" | "LD_LIBRARY_PATH") || !words.iter().any(|w| w.starts_with(&format!("{k}="))))
+        .map(|(k, v)| if matches!(*k, "LD_PRELOAD" | "LD_LIBRARY_PATH") { format!("{k}=\"${{{k}:+${k}:}}{v}\"") } else { format!("{k}={}", sh_word(v)) })
+        .collect()
+}
+
+fn sh_word(v: &str) -> String {
+    if v.chars().all(|c| c.is_ascii_alphanumeric() || "/-_.=+:,".contains(c)) { v.to_string() } else { format!("'{}'", v.replace('\'', "'\\''")) }
+}
+
+/// A Windows game's options from ProtonDB: settings first, game arguments right after
+/// `%command%`, leaving out arguments the options already have.
+fn launch_options(env: &[(&str, String)], args: &[String], existing: &str) -> String {
+    let words: Vec<&str> = existing.split_whitespace().collect();
+    let settings = settings(env, existing);
+    let args: Vec<&String> = args.iter().filter(|a| !words.contains(&a.split(' ').next().unwrap_or(""))).collect();
+    if settings.is_empty() && args.is_empty() {
+        return existing.to_string();
+    }
+    let command = args.iter().fold("%command%".to_string(), |c, a| format!("{c} {a}"));
+    settings.into_iter().chain([fit_options(existing, &command)]).collect::<Vec<_>>().join(" ")
+}
+
+/// A Linux build's options: the settings exported, the wrappers (Steam's old runtime's run.sh,
+/// then the helper hiding) gathered in `"$@"` right before `%command%`. Steam keeps a game's
+/// options when it's switched to its Windows build, where these fixes get in Proton's way
+/// (Particle Fleet's Windows build ended up inside bwrap and played badly), so they only
+/// apply without STEAM_COMPAT_PROTON, which Steam sets for every Proton launch and for no native
+/// one (tested: Cookard, Moonlighter in the Steam Linux Runtime).
+fn native_options(env: &[(&str, String)], runtime: Option<&Path>, wrap: Option<&str>, existing: &str) -> String {
+    let settings = settings(env, existing);
+    let runtime = runtime.map(|r| r.display().to_string()).filter(|r| !existing.contains(r.as_str()));
+    if settings.is_empty() && runtime.is_none() && wrap.is_none() {
+        return existing.to_string();
+    }
+    let mut fixes = Vec::new();
+    if !settings.is_empty() {
+        fixes.push(format!("export {};", settings.join(" ")));
+    }
+    if let Some(run) = &runtime {
+        fixes.push(format!("set -- {};", sh_word(run)));
+    }
+    fixes.extend(wrap.map(str::to_string));
+    let command = if runtime.is_some() || wrap.is_some() { "\"$@\" %command%" } else { "%command%" };
+    format!("[ -n \"$STEAM_COMPAT_PROTON\" ] || {{ {} }}; {}", fixes.join(" "), fit_options(existing, command))
 }
 
 /// Whether undoing this game's setup changes Steam's files.
@@ -1748,29 +1773,55 @@ mod tests {
     #[test]
     fn launch_options_fit_around_existing_ones() {
         let env = [("GLIBC_TUNABLES", "glibc.rtld.execstack=2".to_string())];
-        assert_eq!(launch_options(&env, &[], None, None, ""), "GLIBC_TUNABLES=glibc.rtld.execstack=2 %command%");
-        assert_eq!(launch_options(&[], &[], None, Some(HIDE_HELPERS), "STEAM_COMPAT_LAUNCHER_SERVICE=proton %command%"), format!("{HIDE_HELPERS} STEAM_COMPAT_LAUNCHER_SERVICE=proton \"$@\" %command%"));
-        assert_eq!(launch_options(&env, &[], None, None, "-insecure"), "GLIBC_TUNABLES=glibc.rtld.execstack=2 %command% -insecure");
-        assert_eq!(launch_options(&[], &[], None, None, "-insecure"), "-insecure");
+        let native = |fixes: &str, rest: &str| format!("[ -n \"$STEAM_COMPAT_PROTON\" ] || {{ {fixes} }}; {rest}");
+        assert_eq!(native_options(&env, None, None, ""), native("export GLIBC_TUNABLES=glibc.rtld.execstack=2;", "%command%"));
+        assert_eq!(native_options(&[], None, Some(HIDE_HELPERS), "STEAM_COMPAT_LAUNCHER_SERVICE=proton %command%"), native(HIDE_HELPERS, "STEAM_COMPAT_LAUNCHER_SERVICE=proton \"$@\" %command%"));
+        assert_eq!(native_options(&env, None, None, "-insecure"), native("export GLIBC_TUNABLES=glibc.rtld.execstack=2;", "%command% -insecure"));
+        assert_eq!(native_options(&[], None, None, "-insecure"), "-insecure");
+        assert_eq!(native_options(&env, None, None, "GLIBC_TUNABLES=x %command%"), "GLIBC_TUNABLES=x %command%");
         // From ProtonDB's table: arguments right after %command%, nothing the options already have.
         let wined3d = [("PROTON_USE_WINED3D", "1".to_string())];
         let args = ["-force-d3d11".to_string(), "--rendering-driver vulkan".to_string()];
-        assert_eq!(launch_options(&wined3d, &args, None, None, ""), "PROTON_USE_WINED3D=1 %command% -force-d3d11 --rendering-driver vulkan");
-        assert_eq!(launch_options(&wined3d, &args[..1], None, None, "gamemoderun %command% -skipintro"), "PROTON_USE_WINED3D=1 gamemoderun %command% -force-d3d11 -skipintro");
-        assert_eq!(launch_options(&wined3d, &args[..1], None, None, "PROTON_USE_WINED3D=0 %command% -force-d3d11"), "PROTON_USE_WINED3D=0 %command% -force-d3d11");
+        assert_eq!(launch_options(&wined3d, &args, ""), "PROTON_USE_WINED3D=1 %command% -force-d3d11 --rendering-driver vulkan");
+        assert_eq!(launch_options(&wined3d, &args[..1], "gamemoderun %command% -skipintro"), "PROTON_USE_WINED3D=1 gamemoderun %command% -force-d3d11 -skipintro");
+        assert_eq!(launch_options(&wined3d, &args[..1], "PROTON_USE_WINED3D=0 %command% -force-d3d11"), "PROTON_USE_WINED3D=0 %command% -force-d3d11");
         // Steam doesn't pass its old runtime's libraries on to games: its run.sh goes in front.
         let run = Path::new("/home/a b/.local/share/Steam/ubuntu12_32/steam-runtime/run.sh");
         let libs = [("LD_LIBRARY_PATH", "/x/libs".to_string())];
-        assert_eq!(launch_options(&libs, &[], Some(run), None, ""), "LD_LIBRARY_PATH=\"${LD_LIBRARY_PATH:+$LD_LIBRARY_PATH:}/x/libs\" '/home/a b/.local/share/Steam/ubuntu12_32/steam-runtime/run.sh' %command%");
-        assert_eq!(launch_options(&[], &[], Some(run), Some(HIDE_HELPERS), "gamemoderun %command%"), format!("{HIDE_HELPERS} gamemoderun '{}' \"$@\" %command%", run.display()));
-        assert_eq!(launch_options(&[], &[], Some(run), None, "'/home/a b/.local/share/Steam/ubuntu12_32/steam-runtime/run.sh' %command%"), "'/home/a b/.local/share/Steam/ubuntu12_32/steam-runtime/run.sh' %command%");
+        assert_eq!(native_options(&libs, Some(run), None, ""), native(&format!("export LD_LIBRARY_PATH=\"${{LD_LIBRARY_PATH:+$LD_LIBRARY_PATH:}}/x/libs\"; set -- '{}';", run.display()), "\"$@\" %command%"));
+        assert_eq!(native_options(&[], Some(run), Some(HIDE_HELPERS), "gamemoderun %command%"), native(&format!("set -- '{}'; {HIDE_HELPERS}", run.display()), "gamemoderun \"$@\" %command%"));
+        assert_eq!(native_options(&[], Some(run), None, "'/home/a b/.local/share/Steam/ubuntu12_32/steam-runtime/run.sh' %command%"), "'/home/a b/.local/share/Steam/ubuntu12_32/steam-runtime/run.sh' %command%");
+    }
+
+    /// Run the way Steam runs them, the fixes apply to a native launch and stay out of a Proton one.
+    #[test]
+    fn native_options_step_aside_for_proton() {
+        let run = Path::new("/a b/run.sh");
+        let env = [("LD_PRELOAD", "/x.so".to_string())];
+        let line = native_options(&env, Some(run), Some(HIDE_HELPERS), "gamemoderun %command% -insecure").replace("gamemoderun", "printf '%s|' \"$LD_PRELOAD\"").replace("%command%", "game");
+        let out = |proton: bool| {
+            let mut sh = std::process::Command::new("sh");
+            sh.arg("-c").arg(&line).env_remove("LD_PRELOAD").env_remove("STEAM_COMPAT_PROTON");
+            if proton {
+                sh.env("STEAM_COMPAT_PROTON", "1");
+            }
+            String::from_utf8_lossy(&sh.output().unwrap().stdout).into_owned()
+        };
+        assert!(out(false).starts_with("/x.so|/a b/run.sh|/usr/bin/bwrap|--dev-bind|/|/|"), "{}", out(false));
+        assert!(out(false).ends_with("|game|-insecure|"));
+        assert_eq!(out(true), "|game|-insecure|");
     }
 
     /// The snippet must hide exactly the /proc/self/exe helpers and run the command after it.
     #[test]
     fn hide_helpers_runs_the_command() {
+        use std::os::unix::process::CommandExt;
+        let mut helper = std::process::Command::new("sleep").arg0("/proc/self/exe").arg("5").spawn().unwrap();
         let out = std::process::Command::new("sh").arg("-c").arg(format!("{HIDE_HELPERS} printf '%s ' \"$@\"")).output().unwrap();
-        assert!(String::from_utf8_lossy(&out.stdout).starts_with("/usr/bin/bwrap --dev-bind / / "));
+        helper.kill().ok();
+        let out = String::from_utf8_lossy(&out.stdout);
+        assert!(out.starts_with("/usr/bin/bwrap --dev-bind / / "));
+        assert!(out.contains(&format!(" --ro-bind /dev/null /proc/{}/cmdline ", helper.id())), "{out}");
         let extra = ["--ro-bind".to_string(), "/a b's".to_string(), "/x".to_string()];
         let out = std::process::Command::new("sh").arg("-c").arg(format!("{} printf '%s|' \"$@\"", hide_helpers_with(&extra))).output().unwrap();
         assert!(String::from_utf8_lossy(&out.stdout).starts_with("/usr/bin/bwrap|--dev-bind|/|/|--ro-bind|/a b's|/x|"));
