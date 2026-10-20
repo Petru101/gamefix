@@ -226,7 +226,8 @@ pub enum Provider {
 }
 
 /// The winetricks component providing a DLL Wine lacks, from what old games use: MFC, the
-/// Visual Basic runtimes, OpenAL, PhysX's loader, an MP3 codec.
+/// Visual Basic runtimes, OpenAL, PhysX's loader, an MP3 codec, Games for Windows Live (gone
+/// since 2014; xliveless stands in for it, as protonfixes does for Dirt 2 and Fable III).
 fn provider(dll: &str) -> Provider {
     let stem = dll.trim_end_matches(".dll");
     let stem = stem.strip_suffix('u').filter(|s| s.starts_with("mfc")).unwrap_or(stem);
@@ -241,6 +242,7 @@ fn provider(dll: &str) -> Provider {
         "openal32" => Provider::Component("openal"),
         "physxloader" | "physxcore" | "physxcooking" | "physxdevice" => Provider::Component("physx"),
         "l3codeca" => Provider::Component("l3codecx"),
+        "xlive" => Provider::Component("xliveless"),
         s if ["msvcp", "msvcr", "vcruntime", "ucrtbase", "concrt", "vcomp"].iter().any(|p| s.starts_with(p)) && s.ends_with('d') => Provider::DebugBuild,
         _ => Provider::Unknown,
     }
@@ -282,7 +284,33 @@ pub fn missing_parts(program: &Path) -> Vec<(String, Provider)> {
             }
         }
     }
+    // PhysX 2's loader shipped without its engine (PhysXCore.dll), which comes from NVIDIA's PhysX
+    // System Software: Unreal Engine 3 games load it by name at run time, so it's in no import
+    // table (Alien Breed 2: PhysXLocal/PhysXLoader.dll only, "PhysX not installed or corrupt";
+    // Dishonored brings both and runs).
+    if !missing.iter().any(|(_, p)| *p == Provider::Component("physx")) {
+        if let Some(dir) = program.parent() {
+            let files = files_below(dir, 2);
+            let has = |name: &str| files.iter().any(|f| f.eq_ignore_ascii_case(name));
+            if has("physxloader.dll") && !has("physxcore.dll") {
+                missing.push(("PhysXCore.dll".into(), Provider::Component("physx")));
+            }
+        }
+    }
     missing
+}
+
+/// File names in a folder and the folders below it, `depth` levels down.
+fn files_below(dir: &Path, depth: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+        match entry.file_type() {
+            Ok(t) if t.is_dir() && depth > 0 => out.extend(files_below(&entry.path(), depth - 1)),
+            Ok(t) if t.is_file() => out.push(entry.file_name().to_string_lossy().into_owned()),
+            _ => {}
+        }
+    }
+    out
 }
 
 /// A WINEDLLOVERRIDES value making Wine use the game's own copies first.
@@ -385,6 +413,7 @@ mod tests {
         assert_eq!(provider("physxloader.dll"), Provider::Component("physx"));
         assert_eq!(provider("msvcp140d.dll"), Provider::DebugBuild);
         assert_eq!(provider("ucrtbased.dll"), Provider::DebugBuild);
+        assert_eq!(provider("xlive.dll"), Provider::Component("xliveless"));
         assert_eq!(provider("somegame.dll"), Provider::Unknown);
     }
 
