@@ -454,6 +454,15 @@ pub fn net_standard(dir: &Path) -> Vec<String> {
 
 /// The Windows game program: not an installer, helper or .NET part of a Linux build.
 fn pick_windows(root: &Path, files: &[Found]) -> Option<usize> {
+    // GOG's own pick from its .info (Beyond Good and Evil: CheckApplication.exe, not BGE.exe),
+    // unless it's an emulator GOG wraps an old game in (Tyrian 2000's DOSBox).
+    if let Some(info) = crate::gog::read(root) {
+        let emulator = stem(&info.program).to_lowercase().starts_with("dosbox") || stem(&info.program).to_lowercase().starts_with("scummvm");
+        let found = files.iter().position(|f| root.join(&f.path) == info.program && matches!(&f.binary, Binary::Pe(pe) if pe.installer.is_none()));
+        if let Some(i) = found.filter(|_| !emulator) {
+            return Some(i);
+        }
+    }
     // Letters and digits only: goal-rush's game is GoalRush/goalrush.exe.
     let plain = |s: &str| s.to_lowercase().chars().filter(|c| c.is_alphanumeric()).collect::<String>();
     let folder = plain(&root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());

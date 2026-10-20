@@ -5,6 +5,7 @@ mod dotnet;
 mod feedback;
 mod fetch;
 mod font;
+mod gog;
 mod love;
 mod proton;
 mod python;
@@ -14,6 +15,7 @@ mod scan;
 mod setup;
 mod steam;
 mod system;
+mod umu;
 mod vdf;
 
 use std::io::{BufRead, IsTerminal, Write};

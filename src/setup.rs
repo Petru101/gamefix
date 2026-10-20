@@ -1362,6 +1362,11 @@ fn setup_install(game: &Game, installer: Installer, targets: &Targets) -> Result
     }
     let own = proton::ignored_dlls(&exe);
     let mut env = vec![("STEAM_COMPAT_DATA_PATH", prefix.display().to_string())];
+    let umu = crate::umu::find(&prefix, &exe);
+    let fixes_tool = umu.as_ref().and_then(|u| protonfixes_tool(&steam, u, &mut done, &mut not_fixed));
+    if let (Some(umu), Some(_)) = (&umu, &fixes_tool) {
+        env.extend(umu.env());
+    }
     add_overrides(&mut env, &own);
     let line = launch_options(&env, &[], "");
     let shortcuts = steam.shortcuts();
@@ -1371,10 +1376,15 @@ fn setup_install(game: &Game, installer: Installer, targets: &Targets) -> Result
     record.push(format!("steam-shortcut\t{appid}\t{}", shortcuts.display()));
     let config = steam.config();
     let previous = steam::compat_tool(&config, appid)?;
+    let fixed = fixes_tool.is_some();
+    let tool = fixes_tool.unwrap_or(tool);
     steam::set_compat_tool(&config, appid, Some(&tool))?;
     record.push(format!("steam-compat\t{appid}\t{}\t{}", config.display(), previous.map_or("-".to_string(), |p| format!("={p}"))));
     fs::write(&record_file, record.join("\n") + "\n").map_err(|e| e.to_string())?;
     done.push(format!("Added \"{name}\" to Steam as a non-Steam game, run with {tool} in that folder's Wine prefix."));
+    if let Some(umu) = umu.as_ref().filter(|_| fixed) {
+        done.push(protonfixes_done(umu, &tool));
+    }
     if !own.is_empty() {
         done.push(format!("Wine uses the game's own {} instead of its built-in copy, as Windows would.", dll_files(&own)));
     }
@@ -1517,11 +1527,23 @@ fn setup_windows(game: &Game, report: &Report, exe: &crate::scan::Found, targets
         fs::write(&record_file, record.join("\n") + "\n").map_err(|e| e.to_string())?;
         return Ok(Outcome { done, not_fixed });
     }
-    let proton = steam.proton().ok_or("No Proton is installed in Steam. Install \"Proton Experimental\" from the Steam library (it's listed under Tools) and try again.")?;
     let program = game.full(exe);
-    let workdir = program.parent().unwrap_or(&game.root);
+    let umu = crate::umu::find(&game.root, &program);
+    let fixes_tool = umu.as_ref().and_then(|u| protonfixes_tool(&steam, u, &mut done, &mut not_fixed));
+    let proton = match &fixes_tool {
+        Some(tool) => tool.clone(),
+        None => steam.proton().ok_or("No Proton is installed in Steam. Install \"Proton Experimental\" from the Steam library (it's listed under Tools) and try again.")?,
+    };
+    // GOG's own way of starting it, when gamefix picked GOG's program.
+    let gog = crate::gog::read(&game.root).filter(|g| g.program == program);
+    let workdir = gog.as_ref().and_then(|g| g.workdir.clone()).unwrap_or_else(|| program.parent().unwrap_or(&game.root).to_path_buf());
+    let args = gog.as_ref().map(|g| g.args.clone()).unwrap_or_default();
     let file = steam.shortcuts();
     let mut env = Vec::new();
+    if let (Some(umu), Some(_)) = (&umu, &fixes_tool) {
+        env.extend(umu.env());
+    }
+    let mut own_prefix = None;
     // RPG Maker XP's runtime package, in a prefix of gamefix's own that Steam is pointed to.
     match report.problems.iter().find_map(|p| if let Problem::RgssRtp(kind) = p { Some(*kind) } else { None }) {
         Some("XP") => {
@@ -1536,16 +1558,32 @@ fn setup_windows(game: &Game, report: &Report, exe: &crate::scan::Found, targets
         Some(kind) => not_fixed.push(format!("RPG Maker {kind}'s runtime package: gamefix installs only XP's so far; install it into the game's Proton prefix ({}).", crate::rpgmaker::RTP_PAGE)),
         None => {}
     }
+    if let Some((gog, helper)) = gog.as_ref().and_then(|g| Some((g, g.helper.as_ref()?))).filter(|_| !env.iter().any(|(k, _)| *k == "STEAM_COMPAT_DATA_PATH")) {
+        match gog_prefix(&steam, &proton, game, gog, helper) {
+            Ok((prefix, note)) => {
+                done.push(note);
+                env.push(("STEAM_COMPAT_DATA_PATH", prefix.display().to_string()));
+                own_prefix = Some(prefix);
+            }
+            Err(e) => not_fixed.push(e),
+        }
+    }
     add_overrides(&mut env, &own);
-    let line = launch_options(&env, &[], "");
-    let shortcut = steam::Shortcut { name: &game.name, exe: &program, start_dir: workdir, icon: "", launch_options: &line };
+    let line = shortcut_options(&env, &args);
+    let shortcut = steam::Shortcut { name: &game.name, exe: &program, start_dir: &workdir, icon: "", launch_options: &line };
     let appid = steam::add_shortcut(&file, &shortcut)?;
     let mut record = vec![format!("steam-shortcut\t{appid}\t{}", file.display())];
+    if let Some(prefix) = &own_prefix {
+        record.insert(0, format!("game-prefix\t{}", prefix.display()));
+    }
     let config = steam.config();
     let previous = steam::compat_tool(&config, appid)?;
     steam::set_compat_tool(&config, appid, Some(&proton))?;
     record.push(format!("steam-compat\t{appid}\t{}\t{}", config.display(), previous.map_or("-".to_string(), |p| format!("={p}"))));
-    install_components(&steam, game, appid, &components, &mut done, &mut not_fixed, &mut record);
+    match &own_prefix {
+        Some(prefix) => winetricks_into(&steam, &proton, prefix, &components, &mut done, &mut not_fixed),
+        None => install_components(&steam, game, appid, &components, &mut done, &mut not_fixed, &mut record),
+    }
 
     let record_file = record_path(game);
     fs::create_dir_all(record_file.parent().unwrap()).map_err(|e| e.to_string())?;
@@ -1553,11 +1591,94 @@ fn setup_windows(game: &Game, report: &Report, exe: &crate::scan::Found, targets
     if targets.menu {
         not_fixed.push("App-menu entries for Windows games aren't supported yet; start it from Steam.".into());
     }
-    done.extend([format!("Added \"{}\" to Steam as a non-Steam game.", game.name), format!("Set it to run with Proton ({proton}).")]);
+    done.push(format!("Added \"{}\" to Steam as a non-Steam game.", game.name));
+    match umu.as_ref().filter(|_| fixes_tool.is_some()) {
+        Some(umu) => done.push(protonfixes_done(umu, &proton)),
+        None => done.push(format!("Set it to run with Proton ({proton}).")),
+    }
     if !own.is_empty() {
         done.push(format!("Set its launch options to {line}: Wine uses the game's own {} instead of its built-in copy, as Windows would.", dll_files(&own)));
     }
+    if gog.is_some() {
+        done.push(format!("Starts it the way GOG Galaxy does: {}{}.", program.strip_prefix(&game.root).unwrap_or(&program).display(), if args.is_empty() { String::new() } else { format!(" {}", args.join(" ")) }));
+    }
     Ok(Outcome { done, not_fixed })
+}
+
+/// GOG's first-run helper (what Galaxy runs once after installing: Beyond Good and Evil's puts
+/// Creative's eax.dll into Windows' system folder and writes Ubisoft's registry keys), run
+/// silently with Galaxy's arguments into a Wine prefix of the game's own,
+/// ~/.local/share/gamefix/prefixes/<slug>, which its shortcut then uses. Run once per prefix (a
+/// `gog-helper` file there names it). Undo leaves the prefix: the game's settings and saves
+/// are in it.
+fn gog_prefix(steam: &Steam, tool: &str, game: &Game, gog: &crate::gog::Info, helper: &Path) -> Result<(PathBuf, String), String> {
+    let name = helper.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let failed = |what: &str| format!("GOG's first-run helper ({name}) couldn't be run: {what}. It sets up what the game expects from Windows; the game may not start without it.");
+    let dir = data_home().join("gamefix/prefixes").join(slug(&game.name));
+    fs::create_dir_all(&dir).map_err(|e| failed(&e.to_string()))?;
+    // Its real path (/var/home, not /home, on Bazzite), as Steam will be given it.
+    let dir = fs::canonicalize(&dir).map_err(|e| failed(&e.to_string()))?;
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+    let shown = fs::canonicalize(&home).ok().and_then(|h| dir.strip_prefix(h).ok().map(|d| format!("~/{}", d.display()))).unwrap_or_else(|| dir.display().to_string());
+    if fs::read_to_string(dir.join("gog-helper")).is_ok_and(|t| t.trim() == name) {
+        return Ok((dir, format!("Its Steam shortcut uses the game's own Wine prefix, {shown}, where GOG's first-run helper ran before.")));
+    }
+    let umu = program_path("umu-run").ok_or_else(|| failed("umu-run (umu-launcher) isn't installed"))?;
+    let tool_dir = steam.tool_dir(tool).ok_or_else(|| failed(&format!("{tool} wasn't found")))?;
+    let game_dir = format!("Z:{}", gog.dir.display()).replace('/', "\\");
+    let status = Command::new(&umu)
+        .arg(helper)
+        .args(["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/Language=English", "/LANG=english", "/galaxyclient", "/nodesktopshortcut"])
+        .arg(format!("/DIR={game_dir}"))
+        .arg(format!("/ProductId={}", gog.id))
+        .current_dir(helper.parent().unwrap_or(&gog.dir))
+        .env("WINEPREFIX", &dir)
+        .env("PROTONPATH", &tool_dir)
+        .env("GAMEID", "umu-0")
+        .env("PROTON_SET_GAME_DRIVE", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    crate::disc::wait_for_prefix(&dir);
+    match status {
+        Ok(s) if s.success() => {}
+        Ok(s) => return Err(failed(&format!("it ended with {s}"))),
+        Err(e) => return Err(failed(&format!("umu-run: {e}"))),
+    }
+    fs::write(dir.join("gog-helper"), format!("{name}\n")).map_err(|e| failed(&e.to_string()))?;
+    Ok((dir, format!("Ran GOG's first-run helper ({name}) with {tool} into a Wine prefix of the game's own, {shown}, which its Steam shortcut uses (undo leaves it: the game's settings and saves are there).")))
+}
+
+/// Windows components (winetricks) for a game run in a prefix of gamefix's own, which
+/// protontricks doesn't know: umu-run's winetricks into that prefix.
+fn winetricks_into(steam: &Steam, tool: &str, prefix: &Path, components: &[&str], done: &mut Vec<String>, not_fixed: &mut Vec<String>) {
+    if components.is_empty() {
+        return;
+    }
+    let list = components.join(" ");
+    let installed = program_path("umu-run").zip(steam.tool_dir(tool)).is_some_and(|(umu, tool_dir)| {
+        let status = Command::new(umu).arg("winetricks").arg("-q").args(components).env("WINEPREFIX", prefix).env("PROTONPATH", tool_dir).env("GAMEID", "umu-0").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
+        crate::disc::wait_for_prefix(prefix);
+        status.is_ok_and(|s| s.success())
+    });
+    if installed {
+        done.push(format!("Installed {list} into its Wine prefix (winetricks; undo leaves them, they're harmless)."));
+    } else {
+        not_fixed.push(format!("Installing {list} with winetricks failed; `WINEPREFIX={} umu-run winetricks {list}` in a terminal shows why.", prefix.display()));
+    }
+}
+
+/// A non-Steam shortcut's launch options. Steam drops `%command%` from them and puts its launch
+/// helpers and the program at the very end (seen in its console log), so arguments for the
+/// program can't follow `%command%`: `sh -c 'exec "$@" <arguments>' sh %command%` puts them
+/// after it.
+fn shortcut_options(env: &[(&str, String)], args: &[String]) -> String {
+    if args.is_empty() {
+        return launch_options(env, &[], "");
+    }
+    let script = format!("exec \"$@\" {}", args.iter().map(|a| if a.is_empty() { "''".to_string() } else { sh_word(a) }).collect::<Vec<_>>().join(" "));
+    settings(env, "").into_iter().chain([format!("sh -c {} sh %command%", sh_word(&script))]).collect::<Vec<_>>().join(" ")
 }
 
 /// Installs winetricks components into the game's Proton prefix with protontricks (the host's,
@@ -1588,6 +1709,32 @@ fn install_components(steam: &Steam, game: &Game, appid: u32, components: &[&str
     } else {
         not_fixed.push(format!("Installing {list} with protontricks failed; `protontricks {appid} {list}` in a terminal shows why."));
     }
+}
+
+/// A Proton whose protonfixes has a fix for this game: the newest GE-Proton installed, else
+/// another installed one carrying it (UMU-Proton), else the latest GE-Proton, downloaded.
+/// Valve's Protons have no protonfixes.
+fn protonfixes_tool(steam: &Steam, umu: &crate::umu::Game, done: &mut Vec<String>, not_fixed: &mut Vec<String>) -> Option<String> {
+    let has_fix = |tool: &str| steam.tool_dir(tool).is_some_and(|dir| umu.fixed_by(&dir));
+    if let Some(tool) = steam.newest_ge().filter(|t| has_fix(t)).or_else(|| steam.tools().into_iter().rev().find(|t| has_fix(t))) {
+        return Some(tool);
+    }
+    match proton::fetch_ge(steam) {
+        Ok(tool) => {
+            done.push(format!("Downloaded {tool} into Steam's compatibility tools (undo leaves it: other games can use it)."));
+            if has_fix(&tool) {
+                return Some(tool);
+            }
+            not_fixed.push(format!("protonfixes has a fix for this game ({}, {}), but {tool}'s copy doesn't have it yet.", umu.title, umu.id));
+        }
+        Err(e) => not_fixed.push(format!("{e} protonfixes, part of GE-Proton, has a fix for this game ({}, {}); ProtonUp-Qt (Flathub) can install GE-Proton.", umu.title, umu.id)),
+    }
+    None
+}
+
+fn protonfixes_done(umu: &crate::umu::Game, tool: &str) -> String {
+    let env: Vec<String> = umu.env().iter().map(|(k, v)| format!("{k}={v}")).collect();
+    format!("Set it to run with {tool}: its protonfixes has a fix for this game ({}, {}), which {} in its launch options point it to.", umu.title, umu.id, env.join(" "))
 }
 
 /// Adds WINEDLLOVERRIDES making Wine use the game's own copies of these DLLs to the settings.
@@ -1731,6 +1878,7 @@ pub fn undo(game: &Game) -> Result<Vec<String>, String> {
                     }
                 }
             }
+            ["game-prefix", prefix] => undone.push(format!("Left its Wine prefix in {prefix}: the game's settings and saves are there. Delete that folder to remove them.")),
             ["installed-game", prefix, ..] => undone.push(format!("Left the installed game in {prefix}: delete that folder to remove it.")),
             ["steam-shortcut", appid, file] => {
                 if let Ok(appid) = appid.parse() {
@@ -1810,6 +1958,19 @@ mod tests {
         assert!(out(false).starts_with("/x.so|/a b/run.sh|/usr/bin/bwrap|--dev-bind|/|/|"), "{}", out(false));
         assert!(out(false).ends_with("|game|-insecure|"));
         assert_eq!(out(true), "|game|-insecure|");
+    }
+
+    /// Steam drops `%command%` and appends its helpers and the program; the arguments must
+    /// still come after the program.
+    #[test]
+    fn shortcut_arguments_follow_the_program() {
+        let args = vec![r".\videos\cdv.avi".to_string(), "it's two".to_string(), String::new()];
+        let line = shortcut_options(&[("STEAM_COMPAT_DATA_PATH", "/a b".to_string())], &args);
+        assert!(line.starts_with("STEAM_COMPAT_DATA_PATH='/a b' sh -c "), "{line}");
+        let steam = format!("{} sh -c 'printf \"%s|\" \"$STEAM_COMPAT_DATA_PATH\" \"$@\"' x game.exe", line.replace("%command%", ""));
+        let out = std::process::Command::new("sh").arg("-c").arg(&steam).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), r"/a b|game.exe|.\videos\cdv.avi|it's two||");
+        assert_eq!(shortcut_options(&[("A", "1".to_string())], &[]), "A=1 %command%");
     }
 
     /// The snippet must hide exactly the /proc/self/exe helpers and run the command after it.

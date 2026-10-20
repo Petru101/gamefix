@@ -9,6 +9,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use crate::gog::find_nocase;
+
 /// Enterbrain's RPG Maker XP runtime package (Inno Setup), as rpgmakerweb.com offers it.
 const XP_RTP: (&str, &str) = ("https://assets.rpgmakerweb.com/xp_rtp104e.exe", "b3bd20ad7f413b40ac233aafd2e061de1dc429c2eadb59d0b3157ba3c47f16b2");
 
@@ -20,13 +22,6 @@ fn ini_value(text: &str, key: &str) -> Option<String> {
     text.lines().find_map(|l| {
         let (k, v) = l.split_once('=')?;
         k.trim().eq_ignore_ascii_case(key).then(|| v.trim().to_string())
-    })
-}
-
-/// A file in a folder, its name's case ignored (Windows games mix them), `\` as the separator.
-fn find_nocase(dir: &Path, rel: &str) -> Option<PathBuf> {
-    rel.split(['\\', '/']).filter(|p| !p.is_empty()).try_fold(dir.to_path_buf(), |at, part| {
-        fs::read_dir(&at).ok()?.flatten().map(|e| e.path()).find(|p| p.file_name().is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(part)))
     })
 }
 

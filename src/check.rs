@@ -1624,6 +1624,16 @@ impl Report {
                             }
                             _ => {
                                 let _ = writeln!(out, "    Fix: run {} with Proton: gamefix setup --steam adds it to Steam that way.", game.files[i].path.display());
+                                let gog = crate::gog::read(&game.root).filter(|g| g.program == game.full(&game.files[i]));
+                                if let Some(helper) = gog.as_ref().and_then(|g| g.helper.as_ref()) {
+                                    let _ = writeln!(out, "• GOG Galaxy runs a first-run helper once after installing it, which sets up what the");
+                                    let _ = writeln!(out, "  game expects from Windows (registry keys, system DLLs): {}.", helper.file_name().unwrap_or_default().to_string_lossy());
+                                    let _ = writeln!(out, "    gamefix setup --steam runs it once, into a Wine prefix of the game's own.");
+                                }
+                                if let Some(umu) = crate::umu::find(&game.root, &game.full(&game.files[i])) {
+                                    let _ = writeln!(out, "• protonfixes (part of GE-Proton and UMU-Proton) has a fix for this game: {}, {}.", umu.title, umu.id);
+                                    let _ = writeln!(out, "    gamefix setup --steam runs it with one of those and tells protonfixes which game it is.");
+                                }
                             }
                         }
                         for (what, _) in &anticheat {

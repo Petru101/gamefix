@@ -33,7 +33,10 @@ A few examples of what it finds and fixes:
   - Game Boy games in mGBA
   - TIC-80 cartridges in TIC-80
 - **Windows games:** it adds them to Steam with Proton. For Steam games, it picks the Proton
-  version that ProtonDB players' reports say works. It runs installers and installs from disc
+  version that ProtonDB players' reports say works. For GOG and Epic games that
+  [protonfixes](https://github.com/Open-Wine-Components/umu-protonfixes) has a fix for, it
+  picks GE-Proton and tells protonfixes which game it is. GOG games start the way GOG Galaxy
+  starts them, and GOG's first-run helper is run once. It runs installers and installs from disc
   images once, then adds the installed game. It can also add Windows parts an old game needs
   (MFC, Visual Basic 6, XNA ...) to its Proton setup.
 
@@ -88,7 +91,8 @@ gamefix prefers changes that work from any shortcut, made where they belong:
   - an app-menu entry in `~/.local/share/applications`
   - a Steam shortcut, or the Steam game's own launch options (fixes for a game's Linux
     version turn themselves off if you later switch it to Proton in Steam)
-- **In gamefix's own folders** (`~/.local/share/gamefix`): libraries, runtimes and fonts.
+- **In gamefix's own folders** (`~/.local/share/gamefix`): libraries, runtimes, fonts, and
+  Wine prefixes for games that need one of their own (undo keeps those: your saves are in them).
 
 Every change is recorded, and `gamefix undo` takes it back. Shared downloads stay after undo
 because other games can use them: LÖVE builds, .NET and Python runtimes, GE-Proton, and
@@ -141,6 +145,10 @@ fixes it writes start games with them.
 export ([bdefore/protondb-data](https://github.com/bdefore/protondb-data)) under the
 [Open Database License](https://opendatacommons.org/licenses/odbl/1-0/). They're made by
 `tools/protondb-tables.py`, and are under the same licence.
+
+`data/umu-fixes.tsv` is derived from [umu-database](https://github.com/Open-Wine-Components/umu-database)
+(GPL-3.0) and the list of fixes in [umu-protonfixes](https://github.com/Open-Wine-Components/umu-protonfixes)
+(BSD-2-Clause). It's made by `tools/umu-table.py`.
 
 ## Made with AI
 
