@@ -27,7 +27,7 @@ A few examples of what it finds and fixes:
   - Java games on a Java version that still runs them
   - Python games in a Python of their own, with the packages they need
   - .NET games on Microsoft's .NET
-  - DOS games in DOSBox Staging
+  - DOS games in DOSBox Staging, GOG's DOS releases too (instead of the Windows DOSBox they bring)
   - Flash games in Ruffle
   - RPG Maker 2000/2003 games in EasyRPG Player
   - Game Boy games in mGBA
@@ -39,7 +39,8 @@ A few examples of what it finds and fixes:
   [protonfixes](https://github.com/Open-Wine-Components/umu-protonfixes) has a fix for, it
   picks GE-Proton and tells protonfixes which game it is. GOG games start the way GOG Galaxy
   starts them, and GOG's first-run helper is run once. It runs installers and installs from disc
-  images once, then adds the installed game to Steam. It can also add Windows parts an old game needs
+  images once, then adds the installed game to Steam. Games packed in an Unreal Development
+  Kit installer (`UDKInstall-<name>.exe`) are unpacked next to it instead. It can also add Windows parts an old game needs
   (MFC, Visual Basic 6, XNA ...) to its Proton setup.
 
 When something can't be fixed, gamefix says so and why. Examples: anti-cheat that doesn't run

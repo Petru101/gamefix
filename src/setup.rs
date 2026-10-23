@@ -120,7 +120,7 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
     if report.problems.iter().any(|p| matches!(p, Problem::UnityDataMissing(_))) {
         return Err("The download lacks the game's data folder (see gamefix check): nothing to set up.".into());
     }
-    if let Some(Problem::LinuxInstaller(file) | Problem::RpgMakerPacked { file, .. }) = report.problems.iter().find(|p| matches!(p, Problem::LinuxInstaller(_) | Problem::RpgMakerPacked { .. })) {
+    if let Some(Problem::LinuxInstaller(file) | Problem::UdkInstaller(file) | Problem::RpgMakerPacked { file, .. }) = report.problems.iter().find(|p| matches!(p, Problem::LinuxInstaller(_) | Problem::UdkInstaller(_) | Problem::RpgMakerPacked { .. })) {
         return setup_unpacked(game, file, targets);
     }
     let Some((main, _)) = game.main() else {
@@ -618,7 +618,7 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
             Problem::Alsa32(None) => not_fixed.push("Its 32-bit ALSA sound: needs Steam's runtime (install Steam), which has a plugin that works.".into()),
             Problem::KickFiles(files) => not_fixed.push(format!("Its missing Mono files ({}): only the developer can add them; the .exe with Proton works.", files.join(", "))),
             Problem::FnaLibs(libs) => not_fixed.push(format!("Its missing native libraries ({}): get FNA's fnalibs, or use the Windows download with Proton.", libs.join(", "))),
-            Problem::NoLinuxBuild | Problem::UnityDataMissing(_) | Problem::LinuxInstaller(_) | Problem::OwnWindowsDlls(_) | Problem::MissingWindowsParts(_) | Problem::Source(..) | Problem::Web(_) | Problem::UnityWeb(_) | Problem::Damaged(_) | Problem::Package(..) | Problem::Flash { .. } | Problem::Tic { .. } | Problem::Rom { .. } | Problem::Mono { .. } | Problem::Dotnet { .. } | Problem::RpgMaker { .. } | Problem::RpgMakerPacked { .. } | Problem::RgssRtp(_) | Problem::Dos { .. } | Problem::Disc { .. } | Problem::CdFiles { .. } | Problem::Protected { .. } | Problem::Archive(_) | Problem::WrongMachine(_) | Problem::Love { .. } | Problem::Python { .. } | Problem::Java { .. } => {}
+            Problem::NoLinuxBuild | Problem::UnityDataMissing(_) | Problem::LinuxInstaller(_) | Problem::UdkInstaller(_) | Problem::OwnWindowsDlls(_) | Problem::MissingWindowsParts(_) | Problem::Source(..) | Problem::Web(_) | Problem::UnityWeb(_) | Problem::Damaged(_) | Problem::Package(..) | Problem::Flash { .. } | Problem::Tic { .. } | Problem::Rom { .. } | Problem::Mono { .. } | Problem::Dotnet { .. } | Problem::RpgMaker { .. } | Problem::RpgMakerPacked { .. } | Problem::RgssRtp(_) | Problem::Dos { .. } | Problem::Disc { .. } | Problem::CdFiles { .. } | Problem::Protected { .. } | Problem::Archive(_) | Problem::WrongMachine(_) | Problem::Love { .. } | Problem::Python { .. } | Problem::Java { .. } => {}
         }
     }
     if !preload.is_empty() {
@@ -1125,11 +1125,13 @@ fn setup_runner(game: &Game, command: Vec<String>, file: &Path, name: &str, targ
     Ok(Outcome { done, not_fixed })
 }
 
-/// The folder a Linux installer's game is unpacked into: its name without words like
-/// "Linux" and "Installer" ("MazeBurrow_v0_7_LinuxInstaller" → "MazeBurrow_v0_7").
+/// The folder an installer's game is unpacked into: its name without words like "Linux" and
+/// "Installer" ("MazeBurrow_v0_7_LinuxInstaller" → "MazeBurrow_v0_7", "UDKInstall-RetroBikePrk.exe"
+/// → "RetroBikePrk").
 pub fn unpacked_name(installer: &Path) -> String {
     let name = installer.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-    let mut base = name.strip_suffix(".run").or_else(|| name.strip_suffix(".bin")).unwrap_or(&name).to_string();
+    let base = [".run", ".bin", ".exe"].iter().find_map(|e| name.strip_suffix(e)).unwrap_or(&name);
+    let mut base = crate::scan::udk_title(base).to_string();
     loop {
         let lower = base.to_lowercase();
         let Some(word) = ["installer", "install", "setup", "linux64", "linux32", "linux", "x86_64", "x86", "64bit", "32bit"].iter().find(|w| lower.ends_with(*w)) else { break };
@@ -1140,7 +1142,8 @@ pub fn unpacked_name(installer: &Path) -> String {
 }
 
 /// A game still in its package, unpacked into a folder named after it beside it, then that set
-/// up: a MojoSetup installer (its zip's `data/`, what the installer would copy), an RPG Maker
+/// up: a MojoSetup installer (its zip's `data/`, what the installer would copy), a UDK
+/// installer (its whole zip, without running UnSetup), an RPG Maker
 /// game disk or self-extractor (all of it, with 7-Zip). A folder already unpacked there (by the
 /// self-extractor itself, or an earlier setup) is used as it is. The unpacked game is set up
 /// under the download's name, so undo on the download finds it; undo leaves the folder, like
@@ -1160,10 +1163,16 @@ fn setup_unpacked(game: &Game, file: &Path, targets: &Targets) -> Result<Outcome
         let unpacked = if rpg {
             crate::rpgmaker::unpack(&installer, &tmp).map(|_| tmp.clone())
         } else {
+            // MojoSetup's game is the zip's data/; UnSetup's is all of it (Binaries, Engine,
+            // <name>Game), the installer itself a .NET program among them.
+            let udk = matches!(crate::binary::identify(&installer), Some(crate::binary::Binary::Pe(_)));
+            let (only, inside): (&[&str], &str) = if udk { (&[], "Binaries") } else { (&["data/*"], "data") };
             // unzip warns (exit 1) about the installer's program before the zip.
-            let out = Command::new("unzip").args(["-q", "-o"]).arg(&installer).arg("data/*").arg("-d").arg(&tmp).output().map_err(|e| format!("unzip: {e}"))?;
-            if out.status.code().is_none_or(|c| c > 1) || !tmp.join("data").is_dir() {
+            let out = Command::new("unzip").args(["-q", "-o"]).arg(&installer).args(only).arg("-d").arg(&tmp).output().map_err(|e| format!("unzip: {e}"))?;
+            if out.status.code().is_none_or(|c| c > 1) || !tmp.join(inside).is_dir() {
                 Err(format!("Couldn't unpack the game from {}: {}", installer.display(), String::from_utf8_lossy(&out.stderr).trim()))
+            } else if udk {
+                Ok(tmp.clone())
             } else {
                 Ok(tmp.join("data"))
             }
@@ -1966,6 +1975,7 @@ mod tests {
         assert_eq!(unpacked_name(Path::new("/g/MazeBurrow_v0_7_LinuxInstaller")), "MazeBurrow_v0_7");
         assert_eq!(unpacked_name(Path::new("/g/game-linux-x86_64-setup.run")), "game");
         assert_eq!(unpacked_name(Path::new("/g/Installer")), "Installer (unpacked)");
+        assert_eq!(unpacked_name(Path::new("/g/UDKInstall-RetroBikePrk.exe")), "RetroBikePrk");
     }
 
     #[test]

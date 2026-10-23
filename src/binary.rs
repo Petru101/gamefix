@@ -1087,11 +1087,12 @@ fn pe(f: &mut File, h: &[u8]) -> Option<Pe> {
     } else {
         None
     };
-    // Installer stubs name themselves in their resources, near the start of the file.
+    // Installer stubs name themselves in their resources, near the start of the file. Epic's
+    // UDK installer (UnSetup) names its stub in its debug path; the game is a zip after it.
     let mut stub = Vec::new();
     f.seek(SeekFrom::Start(0)).ok()?;
     f.take(8 << 20).read_to_end(&mut stub).ok()?;
-    let installer = [("Inno Setup", "Inno Setup"), ("Nullsoft", "NSIS"), ("InstallShield", "InstallShield")]
+    let installer = [("UnSetupNativeWrapper", "UnSetup"), ("Inno Setup", "Inno Setup"), ("Nullsoft", "NSIS"), ("InstallShield", "InstallShield")]
         .into_iter()
         .find(|(marker, _)| stub.windows(marker.len()).any(|w| w == marker.as_bytes()))
         .map(|(_, name)| name);

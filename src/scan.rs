@@ -9,7 +9,7 @@ const MAX_DEPTH: usize = 8;
 const MAX_FILES: usize = 50_000;
 
 /// Programs that ship next to games but aren't the game.
-const NOT_THE_GAME: &[&str] = &["crashhandler", "crashpad", "createdump", "crashreport", "chrome-sandbox", "unins", "redist", "vc_redist", "dxsetup", "steamwebhelper", "quicksfv", "nacl_helper", "nwjc", "chromedriver", "minidump_stackwalk", "ffmpeg", "ffprobe", "ffplay", "oalinst"];
+const NOT_THE_GAME: &[&str] = &["gogdosconfig", "crashhandler", "crashpad", "createdump", "crashreport", "chrome-sandbox", "unins", "redist", "vc_redist", "dxsetup", "steamwebhelper", "quicksfv", "nacl_helper", "nwjc", "chromedriver", "minidump_stackwalk", "ffmpeg", "ffprobe", "ffplay", "oalinst"];
 
 pub struct Found {
     /// Relative to the game's root.
@@ -267,11 +267,16 @@ fn folder_title(dir: &Path) -> Option<String> {
 
 /// A file's name as the game's, with its folder's before a generic one ("Downloads setup").
 fn file_title(dir: &Path, file: &Path) -> String {
-    let s = stem(file);
+    let s = udk_title(&stem(file)).to_string();
     match folder_title(dir) {
         Some(folder) if generic(&s) => format!("{folder} {s}"),
         _ => s,
     }
+}
+
+/// A UDK installer's name without its "UDKInstall-" ("UDKInstall-RetroBikePrk" → "RetroBikePrk").
+pub fn udk_title(name: &str) -> &str {
+    name.strip_prefix("UDKInstall-").or_else(|| name.strip_prefix("UDKInstall_")).filter(|n| !n.is_empty()).unwrap_or(name)
 }
 
 /// Folders that hold unrelated downloads rather than one game.
@@ -330,6 +335,11 @@ fn walk(root: &Path, rel: &Path, depth: usize, out: &mut Vec<Found>) {
 
 fn stem(path: &Path) -> String {
     path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
+}
+
+/// A DOSBox a DOS game brings (GOG's Tyrian 2000): never the game, the DOS program is.
+pub fn bundled_dosbox(path: &Path) -> bool {
+    stem(path).to_lowercase().starts_with("dosbox")
 }
 
 pub fn not_the_game(path: &Path) -> bool {
@@ -471,12 +481,17 @@ fn pick_windows(root: &Path, files: &[Found]) -> Option<usize> {
         .enumerate()
         .filter_map(|(i, f)| {
             let Binary::Pe(pe) = &f.binary else { return None };
-            if pe.installer.is_some() || not_the_game(&f.path) || !f.path.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe")) {
+            if pe.installer.is_some() || not_the_game(&f.path) || !f.path.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe")) || bundled_dosbox(&f.path) {
                 return None;
             }
             let dir = root.join(f.path.parent().unwrap_or(Path::new("")));
             let s = stem(&f.path);
             let mut score = 0;
+            // A map or level editor next to the game (StarCraft II Editor_x64.exe, 64-bit, beat
+            // the 32-bit StarCraft II.exe).
+            if s.to_lowercase().contains("editor") {
+                score -= 5;
+            }
             if dir.join(format!("{s}_Data")).is_dir() {
                 score += 10;
             }
@@ -639,10 +654,26 @@ fn pick_dos(root: &Path, files: &[Found]) -> Option<usize> {
             if !s.is_empty() && folder.contains(&s) {
                 score += 2;
             }
+            if dosbox_runs(&root.join(f.path.parent().unwrap_or(Path::new(""))), &f.path) {
+                score += 5;
+            }
             Some((score, fs::metadata(root.join(&f.path)).map_or(0, |m| m.len()), i))
         })
         .max_by_key(|&(score, size, i)| (score, size, std::cmp::Reverse(i)))
         .map(|(_, _, i)| i)
+}
+
+/// Whether a DOSBox config beside a DOS program runs it from its [autoexec] (GOG's Tyrian 2000:
+/// dosboxT2K_single.conf's menu runs tyrian.exe, not the bigger tyrian2.exe it starts).
+fn dosbox_runs(dir: &Path, program: &Path) -> bool {
+    let name = program.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+    let stem = stem(program).to_lowercase();
+    let Ok(entries) = fs::read_dir(dir) else { return false };
+    entries.flatten().filter(|e| e.file_name().to_string_lossy().to_lowercase().ends_with(".conf")).any(|e| {
+        let text = String::from_utf8_lossy(&fs::read(e.path()).unwrap_or_default()).to_lowercase();
+        let Some((_, autoexec)) = text.split_once("[autoexec]") else { return false };
+        autoexec.lines().filter_map(|l| l.trim().trim_start_matches('@').split_whitespace().next()).any(|w| w == name || w == stem)
+    })
 }
 
 /// The LÖVE version the game says it was made for: `t.version = "0.10.1"` in its conf.lua.

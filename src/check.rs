@@ -32,6 +32,9 @@ pub enum Problem {
     Damaged(PathBuf),
     /// A Linux installer (MojoSetup) with the game packed inside, and no program besides.
     LinuxInstaller(PathBuf),
+    /// Epic's UDK installer (UnSetup): the game is a zip after its program, unpacked rather
+    /// than installed (Retro Bike Park's only download was added to Steam as the game).
+    UdkInstaller(PathBuf),
     /// Unity 2018.2-2018.3 with its resolution window enabled starts at 1x1 pixels when the
     /// window can't open (ScreenSelector.so needs GTK 2): one colour fills the screen (Baldi's
     /// Basics, Brownie Cove, Precedence). Steam's runtime has GTK 2; its run.sh, if any.
@@ -443,7 +446,7 @@ pub fn check(game: &Game, system: &System) -> Report {
                 // Ren'Py keeps its Windows Python and helpers in lib/windows-* (8: lib/py3-windows-*):
                 // not a Windows build.
                 None if f.path.components().any(|c| c.as_os_str().to_string_lossy().trim_start_matches("py3-").trim_start_matches("py2-").starts_with("windows-")) && game.main.is_some() => {}
-                None if !scan::not_the_game(&f.path) && !(pe.dotnet && (game.main.is_some() || game.portable.is_some())) => windows.push((f.path.clone(), pe.bits)),
+                None if !scan::not_the_game(&f.path) && !scan::bundled_dosbox(&f.path) && !(pe.dotnet && (game.main.is_some() || game.portable.is_some())) => windows.push((f.path.clone(), pe.bits)),
                 None => {}
             }
         }
@@ -512,6 +515,7 @@ pub fn check(game: &Game, system: &System) -> Report {
                     Binary::Package(kind) => Some((f.path.clone(), kind)),
                     _ => None,
                 });
+                let udk = report.installers.iter().find(|(_, kind)| *kind == "UnSetup").map(|(p, _)| p.clone());
                 let source = if game.windows.is_none() { source_project(&game.root) } else { None };
                 let web = if game.windows.is_none() { web_export(&game.root) } else { None };
                 let unity_web = if game.windows.is_none() { unity_web(&game.root) } else { None };
@@ -524,6 +528,7 @@ pub fn check(game: &Game, system: &System) -> Report {
                         Problem::RpgMakerPacked { file, kind, dest }
                     }
                     _ if game.linux_installer.is_some() => Problem::LinuxInstaller(game.files[game.linux_installer.unwrap()].path.clone()),
+                    _ if udk.is_some() && game.windows.is_none() => Problem::UdkInstaller(udk.unwrap()),
                     _ if game.cd_installer.is_some() => Problem::CdFiles { installer: game.files[game.cd_installer.unwrap()].path.clone() },
                     _ if game.disc.is_some() => {
                         let file = game.files[game.disc.unwrap()].path.clone();
@@ -1760,6 +1765,11 @@ impl Report {
                 Problem::LinuxInstaller(file) => {
                     let _ = writeln!(out, "• {} is an installer (MojoSetup) with the game packed inside it.", file.display());
                     let _ = writeln!(out, "  gamefix setup unpacks the game into the folder \"{}\" next to it and sets that up.", crate::setup::unpacked_name(file));
+                }
+                Problem::UdkInstaller(file) => {
+                    let _ = writeln!(out, "• {} is an installer (Epic's UDK installer) with the game packed inside it.", file.display());
+                    let _ = writeln!(out, "  gamefix setup unpacks the game into the folder \"{}\" next to it, without running", crate::setup::unpacked_name(file));
+                    let _ = writeln!(out, "  the installer, and sets that up.");
                 }
                 Problem::UnityResolution(run) => {
                     let _ = writeln!(out, "✗ When its start-up resolution window is on (most games), this Unity version (2018.2-2018.3)");
