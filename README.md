@@ -32,12 +32,14 @@ A few examples of what it finds and fixes:
   - RPG Maker 2000/2003 games in EasyRPG Player
   - Game Boy games in mGBA
   - TIC-80 cartridges in TIC-80
-- **Windows games:** it adds them to Steam with Proton. For Steam games, it picks the Proton
+- **Windows games:** it adds them to your app menu (started with Proton through
+  [umu-launcher](https://github.com/Open-Wine-Components/umu-launcher), in a Wine prefix of
+  the game's own) or to Steam with Proton. For Steam games, it picks the Proton
   version that ProtonDB players' reports say works. For GOG and Epic games that
   [protonfixes](https://github.com/Open-Wine-Components/umu-protonfixes) has a fix for, it
   picks GE-Proton and tells protonfixes which game it is. GOG games start the way GOG Galaxy
   starts them, and GOG's first-run helper is run once. It runs installers and installs from disc
-  images once, then adds the installed game. It can also add Windows parts an old game needs
+  images once, then adds the installed game to Steam. It can also add Windows parts an old game needs
   (MFC, Visual Basic 6, XNA ...) to its Proton setup.
 
 When something can't be fixed, gamefix says so and why. Examples: anti-cheat that doesn't run

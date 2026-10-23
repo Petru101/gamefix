@@ -1559,8 +1559,8 @@ impl Report {
                     let components: Vec<&str> = parts.iter().filter_map(|(_, p)| if let Provider::Component(c) = p { Some(*c) } else { None }).collect();
                     if !components.is_empty() {
                         let _ = writeln!(out, "✗ It needs parts of Windows that neither the game brings nor Proton has: {}.", names(|p| matches!(p, Provider::Component(_))));
-                        let _ = writeln!(out, "    Fix: install {} into its Proton prefix (protontricks); gamefix setup --steam does", components.join(" "));
-                        let _ = writeln!(out, "    that once the game has been started from Steam once.");
+                        let _ = writeln!(out, "    Fix: install {} into its Wine prefix (winetricks); gamefix setup does that (for a", components.join(" "));
+                        let _ = writeln!(out, "    game in Steam, with --steam, once it has been started from Steam once).");
                     }
                     let debug = names(|p| *p == Provider::DebugBuild);
                     if !debug.is_empty() {
@@ -1578,7 +1578,7 @@ impl Report {
                     let _ = writeln!(out, "✗ It brings its own {}, replacing a part of Windows. Windows would use the", files.join(", "));
                     let _ = writeln!(out, "  game's copy, but Wine uses its own unless told otherwise, so the game may not look or");
                     let _ = writeln!(out, "  sound as it should (Empire Earth flickers without its own ddraw.dll).");
-                    let _ = writeln!(out, "    Fix (at launch): WINEDLLOVERRIDES={}; gamefix setup --steam adds it.", crate::proton::overrides(dlls));
+                    let _ = writeln!(out, "    Fix (at launch): WINEDLLOVERRIDES={}; gamefix setup adds it.", crate::proton::overrides(dlls));
                 }
                 Problem::Web(file) => {
                     let _ = writeln!(out, "✗ This is a web (HTML5) game ({}): it runs in a browser, not as a program.", file.display());
@@ -1623,16 +1623,16 @@ impl Report {
                                 }
                             }
                             _ => {
-                                let _ = writeln!(out, "    Fix: run {} with Proton: gamefix setup --steam adds it to Steam that way.", game.files[i].path.display());
+                                let _ = writeln!(out, "    Fix: run {} with Proton: gamefix setup adds it to the app menu that way (--steam: to Steam).", game.files[i].path.display());
                                 let gog = crate::gog::read(&game.root).filter(|g| g.program == game.full(&game.files[i]));
                                 if let Some(helper) = gog.as_ref().and_then(|g| g.helper.as_ref()) {
                                     let _ = writeln!(out, "• GOG Galaxy runs a first-run helper once after installing it, which sets up what the");
                                     let _ = writeln!(out, "  game expects from Windows (registry keys, system DLLs): {}.", helper.file_name().unwrap_or_default().to_string_lossy());
-                                    let _ = writeln!(out, "    gamefix setup --steam runs it once, into a Wine prefix of the game's own.");
+                                    let _ = writeln!(out, "    gamefix setup runs it once, into a Wine prefix of the game's own.");
                                 }
                                 if let Some(umu) = crate::umu::find(&game.root, &game.full(&game.files[i])) {
                                     let _ = writeln!(out, "• protonfixes (part of GE-Proton and UMU-Proton) has a fix for this game: {}, {}.", umu.title, umu.id);
-                                    let _ = writeln!(out, "    gamefix setup --steam runs it with one of those and tells protonfixes which game it is.");
+                                    let _ = writeln!(out, "    gamefix setup runs it with one of those and tells protonfixes which game it is.");
                                 }
                             }
                         }
@@ -1788,7 +1788,7 @@ impl Report {
                     let _ = writeln!(out, "  character\" mark), so it can't run. Downloading it again won't help; only the developer");
                     let _ = writeln!(out, "  can fix it by uploading it again.");
                     if let Some(i) = game.windows {
-                        let _ = writeln!(out, "    Fix: run {} with Proton instead: gamefix setup --steam adds it to Steam that way.", game.files[i].path.display());
+                        let _ = writeln!(out, "    Fix: run {} with Proton instead: gamefix setup adds it to the app menu that way (--steam: to Steam).", game.files[i].path.display());
                     }
                 }
                 Problem::Love { file, version, love } => {

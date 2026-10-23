@@ -1430,14 +1430,15 @@ fn jogl_natives(lib: &Path) -> Result<(Vec<PathBuf>, String), String> {
 /// reports say runs it (Steam's own choice stays when there's none); a download becomes a
 /// non-Steam shortcut with Experimental. Games whose anti-cheat stops them are left alone.
 fn setup_windows(game: &Game, report: &Report, exe: &crate::scan::Found, targets: &Targets) -> Result<Outcome, String> {
-    if !targets.steam {
-        return Err("Windows games can only be set up in Steam for now: add --steam.".into());
-    }
+    // Steam's Protons are used for app-menu entries too, so Steam is needed either way.
     let steam = Steam::find().ok_or("Steam isn't installed, or nobody has logged in to it yet.")?;
-    if steam.running() {
+    if targets.steam && steam.running() {
         return Err(STEAM_OPEN.into());
     }
     let appid = steam::installed_app(&game.root);
+    if appid.is_some() && !targets.steam {
+        return Err("It's a Steam game: start it from Steam, or set it up in Steam (add --steam).".into());
+    }
     let own: Vec<String> = report.problems.iter().find_map(|p| if let Problem::OwnWindowsDlls(d) = p { Some(d.clone()) } else { None }).unwrap_or_default();
     let mut components: Vec<&str> = report.problems.iter().flat_map(|p| match p {
         Problem::MissingWindowsParts(parts) => parts.iter().filter_map(|(_, p)| if let proton::Provider::Component(c) = p { Some(*c) } else { None }).collect(),
@@ -1568,36 +1569,66 @@ fn setup_windows(game: &Game, report: &Report, exe: &crate::scan::Found, targets
             Err(e) => not_fixed.push(e),
         }
     }
-    add_overrides(&mut env, &own);
-    let line = shortcut_options(&env, &args);
-    let shortcut = steam::Shortcut { name: &game.name, exe: &program, start_dir: &workdir, icon: "", launch_options: &line };
-    let appid = steam::add_shortcut(&file, &shortcut)?;
-    let mut record = vec![format!("steam-shortcut\t{appid}\t{}", file.display())];
-    if let Some(prefix) = &own_prefix {
-        record.insert(0, format!("game-prefix\t{}", prefix.display()));
+    // An app-menu entry runs it with umu-run, which needs a prefix of its own: the game's in
+    // gamefix's prefixes folder, which a Steam shortcut made with it uses too, so both share
+    // the game's settings and saves.
+    if targets.menu && !env.iter().any(|(k, _)| *k == "STEAM_COMPAT_DATA_PATH") {
+        let dir = data_home().join("gamefix/prefixes").join(slug(&game.name));
+        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        // Its real path (/var/home, not /home, on Bazzite), as Steam will be given it.
+        let dir = fs::canonicalize(&dir).map_err(|e| e.to_string())?;
+        env.push(("STEAM_COMPAT_DATA_PATH", dir.display().to_string()));
+        own_prefix = Some(dir);
     }
-    let config = steam.config();
-    let previous = steam::compat_tool(&config, appid)?;
-    steam::set_compat_tool(&config, appid, Some(&proton))?;
-    record.push(format!("steam-compat\t{appid}\t{}\t{}", config.display(), previous.map_or("-".to_string(), |p| format!("={p}"))));
-    match &own_prefix {
-        Some(prefix) => winetricks_into(&steam, &proton, prefix, &components, &mut done, &mut not_fixed),
-        None => install_components(&steam, game, appid, &components, &mut done, &mut not_fixed, &mut record),
+    add_overrides(&mut env, &own);
+    let mut record = Vec::new();
+    if let Some(prefix) = &own_prefix {
+        record.push(format!("game-prefix\t{}", prefix.display()));
+    }
+    if targets.menu {
+        let umu_run = program_path("umu-run").ok_or("umu-run (umu-launcher) is needed to start Windows games from the app menu; Bazzite has it, other systems have an umu-launcher package.")?;
+        let exec = umu_command(&umu_run, steam.tool_dir(&proton).as_deref(), &env, &program, &args);
+        let entry = write_entry(game, &exec.iter().map(|a| exec_arg(a)).collect::<Vec<_>>(), &workdir, "applications-games", false)?;
+        // Undo goes backwards: the entry first in the file is removed last.
+        record.insert(0, format!("created\t{}", entry.display()));
+        done.push(format!("Added \"{}\" to the app menu, under Games (run with {proton} through umu-run).", game.name));
+    }
+    let mut shortcut_id = None;
+    if targets.steam {
+        let line = shortcut_options(&env, &args);
+        let shortcut = steam::Shortcut { name: &game.name, exe: &program, start_dir: &workdir, icon: "", launch_options: &line };
+        let appid = steam::add_shortcut(&file, &shortcut)?;
+        record.push(format!("steam-shortcut\t{appid}\t{}", file.display()));
+        let config = steam.config();
+        let previous = steam::compat_tool(&config, appid)?;
+        steam::set_compat_tool(&config, appid, Some(&proton))?;
+        record.push(format!("steam-compat\t{appid}\t{}\t{}", config.display(), previous.map_or("-".to_string(), |p| format!("={p}"))));
+        shortcut_id = Some(appid);
+    }
+    match (&own_prefix, shortcut_id) {
+        (Some(prefix), _) => winetricks_into(&steam, &proton, prefix, &components, &mut done, &mut not_fixed),
+        (None, Some(appid)) => install_components(&steam, game, appid, &components, &mut done, &mut not_fixed, &mut record),
+        (None, None) => {}
     }
 
     let record_file = record_path(game);
     fs::create_dir_all(record_file.parent().unwrap()).map_err(|e| e.to_string())?;
     fs::write(&record_file, record.join("\n") + "\n").map_err(|e| e.to_string())?;
     if targets.menu {
-        not_fixed.push("App-menu entries for Windows games aren't supported yet; start it from Steam.".into());
+        refresh_menu();
+        if let Some(prefix) = &own_prefix {
+            done.push(format!("Its Wine prefix (its settings and saves) is {} (undo leaves it).", prefix.display()));
+        }
     }
-    done.push(format!("Added \"{}\" to Steam as a non-Steam game.", game.name));
+    if targets.steam {
+        done.push(format!("Added \"{}\" to Steam as a non-Steam game.", game.name));
+    }
     match umu.as_ref().filter(|_| fixes_tool.is_some()) {
         Some(umu) => done.push(protonfixes_done(umu, &proton)),
         None => done.push(format!("Set it to run with Proton ({proton}).")),
     }
     if !own.is_empty() {
-        done.push(format!("Set its launch options to {line}: Wine uses the game's own {} instead of its built-in copy, as Windows would.", dll_files(&own)));
+        done.push(format!("Set WINEDLLOVERRIDES={} for it: Wine uses the game's own {} instead of its built-in copy, as Windows would.", proton::overrides(&own), dll_files(&own)));
     }
     if gog.is_some() {
         done.push(format!("Starts it the way GOG Galaxy does: {}{}.", program.strip_prefix(&game.root).unwrap_or(&program).display(), if args.is_empty() { String::new() } else { format!(" {}", args.join(" ")) }));
@@ -1667,6 +1698,22 @@ fn winetricks_into(steam: &Steam, tool: &str, prefix: &Path, components: &[&str]
     } else {
         not_fixed.push(format!("Installing {list} with winetricks failed; `WINEPREFIX={} umu-run winetricks {list}` in a terminal shows why.", prefix.display()));
     }
+}
+
+/// The command an app-menu entry starts a Windows game with: umu-run with the prefix, the
+/// Proton (Steam's tool folder; else umu fetches GE-Proton itself) and the game's id for
+/// protonfixes (UMU_ID is GAMEID under umu-run), then the launch settings Steam would get.
+fn umu_command(umu_run: &Path, tool_dir: Option<&Path>, env: &[(&str, String)], program: &Path, args: &[String]) -> Vec<String> {
+    let get = |key: &str| env.iter().find(|(k, _)| *k == key).map(|(_, v)| v.clone());
+    let mut command = vec!["env".to_string()];
+    command.extend(get("STEAM_COMPAT_DATA_PATH").map(|p| format!("WINEPREFIX={p}")));
+    command.push(format!("PROTONPATH={}", tool_dir.map_or("GE-Proton".to_string(), |d| d.display().to_string())));
+    command.push(format!("GAMEID={}", get("UMU_ID").unwrap_or_else(|| "umu-0".into())));
+    command.extend(env.iter().filter(|(k, _)| !["STEAM_COMPAT_DATA_PATH", "UMU_ID"].contains(k)).map(|(k, v)| format!("{k}={v}")));
+    command.push(umu_run.display().to_string());
+    command.push(program.display().to_string());
+    command.extend(args.iter().cloned());
+    command
 }
 
 /// A non-Steam shortcut's launch options. Steam drops `%command%` from them and puts its launch
@@ -1903,6 +1950,16 @@ fn refresh_menu() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn umu_commands() {
+        let env = vec![("UMU_ID", "umu-1207658746".to_string()), ("STORE", "gog".to_string()), ("STEAM_COMPAT_DATA_PATH", "/p/bge".to_string()), ("WINEDLLOVERRIDES", "d3d9=n,b".to_string())];
+        let command = umu_command(Path::new("/usr/bin/umu-run"), Some(Path::new("/s/GE-Proton11-7")), &env, Path::new("/g/BGE/CheckApplication.exe"), &["-x".to_string()]);
+        assert_eq!(command, ["env", "WINEPREFIX=/p/bge", "PROTONPATH=/s/GE-Proton11-7", "GAMEID=umu-1207658746", "STORE=gog", "WINEDLLOVERRIDES=d3d9=n,b", "/usr/bin/umu-run", "/g/BGE/CheckApplication.exe", "-x"]);
+        // No Proton found in Steam, no fix: umu fetches GE-Proton, no protonfixes id.
+        let command = umu_command(Path::new("/usr/bin/umu-run"), None, &[], Path::new("/g/game.exe"), &[]);
+        assert_eq!(command, ["env", "PROTONPATH=GE-Proton", "GAMEID=umu-0", "/usr/bin/umu-run", "/g/game.exe"]);
+    }
 
     #[test]
     fn installer_folder_names() {
