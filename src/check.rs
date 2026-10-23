@@ -1653,8 +1653,8 @@ impl Report {
                             let _ = writeln!(out, "  If it won't start or can't go online, nothing on this side can change that.");
                         }
                     } else if !self.installers.is_empty() {
-                        let _ = writeln!(out, "    It's an installer: gamefix setup --steam runs it with Proton (you click through it");
-                        let _ = writeln!(out, "    once) and adds the game it installs to Steam.");
+                        let _ = writeln!(out, "    It's an installer: gamefix setup runs it with Proton (you click through it");
+                        let _ = writeln!(out, "    once) and adds the game it installs to the app menu (--steam: to Steam).");
                     }
                 }
                 Problem::Flash { file, ruffle: Some(ruffle) } => {
@@ -1714,8 +1714,8 @@ impl Report {
                 }
                 Problem::CdFiles { installer } => {
                     let _ = writeln!(out, "• These are a Windows game CD's files; its installer is {}.", installer.display());
-                    let _ = writeln!(out, "  gamefix setup --steam installs it with Proton (you click through the installer once)");
-                    let _ = writeln!(out, "  and adds the installed game to Steam.");
+                    let _ = writeln!(out, "  gamefix setup installs it with Proton (you click through the installer once)");
+                    let _ = writeln!(out, "  and adds the installed game to the app menu (--steam: to Steam).");
                 }
                 Problem::Protected { what, file, others } => {
                     let _ = writeln!(out, "✗ Its program ({}) is protected by {what}, whose driver Windows 10 and later", file.display());
@@ -1727,8 +1727,8 @@ impl Report {
                 }
                 Problem::Disc { file, installer: Some(installer), .. } => {
                     let _ = writeln!(out, "• This is a Windows game's disc image ({}); its installer is {installer}.", file.display());
-                    let _ = writeln!(out, "  gamefix setup --steam installs it with Proton (you click through the installer once)");
-                    let _ = writeln!(out, "  and adds the installed game to Steam.");
+                    let _ = writeln!(out, "  gamefix setup installs it with Proton (you click through the installer once)");
+                    let _ = writeln!(out, "  and adds the installed game to the app menu (--steam: to Steam).");
                 }
                 Problem::Disc { file, files: None, .. } => {
                     let _ = writeln!(out, "✗ This is a disc image ({}), and 7-Zip (7z) is needed to look inside it.", file.display());

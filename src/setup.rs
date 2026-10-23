@@ -943,9 +943,15 @@ fn java_sound_conf(plugin: &Path) -> Result<String, String> {
 /// Writes the game's app-menu entry running `exec` (already quoted) in `workdir`; a text game
 /// gets a terminal (`Terminal=true`: the desktop opens its own, Konsole on KDE).
 fn write_entry(game: &Game, exec: &[String], workdir: &Path, icon: &str, terminal: bool) -> Result<PathBuf, String> {
+    write_entry_as(game, &game.name, exec, workdir, icon, terminal)
+}
+
+/// An entry named otherwise than the download (an installed game's own name: Bookworm Deluxe,
+/// not "Bookworm-Deluxe_Win_EN_ISO").
+fn write_entry_as(game: &Game, name: &str, exec: &[String], workdir: &Path, icon: &str, terminal: bool) -> Result<PathBuf, String> {
     let entry_text = format!(
         "[Desktop Entry]\nType=Application\nName={}\nComment=Set up by gamefix\nExec={}\nPath={}\nIcon={}\nCategories=Game;\nTerminal={terminal}\nX-Gamefix-Game={}\n",
-        value(&game.name),
+        value(name),
         exec.join(" "),
         value(&workdir.display().to_string()),
         value(icon),
@@ -953,7 +959,7 @@ fn write_entry(game: &Game, exec: &[String], workdir: &Path, icon: &str, termina
     );
     let apps = data_home().join("applications");
     fs::create_dir_all(&apps).map_err(|e| e.to_string())?;
-    let entry = apps.join(format!("gamefix-{}.desktop", slug(&game.name)));
+    let entry = apps.join(format!("gamefix-{}.desktop", slug(name)));
     fs::write(&entry, entry_text).map_err(|e| e.to_string())?;
     Ok(entry)
 }
@@ -1272,11 +1278,9 @@ const INSTALL_NOTE: &str = "gamefix-install.txt";
 /// in ~/Games, then adds the installed program to Steam, with launch options pointing Steam at
 /// that prefix (its registry and saves are there). Undo leaves the installed game.
 fn setup_install(game: &Game, installer: Installer, targets: &Targets) -> Result<Outcome, String> {
-    if !targets.steam {
-        return Err("Windows games can only be set up in Steam for now: add --steam.".into());
-    }
+    // Steam's Protons install it and run it from the app menu too, so Steam is needed either way.
     let steam = Steam::find().ok_or("Steam isn't installed, or nobody has logged in to it yet.")?;
-    if steam.running() {
+    if targets.steam && steam.running() {
         return Err(STEAM_OPEN.into());
     }
     let tool = steam.proton().ok_or("No Proton is installed in Steam: install Proton Experimental (Library → Tools), then set it up again.")?;
@@ -1373,7 +1377,7 @@ fn setup_install(game: &Game, installer: Installer, targets: &Targets) -> Result
     fs::create_dir_all(record_file.parent().unwrap()).map_err(|e| e.to_string())?;
     let mut record = vec![format!("installed-game\t{}\t{}\t{name}", prefix.display(), exe.display())];
     fs::write(&record_file, record.join("\n") + "\n").map_err(|e| e.to_string())?;
-    if steam.running() {
+    if targets.steam && steam.running() {
         return Err(format!("Steam was opened while it installed. Close Steam and set it up again: the installed game in {} is used, not installed twice.", prefix.display()));
     }
     if let Some(crate::binary::Binary::Pe(pe)) = crate::binary::identify(&exe) {
@@ -1389,29 +1393,39 @@ fn setup_install(game: &Game, installer: Installer, targets: &Targets) -> Result
         env.extend(umu.env());
     }
     add_overrides(&mut env, &own);
-    let line = launch_options(&env, &[], "");
-    let shortcuts = steam.shortcuts();
     let workdir = exe.parent().unwrap_or(&prefix);
     let icon = windows_icon(game, &exe, &mut record);
-    let shortcut = steam::Shortcut { name: &name, exe: &exe, start_dir: workdir, icon: if icon.starts_with('/') { &icon } else { "" }, launch_options: &line };
-    let appid = steam::add_shortcut(&shortcuts, &shortcut)?;
-    record.push(format!("steam-shortcut\t{appid}\t{}", shortcuts.display()));
-    let config = steam.config();
-    let previous = steam::compat_tool(&config, appid)?;
     let fixed = fixes_tool.is_some();
     let tool = fixes_tool.unwrap_or(tool);
-    steam::set_compat_tool(&config, appid, Some(&tool))?;
-    record.push(format!("steam-compat\t{appid}\t{}\t{}", config.display(), previous.map_or("-".to_string(), |p| format!("={p}"))));
+    if targets.menu {
+        let umu_run = program_path("umu-run").ok_or("umu-run (umu-launcher) is needed to start Windows games from the app menu; Bazzite has it, other systems have an umu-launcher package.")?;
+        let exec = umu_command(&umu_run, steam.tool_dir(&tool).as_deref(), &env, &exe, &[]);
+        let entry = write_entry_as(game, &name, &exec.iter().map(|a| exec_arg(a)).collect::<Vec<_>>(), workdir, &icon, false)?;
+        // Undo goes backwards: the entry first in the file is removed last.
+        record.insert(0, format!("created\t{}", entry.display()));
+        done.push(format!("Added \"{name}\" to the app menu, under Games, run with {tool} in that folder's Wine prefix."));
+    }
+    if targets.steam {
+        let line = launch_options(&env, &[], "");
+        let shortcuts = steam.shortcuts();
+        let shortcut = steam::Shortcut { name: &name, exe: &exe, start_dir: workdir, icon: if icon.starts_with('/') { &icon } else { "" }, launch_options: &line };
+        let appid = steam::add_shortcut(&shortcuts, &shortcut)?;
+        record.push(format!("steam-shortcut\t{appid}\t{}", shortcuts.display()));
+        let config = steam.config();
+        let previous = steam::compat_tool(&config, appid)?;
+        steam::set_compat_tool(&config, appid, Some(&tool))?;
+        record.push(format!("steam-compat\t{appid}\t{}\t{}", config.display(), previous.map_or("-".to_string(), |p| format!("={p}"))));
+        done.push(format!("Added \"{name}\" to Steam as a non-Steam game, run with {tool} in that folder's Wine prefix."));
+    }
     fs::write(&record_file, record.join("\n") + "\n").map_err(|e| e.to_string())?;
-    done.push(format!("Added \"{name}\" to Steam as a non-Steam game, run with {tool} in that folder's Wine prefix."));
+    if targets.menu {
+        refresh_menu();
+    }
     if let Some(umu) = umu.as_ref().filter(|_| fixed) {
         done.push(protonfixes_done(umu, &tool));
     }
     if !own.is_empty() {
         done.push(format!("Wine uses the game's own {} instead of its built-in copy, as Windows would.", dll_files(&own)));
-    }
-    if targets.menu {
-        not_fixed.push("App-menu entries for Windows games aren't supported yet; start it from Steam.".into());
     }
     Ok(Outcome { done, not_fixed })
 }
