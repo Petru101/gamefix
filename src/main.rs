@@ -93,7 +93,7 @@ fn run(command: &str, game: &scan::Game, targets: &setup::Targets, dialog: bool)
             let question = format!("{} runs in {}, which isn't installed.\n\ngamefix can install it from Flathub{size}, for you only: no password needed.\n\nInstall {} now?", game.name, runner.name, runner.name);
             if confirm(&title, &question, dialog) {
                 if dialog {
-                    let _ = Command::new("notify-send").args([title.as_str(), &format!("Installing {} from Flathub…", runner.name)]).status();
+                    let _ = Command::new("notify-send").args([title.as_str(), &markup_escaped(&format!("Installing {} from Flathub…", runner.name))]).status();
                 } else {
                     println!("Installing {} from Flathub…", runner.name);
                 }
@@ -151,7 +151,7 @@ fn feedback(path: Option<&str>, dialog: bool) -> Option<Said> {
     let along = if game.is_some() { "gamefix's report on the game and what it changed for it go along with it" } else { "your system's name and graphics card maker go along with it" };
     if dialog {
         let input = |kind: &str, text: &str| {
-            let out = Command::new("kdialog").args(["--title", &title, kind, text, ""]).output().ok().filter(|o| o.status.success())?;
+            let out = Command::new("kdialog").args(["--title", &title, kind, &qt_text(text), ""]).output().ok().filter(|o| o.status.success())?;
             Some(String::from_utf8_lossy(&out.stdout).trim_end().to_owned())
         };
         report.message = input("--textinputbox", &format!("What went wrong, or what would you like to tell the developer?\n({along}; you'll see everything before it's sent.)"))?;
@@ -195,14 +195,27 @@ fn feedback(path: Option<&str>, dialog: bool) -> Option<Said> {
 /// KDE's own dialogs; without kdialog (another desktop), a notification instead.
 fn show(said: &Said) {
     let kind = if said.ok { "--msgbox" } else { "--error" };
-    let shown = Command::new("kdialog").args(["--title", &said.title, kind, said.text.trim_end()]).status().is_ok_and(|s| s.success());
+    let shown = Command::new("kdialog").args(["--title", &said.title, kind, &qt_text(said.text.trim_end())]).status().is_ok_and(|s| s.success());
     if !shown {
-        let _ = Command::new("notify-send").args([&said.title, said.text.trim_end()]).status();
+        let _ = Command::new("notify-send").args([&said.title, &markup_escaped(said.text.trim_end())]).status();
     }
 }
 
 fn ask(title: &str, question: &str) -> bool {
-    Command::new("kdialog").args(["--title", title, "--yesno", question]).status().is_ok_and(|s| s.success())
+    Command::new("kdialog").args(["--title", title, "--yesno", &qt_text(question)]).status().is_ok_and(|s| s.success())
+}
+
+/// `<`, `>` and `&` as HTML writes them. Notifications read a little HTML (links too), and
+/// game names and paths come from downloads.
+fn markup_escaped(text: &str) -> String {
+    text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+/// A dialog's text as Qt rich text showing every character as it is, with its line breaks and
+/// indents. Left plain, Qt takes a text whose first line has something tag-like (a game named
+/// "<b>...") for HTML, the rest of it included.
+fn qt_text(text: &str) -> String {
+    format!("<qt><p style=\"white-space:pre-wrap\">{}</p></qt>", markup_escaped(text))
 }
 
 /// A yes/no question: in a window from the right-click menu, else on the terminal (no terminal

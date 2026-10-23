@@ -1048,12 +1048,15 @@ pub fn unreal_bootstrap(path: &Path) -> Option<(std::path::PathBuf, String)> {
     }
     let data = std::fs::read(path).ok()?;
     let utf16 = |s: &str| -> Vec<u8> { s.encode_utf16().flat_map(|c| c.to_le_bytes()).collect() };
+    // Its name in its version information (UTF-16), or only in its debug file's name (ASCII:
+    // UE4 launchers without version information, Ghost Defender's Invade.exe).
     let marker = utf16("BootstrapPackagedGame");
-    if !data.windows(marker.len()).any(|w| w == marker) {
+    if !data.windows(marker.len()).any(|w| w == marker) && !contains_bytes(&data, b"BootstrapPackagedGame") {
         return None;
     }
-    let key = utf16("\\Binaries\\Win");
-    let at = data.windows(key.len()).position(|w| w == key)?;
+    // With backslashes, or forward slashes in older UE4 launchers (`Engine/Binaries/Win32/UE4Game.exe`).
+    let (back, forward) = (utf16("Binaries\\Win"), utf16("Binaries/Win"));
+    let at = data.windows(back.len()).position(|w| w == back || w == forward)?;
     let unit = |i: usize| data.get(i..i + 2).map(|b| u16::from_le_bytes([b[0], b[1]]));
     let printable = |u: u16| (0x20..0x7f).contains(&u);
     let mut start = at;
@@ -1075,6 +1078,10 @@ pub fn unreal_bootstrap(path: &Path) -> Option<(std::path::PathBuf, String)> {
     let args = if args.encode_utf16().all(printable) { args } else { String::new() };
     let program = path.parent()?.join(target.replace('\\', "/"));
     program.is_file().then_some((program, args))
+}
+
+fn contains_bytes(data: &[u8], needle: &[u8]) -> bool {
+    data.windows(needle.len()).any(|w| w == needle)
 }
 
 /// The maker a Windows file names in its version information ("CompanyName"), if any.
@@ -1146,15 +1153,21 @@ mod tests {
         std::fs::create_dir_all(dir.join("Game/Binaries/Win64")).unwrap();
         std::fs::write(dir.join("Game/Binaries/Win64/Game-Win64-Shipping.exe"), b"MZ").unwrap();
         let utf16 = |s: &str| -> Vec<u8> { s.encode_utf16().flat_map(|c| c.to_le_bytes()).collect() };
-        let mut data = b"MZ..IEND\xaeB`\x82P".to_vec();
-        data.extend(utf16("Game\\Binaries\\Win64\\Game-Win64-Shipping.exe\0Game\0"));
-        data.extend(b"PADDINGXX");
-        data.extend(utf16("BootstrapPackagedGame-Win64-Shipping.exe"));
-        let launcher = dir.join("Game.exe");
-        std::fs::write(&launcher, &data).unwrap();
-        let found = super::unreal_bootstrap(&launcher);
+        // UE 5's launcher writes backslashes, older UE4 ones forward slashes.
+        let mut found = Vec::new();
+        for target in ["Game\\Binaries\\Win64\\Game-Win64-Shipping.exe", "Game/Binaries/Win64/Game-Win64-Shipping.exe"] {
+            let mut data = b"MZ..IEND\xaeB`\x82P".to_vec();
+            data.extend(utf16(&format!("{target}\0Game\0")));
+            data.extend(b"PADDINGXX");
+            data.extend(utf16("BootstrapPackagedGame-Win64-Shipping.exe"));
+            let launcher = dir.join("Game.exe");
+            std::fs::write(&launcher, &data).unwrap();
+            found.push(super::unreal_bootstrap(&launcher));
+        }
         std::fs::remove_dir_all(&dir).unwrap();
-        assert_eq!(found, Some((dir.join("Game/Binaries/Win64/Game-Win64-Shipping.exe"), "Game".to_string())));
+        for found in found {
+            assert_eq!(found, Some((dir.join("Game/Binaries/Win64/Game-Win64-Shipping.exe"), "Game".to_string())));
+        }
     }
 
     #[test]

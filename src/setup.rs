@@ -71,6 +71,25 @@ pub fn record_path(game: &Game) -> PathBuf {
     data_home().join("gamefix/games").join(format!("{}.log", slug(&game.name)))
 }
 
+/// Writes a setup's record, one change a line. A line break inside one (a file name from the
+/// download can hold one) would start a line of its own, which undo would act on: refused.
+fn write_record(file: &Path, record: &[String]) -> Result<(), String> {
+    if let Some(line) = record.iter().find(|l| l.contains(['\n', '\r'])) {
+        return Err(format!("A name has a line break in it, which gamefix can't record safely: {}", line.escape_debug()));
+    }
+    fs::write(file, record.iter().map(|l| format!("{l}\n")).collect::<String>()).map_err(|e| e.to_string())
+}
+
+/// A name in the game's folder with a line break in it, if any: gamefix records paths one a
+/// line, so such a game is refused before anything changes.
+fn line_break_name(game: &Game) -> Option<PathBuf> {
+    let broken = |p: &Path| p.to_string_lossy().contains(['\n', '\r']);
+    if broken(&game.root) {
+        return Some(game.root.clone());
+    }
+    game.files.iter().map(|f| game.full(f)).find(|p| broken(p))
+}
+
 /// One argument of a desktop entry's Exec line, quoted by the spec's rules: inside double
 /// quotes `"`, `` ` ``, `$` and `\` take a backslash, and string escaping then doubles every `\`.
 pub fn exec_arg(arg: &str) -> String {
@@ -118,6 +137,9 @@ fn icon(game: &Game, main: &Path) -> String {
 }
 
 pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome, String> {
+    if let Some(path) = line_break_name(game) {
+        return Err(format!("A name in the game's folder has a line break in it, which gamefix can't record safely; rename it first: {}", path.display().to_string().escape_debug()));
+    }
     if record_path(game).exists() {
         if targets.steam && Steam::find().is_some_and(|s| s.running()) {
             return Err(STEAM_OPEN.into());
@@ -738,7 +760,7 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
 
     let record_file = record_path(game);
     fs::create_dir_all(record_file.parent().unwrap()).map_err(|e| e.to_string())?;
-    fs::write(&record_file, record.join("\n") + "\n").map_err(|e| e.to_string())?;
+    write_record(&record_file, &record)?;
     if targets.menu {
         refresh_menu();
     }
@@ -1136,7 +1158,7 @@ fn setup_runner(game: &Game, command: Vec<String>, file: &Path, name: &str, targ
     }
     let record_file = record_path(game);
     fs::create_dir_all(record_file.parent().unwrap()).map_err(|e| e.to_string())?;
-    fs::write(&record_file, record.iter().map(|l| format!("{l}\n")).collect::<String>()).map_err(|e| e.to_string())?;
+    write_record(&record_file, &record)?;
     if targets.menu {
         refresh_menu();
     }
@@ -1204,9 +1226,9 @@ fn setup_unpacked(game: &Game, file: &Path, targets: &Targets) -> Result<Outcome
     let report = crate::check::check(&unpacked, &crate::system::System::load());
     let mut outcome = setup(&unpacked, &report, targets)?;
     let record = record_path(&unpacked);
-    let mut lines = fs::read_to_string(&record).unwrap_or_default();
-    lines.push_str(&format!("installed-game\t{}\n", dest.display()));
-    fs::write(&record, lines).map_err(|e| e.to_string())?;
+    let mut lines: Vec<String> = fs::read_to_string(&record).unwrap_or_default().lines().map(String::from).collect();
+    lines.push(format!("installed-game\t{}", dest.display()));
+    write_record(&record, &lines)?;
     outcome.done.insert(0, if earlier {
         format!("Set up the game already unpacked from {} in {}.", file.display(), dest.display())
     } else {
@@ -1376,7 +1398,7 @@ fn setup_install(game: &Game, installer: Installer, targets: &Targets) -> Result
     let record_file = record_path(game);
     fs::create_dir_all(record_file.parent().unwrap()).map_err(|e| e.to_string())?;
     let mut record = vec![format!("installed-game\t{}\t{}\t{name}", prefix.display(), exe.display())];
-    fs::write(&record_file, record.join("\n") + "\n").map_err(|e| e.to_string())?;
+    write_record(&record_file, &record)?;
     if targets.steam && steam.running() {
         return Err(format!("Steam was opened while it installed. Close Steam and set it up again: the installed game in {} is used, not installed twice.", prefix.display()));
     }
@@ -1417,7 +1439,7 @@ fn setup_install(game: &Game, installer: Installer, targets: &Targets) -> Result
         record.push(format!("steam-compat\t{appid}\t{}\t{}", config.display(), previous.map_or("-".to_string(), |p| format!("={p}"))));
         done.push(format!("Added \"{name}\" to Steam as a non-Steam game, run with {tool} in that folder's Wine prefix."));
     }
-    fs::write(&record_file, record.join("\n") + "\n").map_err(|e| e.to_string())?;
+    write_record(&record_file, &record)?;
     if targets.menu {
         refresh_menu();
     }
@@ -1561,7 +1583,7 @@ fn setup_windows(game: &Game, report: &Report, exe: &crate::scan::Found, targets
         }
         let record_file = record_path(game);
         fs::create_dir_all(record_file.parent().unwrap()).map_err(|e| e.to_string())?;
-        fs::write(&record_file, record.join("\n") + "\n").map_err(|e| e.to_string())?;
+        write_record(&record_file, &record)?;
         return Ok(Outcome { done, not_fixed });
     }
     let program = game.full(exe);
@@ -1665,7 +1687,7 @@ fn setup_windows(game: &Game, report: &Report, exe: &crate::scan::Found, targets
 
     let record_file = record_path(game);
     fs::create_dir_all(record_file.parent().unwrap()).map_err(|e| e.to_string())?;
-    fs::write(&record_file, record.join("\n") + "\n").map_err(|e| e.to_string())?;
+    write_record(&record_file, &record)?;
     if targets.menu {
         refresh_menu();
         if let Some(prefix) = &own_prefix {
@@ -1872,7 +1894,9 @@ fn settings(env: &[(&str, String)], existing: &str) -> Vec<String> {
     let words: Vec<&str> = existing.split_whitespace().collect();
     env.iter()
         .filter(|(k, _)| matches!(*k, "LD_PRELOAD" | "LD_LIBRARY_PATH") || !words.iter().any(|w| w.starts_with(&format!("{k}="))))
-        .map(|(k, v)| if matches!(*k, "LD_PRELOAD" | "LD_LIBRARY_PATH") { format!("{k}=\"${{{k}:+${k}:}}{v}\"") } else { format!("{k}={}", sh_word(v)) })
+        // The value quoted on its own: it can hold the game's folder, whose name is the
+        // download's (a `$(...)` or `"` in it would otherwise run, or end the quotes).
+        .map(|(k, v)| if matches!(*k, "LD_PRELOAD" | "LD_LIBRARY_PATH") { format!("{k}=\"${{{k}:+${k}:}}\"{}", sh_word(v)) } else { format!("{k}={}", sh_word(v)) })
         .collect()
 }
 
@@ -2046,7 +2070,7 @@ mod tests {
         // Steam doesn't pass its old runtime's libraries on to games: its run.sh goes in front.
         let run = Path::new("/home/a b/.local/share/Steam/ubuntu12_32/steam-runtime/run.sh");
         let libs = [("LD_LIBRARY_PATH", "/x/libs".to_string())];
-        assert_eq!(native_options(&libs, Some(run), None, ""), native(&format!("export LD_LIBRARY_PATH=\"${{LD_LIBRARY_PATH:+$LD_LIBRARY_PATH:}}/x/libs\"; set -- '{}';", run.display()), "\"$@\" %command%"));
+        assert_eq!(native_options(&libs, Some(run), None, ""), native(&format!("export LD_LIBRARY_PATH=\"${{LD_LIBRARY_PATH:+$LD_LIBRARY_PATH:}}\"/x/libs; set -- '{}';", run.display()), "\"$@\" %command%"));
         assert_eq!(native_options(&[], Some(run), Some(HIDE_HELPERS), "gamemoderun %command%"), native(&format!("set -- '{}'; {HIDE_HELPERS}", run.display()), "gamemoderun \"$@\" %command%"));
         assert_eq!(native_options(&[], Some(run), None, "'/home/a b/.local/share/Steam/ubuntu12_32/steam-runtime/run.sh' %command%"), "'/home/a b/.local/share/Steam/ubuntu12_32/steam-runtime/run.sh' %command%");
     }
@@ -2068,6 +2092,27 @@ mod tests {
         assert!(out(false).starts_with("/x.so|/a b/run.sh|/usr/bin/bwrap|--dev-bind|/|/|"), "{}", out(false));
         assert!(out(false).ends_with("|game|-insecure|"));
         assert_eq!(out(true), "|game|-insecure|");
+    }
+
+    /// A downloaded game's folder name is anyone's text: in launch options it stays a value,
+    /// never shell code, whatever it holds.
+    #[test]
+    fn launch_options_keep_folder_names_as_text() {
+        let dir = std::env::temp_dir().join(format!("gamefix-quote-{}", std::process::id()));
+        let hostile = format!("{}/a \"$(touch {}/ran)`touch {}/ran`'b/lib.so", dir.display(), dir.display(), dir.display());
+        fs::create_dir_all(&dir).unwrap();
+        for env in [vec![("LD_PRELOAD", hostile.clone())], vec![("LD_LIBRARY_PATH", hostile.clone())], vec![("STEAM_COMPAT_DATA_PATH", hostile.clone())]] {
+            let key = env[0].0;
+            for line in [native_options(&env, None, None, ""), launch_options(&env, &[], ""), shortcut_options(&env, &["-x".to_string()])] {
+                // The program Steam starts reads it from its environment.
+                let script = line.replace("%command%", &format!("sh -c 'printf %s \"${key}\"'"));
+                let out = std::process::Command::new("sh").arg("-c").arg(&script).env_remove(key).env_remove("STEAM_COMPAT_PROTON").output().unwrap();
+                assert_eq!(String::from_utf8_lossy(&out.stdout), hostile, "{line}");
+            }
+        }
+        let ran = dir.join("ran").exists();
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(!ran);
     }
 
     /// Steam drops `%command%` and appends its helpers and the program; the arguments must

@@ -9,7 +9,7 @@ const MAX_DEPTH: usize = 8;
 const MAX_FILES: usize = 50_000;
 
 /// Programs that ship next to games but aren't the game.
-const NOT_THE_GAME: &[&str] = &["gogdosconfig", "crashhandler", "crashpad", "createdump", "crashreport", "chrome-sandbox", "unins", "redist", "vc_redist", "dxsetup", "steamwebhelper", "quicksfv", "nacl_helper", "nwjc", "chromedriver", "minidump_stackwalk", "ffmpeg", "ffprobe", "ffplay", "oalinst"];
+const NOT_THE_GAME: &[&str] = &["gogdosconfig", "prereqsetup", "crashhandler", "crashpad", "createdump", "crashreport", "chrome-sandbox", "unins", "redist", "vc_redist", "dxsetup", "steamwebhelper", "quicksfv", "nacl_helper", "nwjc", "chromedriver", "minidump_stackwalk", "ffmpeg", "ffprobe", "ffplay", "oalinst"];
 
 pub struct Found {
     /// Relative to the game's root.
@@ -492,6 +492,13 @@ fn pick_windows(root: &Path, files: &[Found]) -> Option<usize> {
             if s.to_lowercase().contains("editor") {
                 score -= 5;
             }
+            // Unreal's own programs (Engine/Binaries: a content-only game's UE4Game.exe, crash
+            // reporters): the game's launcher above starts them with its project (Connected
+            // Worlds' UE4Game.exe alone quit at once, code 43).
+            let lower = f.path.to_string_lossy().to_lowercase();
+            if lower.starts_with("engine/binaries/") || lower.contains("/engine/binaries/") {
+                score -= 5;
+            }
             if dir.join(format!("{s}_Data")).is_dir() {
                 score += 10;
             }
@@ -825,7 +832,7 @@ fn engine(root: &Path, main: &Path, files: &[Found]) -> Option<Engine> {
     if dir.join(format!("{s}.pck")).is_file() || dir.join("data.pck").is_file() || ends_with_pck(&dir.join(main.file_name()?)) {
         return Some(Engine { name: "Godot", version: None, guess: None });
     }
-    if main.components().any(|c| c.as_os_str() == "Binaries") || root.join("Engine").is_dir() {
+    if main.components().any(|c| c.as_os_str() == "Binaries") || root.join("Engine").is_dir() || dir.join("Engine/Binaries").is_dir() {
         return Some(Engine { name: "Unreal Engine", version: None, guess: None });
     }
     if dir.join("assets/game.unx").is_file() || dir.join("game.unx").is_file() {
