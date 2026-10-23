@@ -126,37 +126,53 @@ pub fn installed_program(pfx: &Path, name: &str) -> Installed {
     }
 }
 
-/// The .lnk files in a prefix's Start Menu and desktop folders.
+/// The .lnk files in a prefix's Start Menu and desktop folders, of every user (Proton's
+/// steamuser, plain Wine's own user name).
 fn links(pfx: &Path) -> Vec<PathBuf> {
     let c = pfx.join("drive_c");
     let mut links = Vec::new();
-    for dir in ["ProgramData/Microsoft/Windows/Start Menu", "users/Public/Desktop", "users/steamuser/Desktop", "users/steamuser/AppData/Roaming/Microsoft/Windows/Start Menu"] {
-        find_files(&c.join(dir), "lnk", 0, &mut links);
+    find_files(&c.join("ProgramData/Microsoft/Windows/Start Menu"), "lnk", 0, &mut links);
+    for user in fs::read_dir(c.join("users")).into_iter().flatten().flatten() {
+        for dir in ["Desktop", "AppData/Roaming/Microsoft/Windows/Start Menu"] {
+            find_files(&user.path().join(dir), "lnk", 0, &mut links);
+        }
     }
     links
+}
+
+fn unwanted(p: &Path) -> bool {
+    let file = p.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+    NOT_THE_PROGRAM.iter().any(|n| file.contains(n)) || crate::scan::not_the_game(p)
+}
+
+/// The programs a prefix's Start Menu and desktop shortcuts point to, with the shortcuts'
+/// names: what installers put there, leaving out uninstallers, readmes and the like.
+pub fn shortcuts(pfx: &Path) -> Vec<(PathBuf, String)> {
+    links(pfx)
+        .iter()
+        .filter_map(|lnk| {
+            let target = link_target(&fs::read(lnk).ok()?)?;
+            // Drives are links in dosdevices ("c:" -> ../drive_c, "s:" -> a real folder).
+            let letter = target.get(..2)?.to_lowercase();
+            let drive = fs::canonicalize(pfx.join("dosdevices").join(&letter)).ok().or_else(|| (letter == "c:").then(|| pfx.join("drive_c")))?;
+            let exe = resolve(&drive, target.get(3..)?)?;
+            if !exe.is_file() || unwanted(&exe) {
+                return None;
+            }
+            Some((exe, lnk.file_stem()?.to_string_lossy().into_owned()))
+        })
+        .collect()
 }
 
 fn find_installed(pfx: &Path, name: &str) -> Option<(PathBuf, String)> {
     let c = pfx.join("drive_c");
     let words = words(name);
-    let unwanted = |p: &Path| {
-        let file = p.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
-        NOT_THE_PROGRAM.iter().any(|n| file.contains(n)) || crate::scan::not_the_game(p)
-    };
     let size = |p: &Path| fs::metadata(p).map_or(0, |m| m.len());
-    let from_links = links(pfx)
-        .iter()
-        .filter_map(|lnk| {
-            let target = link_target(&fs::read(lnk).ok()?)?;
-            // Drives are links in dosdevices ("c:" -> ../drive_c, "s:" -> a real folder).
-            let drive = fs::canonicalize(pfx.join("dosdevices").join(target.get(..2)?.to_lowercase())).ok()?;
-            let exe = resolve(&drive, target.get(3..)?)?;
-            if !exe.is_file() || unwanted(&exe) {
-                return None;
-            }
-            let label = lnk.file_stem()?.to_string_lossy().into_owned();
+    let from_links = shortcuts(pfx)
+        .into_iter()
+        .map(|(exe, label)| {
             let named = words.iter().any(|w| label.to_lowercase().contains(w.as_str()) || exe.to_string_lossy().to_lowercase().contains(w.as_str()));
-            Some(((named, size(&exe)), exe, label))
+            ((named, size(&exe)), exe, label)
         })
         .max_by_key(|(key, ..)| *key)
         .map(|(_, exe, label)| (exe, label));

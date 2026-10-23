@@ -1,23 +1,4 @@
-mod binary;
-mod check;
-mod disc;
-mod dotnet;
-mod feedback;
-mod fetch;
-mod font;
-mod gog;
-mod love;
-mod proton;
-mod python;
-mod rpgmaker;
-mod rightclick;
-mod scan;
-mod setup;
-mod steam;
-mod system;
-mod umu;
-mod vdf;
-
+use gamefix::*;
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
