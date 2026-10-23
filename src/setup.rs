@@ -95,6 +95,18 @@ fn value(s: &str) -> String {
     s.replace('\\', "\\\\").replace('\n', " ")
 }
 
+/// A Windows game's own icon, saved as a PNG in gamefix's icons folder for its menu entry and
+/// Steam shortcut (recorded, so undo removes it); without one, the generic games icon.
+fn windows_icon(game: &Game, program: &Path, record: &mut Vec<String>) -> String {
+    let file = data_home().join("gamefix/icons").join(format!("{}.png", slug(&game.name)));
+    let saved = crate::peicon::icon_png(program).is_some_and(|png| fs::create_dir_all(file.parent().unwrap()).and_then(|_| fs::write(&file, png)).is_ok());
+    if !saved {
+        return "applications-games".into();
+    }
+    record.push(format!("created\t{}", file.display()));
+    file.display().to_string()
+}
+
 fn icon(game: &Game, main: &Path) -> String {
     let dir = game.root.join(main.parent().unwrap_or(Path::new("")));
     let stem = main.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
@@ -1380,7 +1392,8 @@ fn setup_install(game: &Game, installer: Installer, targets: &Targets) -> Result
     let line = launch_options(&env, &[], "");
     let shortcuts = steam.shortcuts();
     let workdir = exe.parent().unwrap_or(&prefix);
-    let shortcut = steam::Shortcut { name: &name, exe: &exe, start_dir: workdir, icon: "", launch_options: &line };
+    let icon = windows_icon(game, &exe, &mut record);
+    let shortcut = steam::Shortcut { name: &name, exe: &exe, start_dir: workdir, icon: if icon.starts_with('/') { &icon } else { "" }, launch_options: &line };
     let appid = steam::add_shortcut(&shortcuts, &shortcut)?;
     record.push(format!("steam-shortcut\t{appid}\t{}", shortcuts.display()));
     let config = steam.config();
@@ -1548,6 +1561,20 @@ fn setup_windows(game: &Game, report: &Report, exe: &crate::scan::Found, targets
     let gog = crate::gog::read(&game.root).filter(|g| g.program == program);
     let workdir = gog.as_ref().and_then(|g| g.workdir.clone()).unwrap_or_else(|| program.parent().unwrap_or(&game.root).to_path_buf());
     let args = gog.as_ref().map(|g| g.args.clone()).unwrap_or_default();
+    // Unreal's launcher only checks Microsoft's VC++ runtime, then starts the game's program.
+    // Newer ones want a newer build than Proton's own (Starship Troopers: 14.42.34438, Wine's
+    // is 14.42.34433), and a Proton update puts Wine's back over an installed one: the game's
+    // program, started directly, runs on Wine's.
+    // The icon players know, from the program they'd start (an Unreal launcher's has it too).
+    let shown = program.clone();
+    let (program, workdir, args) = match crate::binary::unreal_bootstrap(&program) {
+        Some((target, own)) => {
+            done.push(format!("Starts {} directly, as Unreal's launcher would after checking for Microsoft's VC++ runtime (newer launchers refuse the one Proton brings).", target.strip_prefix(&game.root).unwrap_or(&target).display()));
+            let dir = target.parent().unwrap_or(&game.root).to_path_buf();
+            (target, dir, own.split_whitespace().map(String::from).chain(args).collect())
+        }
+        None => (program, workdir, args),
+    };
     let file = steam.shortcuts();
     let mut env = Vec::new();
     if let (Some(umu), Some(_)) = (&umu, &fixes_tool) {
@@ -1594,10 +1621,11 @@ fn setup_windows(game: &Game, report: &Report, exe: &crate::scan::Found, targets
     if let Some(prefix) = &own_prefix {
         record.push(format!("game-prefix\t{}", prefix.display()));
     }
+    let icon = windows_icon(game, &shown, &mut record);
     if targets.menu {
         let umu_run = program_path("umu-run").ok_or("umu-run (umu-launcher) is needed to start Windows games from the app menu; Bazzite has it, other systems have an umu-launcher package.")?;
         let exec = umu_command(&umu_run, steam.tool_dir(&proton).as_deref(), &env, &program, &args);
-        let entry = write_entry(game, &exec.iter().map(|a| exec_arg(a)).collect::<Vec<_>>(), &workdir, "applications-games", false)?;
+        let entry = write_entry(game, &exec.iter().map(|a| exec_arg(a)).collect::<Vec<_>>(), &workdir, &icon, false)?;
         // Undo goes backwards: the entry first in the file is removed last.
         record.insert(0, format!("created\t{}", entry.display()));
         done.push(format!("Added \"{}\" to the app menu, under Games (run with {proton} through umu-run).", game.name));
@@ -1605,7 +1633,8 @@ fn setup_windows(game: &Game, report: &Report, exe: &crate::scan::Found, targets
     let mut shortcut_id = None;
     if targets.steam {
         let line = shortcut_options(&env, &args);
-        let shortcut = steam::Shortcut { name: &game.name, exe: &program, start_dir: &workdir, icon: "", launch_options: &line };
+        let steam_icon = if icon.starts_with('/') { icon.as_str() } else { "" };
+        let shortcut = steam::Shortcut { name: &game.name, exe: &program, start_dir: &workdir, icon: steam_icon, launch_options: &line };
         let appid = steam::add_shortcut(&file, &shortcut)?;
         record.push(format!("steam-shortcut\t{appid}\t{}", file.display()));
         let config = steam.config();
@@ -1639,7 +1668,7 @@ fn setup_windows(game: &Game, report: &Report, exe: &crate::scan::Found, targets
     if !own.is_empty() {
         done.push(format!("Set WINEDLLOVERRIDES={} for it: Wine uses the game's own {} instead of its built-in copy, as Windows would.", proton::overrides(&own), dll_files(&own)));
     }
-    if gog.is_some() {
+    if gog.as_ref().is_some_and(|g| g.program == program) {
         done.push(format!("Starts it the way GOG Galaxy does: {}{}.", program.strip_prefix(&game.root).unwrap_or(&program).display(), if args.is_empty() { String::new() } else { format!(" {}", args.join(" ")) }));
     }
     Ok(Outcome { done, not_fixed })

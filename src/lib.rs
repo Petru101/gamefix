@@ -9,6 +9,7 @@ pub mod fetch;
 pub mod font;
 pub mod gog;
 pub mod love;
+pub mod peicon;
 pub mod proton;
 pub mod python;
 pub mod rpgmaker;

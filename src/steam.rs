@@ -367,7 +367,7 @@ pub fn write(items: &[(Vec<u8>, Node)]) -> Vec<u8> {
     out
 }
 
-fn crc32(data: &[u8]) -> u32 {
+pub(crate) fn crc32(data: &[u8]) -> u32 {
     let mut crc = !0u32;
     for &b in data {
         crc ^= b as u32;

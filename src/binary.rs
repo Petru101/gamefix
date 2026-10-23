@@ -1038,6 +1038,45 @@ pub fn bundle_without_pkg_resources(data: &mut [u8]) -> Result<(), String> {
     }
 }
 
+/// Unreal's launcher (BootstrapPackagedGame, renamed as the game) beside a packaged game: the
+/// program it starts and the arguments it gives it, kept as two UTF-16 strings in its resources
+/// (Starship Troopers: `StarshipTroopers_UBW\Binaries\Win64\StarshipTroopers_UBW-Win64-Shipping.exe`,
+/// then `StarshipTroopers_UBW`). The launcher itself only checks Microsoft's VC++ runtime first.
+pub fn unreal_bootstrap(path: &Path) -> Option<(std::path::PathBuf, String)> {
+    if std::fs::metadata(path).ok()?.len() > 8 << 20 {
+        return None;
+    }
+    let data = std::fs::read(path).ok()?;
+    let utf16 = |s: &str| -> Vec<u8> { s.encode_utf16().flat_map(|c| c.to_le_bytes()).collect() };
+    let marker = utf16("BootstrapPackagedGame");
+    if !data.windows(marker.len()).any(|w| w == marker) {
+        return None;
+    }
+    let key = utf16("\\Binaries\\Win");
+    let at = data.windows(key.len()).position(|w| w == key)?;
+    let unit = |i: usize| data.get(i..i + 2).map(|b| u16::from_le_bytes([b[0], b[1]]));
+    let printable = |u: u16| (0x20..0x7f).contains(&u);
+    let mut start = at;
+    while start >= 2 && unit(start - 2).is_some_and(printable) {
+        start -= 2;
+    }
+    let read = |from: usize| -> (String, usize) {
+        let mut units = Vec::new();
+        let mut i = from;
+        while let Some(u) = unit(i).filter(|&u| u != 0) {
+            units.push(u);
+            i += 2;
+        }
+        (String::from_utf16_lossy(&units), i + 2)
+    };
+    let (target, next) = read(start);
+    // The arguments follow; resource padding ("PADDINGX" as bytes) isn't ASCII text in UTF-16.
+    let (args, _) = read(next);
+    let args = if args.encode_utf16().all(printable) { args } else { String::new() };
+    let program = path.parent()?.join(target.replace('\\', "/"));
+    program.is_file().then_some((program, args))
+}
+
 /// The maker a Windows file names in its version information ("CompanyName"), if any.
 pub fn company(path: &Path) -> Option<String> {
     let data = std::fs::read(path).ok()?;
@@ -1101,6 +1140,23 @@ fn pe(f: &mut File, h: &[u8]) -> Option<Pe> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reads_unreal_launchers() {
+        let dir = std::env::temp_dir().join(format!("gamefix-ue-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("Game/Binaries/Win64")).unwrap();
+        std::fs::write(dir.join("Game/Binaries/Win64/Game-Win64-Shipping.exe"), b"MZ").unwrap();
+        let utf16 = |s: &str| -> Vec<u8> { s.encode_utf16().flat_map(|c| c.to_le_bytes()).collect() };
+        let mut data = b"MZ..IEND\xaeB`\x82P".to_vec();
+        data.extend(utf16("Game\\Binaries\\Win64\\Game-Win64-Shipping.exe\0Game\0"));
+        data.extend(b"PADDINGXX");
+        data.extend(utf16("BootstrapPackagedGame-Win64-Shipping.exe"));
+        let launcher = dir.join("Game.exe");
+        std::fs::write(&launcher, &data).unwrap();
+        let found = super::unreal_bootstrap(&launcher);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(found, Some((dir.join("Game/Binaries/Win64/Game-Win64-Shipping.exe"), "Game".to_string())));
+    }
+
     #[test]
     fn finds_needles_in_one_pass() {
         let data = b"xx/usr/share/fonts..Arial.ttf FreeSansH9";

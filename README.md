@@ -34,7 +34,7 @@ A few examples of what it finds and fixes:
   - TIC-80 cartridges in TIC-80
 - **Windows games:** it adds them to your app menu (started with Proton through
   [umu-launcher](https://github.com/Open-Wine-Components/umu-launcher), in a Wine prefix of
-  the game's own) or to Steam with Proton. For Steam games, it picks the Proton
+  the game's own) or to Steam with Proton, with the game's own icon. For Steam games, it picks the Proton
   version that ProtonDB players' reports say works. For GOG and Epic games that
   [protonfixes](https://github.com/Open-Wine-Components/umu-protonfixes) has a fix for, it
   picks GE-Proton and tells protonfixes which game it is. GOG games start the way GOG Galaxy

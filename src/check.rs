@@ -1639,6 +1639,13 @@ impl Report {
                                     let _ = writeln!(out, "• protonfixes (part of GE-Proton and UMU-Proton) has a fix for this game: {}, {}.", umu.title, umu.id);
                                     let _ = writeln!(out, "    gamefix setup runs it with one of those and tells protonfixes which game it is.");
                                 }
+                                if let Some((target, _)) = crate::binary::unreal_bootstrap(&game.full(&game.files[i])) {
+                                    let _ = writeln!(out, "• {} is Unreal's launcher: it checks for Microsoft's VC++ runtime, then starts", game.files[i].path.display());
+                                    let _ = writeln!(out, "  the game's program, {}.", target.strip_prefix(&game.root).unwrap_or(&target).display());
+                                    let _ = writeln!(out, "  Newer launchers refuse the runtime Proton brings (\"Microsoft Visual C++ 2015-2022");
+                                    let _ = writeln!(out, "  Redistributable (x64)\" is required).");
+                                    let _ = writeln!(out, "    gamefix setup starts the game's program directly; it runs on Proton's own runtime.");
+                                }
                             }
                         }
                         for (what, _) in &anticheat {
