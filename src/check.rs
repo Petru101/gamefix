@@ -1974,7 +1974,8 @@ impl Report {
                 }
                 Problem::Java { file, java: None } => {
                     let _ = writeln!(out, "✗ This is a Java game ({}): it runs with \"java -jar\", and Java isn't installed.", file.display());
-                    let _ = writeln!(out, "    Fix: on Bazzite, run \"brew install openjdk\" in a terminal; then gamefix setup adds it to the app menu.");
+                    let _ = writeln!(out, "    Fix: gamefix setup offers to download Java (Eclipse Temurin, from adoptium.net, 45-60");
+                    let _ = writeln!(out, "    MB) into ~/.local/share/gamefix/java, then adds the game to the app menu.");
                 }
                 Problem::Java { file, java: Some(java) } if file.extension().is_some_and(|e| e == "jar") => {
                     let _ = writeln!(out, "• This is a Java game; Java is installed, so it runs with: {} -jar \"{}\"", java.display(), file.display());
@@ -1996,14 +1997,13 @@ impl Report {
                     let major = System::java_major(java);
                     if needs.nashorn && !major.is_some_and(|v| v <= 14) {
                         let _ = writeln!(out, "  It runs JavaScript through Java's own engine (Nashorn), which Java 15 removed: it needs");
-                        let _ = writeln!(out, "  Java 14 or older (\"brew install openjdk@11\"; gamefix uses that one when it's there).");
+                        let _ = writeln!(out, "  Java 14 or older: gamefix setup offers to download Java 11 for it.");
                     } else if needs.old_lwjgl3 && !major.is_some_and(|v| v <= 16) {
                         let _ = writeln!(out, "  It brings LWJGL 3 from before 3.1 (2015-2016), which fails on current Java when it draws");
-                        let _ = writeln!(out, "  (IndexOutOfBoundsException: Homorium); Java 11 runs it (\"brew install openjdk@11\"; gamefix");
-                        let _ = writeln!(out, "  uses that one when it's there).");
-                    } else if needs.applet && major.is_none() {
-                        let _ = writeln!(out, "  It uses Java applets, which Java 26 removed: it needs Java 25 or older (\"brew install");
-                        let _ = writeln!(out, "  openjdk@21\"; gamefix uses that one when it's there).");
+                        let _ = writeln!(out, "  (IndexOutOfBoundsException: Homorium); Java 11 runs it: gamefix setup offers to download it.");
+                    } else if needs.applet && !major.is_some_and(|v| v <= 25) {
+                        let _ = writeln!(out, "  It uses Java applets, which Java 26 removed: it needs Java 25 or older; gamefix setup");
+                        let _ = writeln!(out, "  offers to download Java 21 for it.");
                     }
                     if let Some(dir) = &needs.home_dir {
                         let home = std::env::var("HOME").unwrap_or_default();
@@ -2028,14 +2028,13 @@ impl Report {
                     let _ = writeln!(out, "  gamefix setup adds that to the app menu, with Java's own sound sent to PipeWire (it would");
                     let _ = writeln!(out, "  open the sound card directly, which PipeWire already holds, and get none).");
                     let (applet, only32, arm) = scan::processing_notes(&game.root, file);
-                    let lts = java.to_string_lossy().contains("/openjdk@");
+                    let lts = java.starts_with(&game.root) || System::java_major(java).is_some_and(|v| v <= 25);
                     if applet && !lts {
                         let _ = writeln!(out, "  It's built on Processing 2 or older, a Java applet, and Java 26 removed those: it needs");
-                        let _ = writeln!(out, "  Java 25 or older (\"brew install openjdk@21\"; gamefix uses that one when it's there).");
+                        let _ = writeln!(out, "  Java 25 or older; gamefix setup offers to download Java 21 for it.");
                     } else if !lts {
                         let _ = writeln!(out, "  Processing from before 2018 can't start on a Java whose version is a single number (\"27\",");
-                        let _ = writeln!(out, "  until its first update): Dial didn't. Java 21 (\"brew install openjdk@21\") works, and");
-                        let _ = writeln!(out, "  gamefix uses it when it's there.");
+                        let _ = writeln!(out, "  until its first update): Dial didn't. Java 21 works; gamefix setup offers to download it.");
                     }
                     if only32 {
                         let _ = writeln!(out, "  It's a 32-bit export: if it draws with OpenGL, 64-bit Java can't load its 32-bit parts");

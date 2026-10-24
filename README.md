@@ -24,7 +24,8 @@ A few examples of what it finds and fixes:
   is open, and a one-colour screen on start.
 - **Games another program runs**, set up with the right version of that program:
   - LÖVE games on the LÖVE version they were made for (0.8, 0.9, 0.10 or 11)
-  - Java games on a Java version that still runs them
+  - Java games on a Java version that still runs them (downloaded for you, after asking, when
+    none is installed)
   - Python games in a Python of their own, with the packages they need
   - .NET games on Microsoft's .NET
   - DOS games in DOSBox Staging, GOG's DOS releases too (instead of the Windows DOSBox they bring)
@@ -98,13 +99,13 @@ gamefix prefers changes that work from any shortcut, made where they belong:
   Wine prefixes for games that need one of their own (undo keeps those: your saves are in them).
 
 Every change is recorded, and `gamefix undo` takes it back. Shared downloads stay after undo
-because other games can use them: LÖVE builds, .NET and Python runtimes, GE-Proton, and
-Flathub apps.
+because other games can use them: LÖVE builds, .NET, Python and Java runtimes, GE-Proton,
+and Flathub apps.
 
 gamefix never runs a game's files to find out what's wrong; it only reads them. It downloads
 only what a fix needs: distribution packages, LÖVE's own builds, Microsoft's .NET, Python
-builds, GE-Proton and RPG Maker's runtime package. Before installing an app from Flathub, it
-asks.
+builds, GE-Proton, RPG Maker's runtime package and Java (Eclipse Temurin, from adoptium.net).
+Before installing an app from Flathub or downloading Java, it asks.
 
 ## Reporting problems
 

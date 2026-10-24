@@ -79,7 +79,7 @@ pub fn find(root: &Path, program: &Path) -> Option<Game> {
 }
 
 /// A string field's value in a JSON file, without a JSON reader: `"key": "value"`.
-fn json_field(text: &str, key: &str) -> Option<String> {
+pub(crate) fn json_field(text: &str, key: &str) -> Option<String> {
     let rest = text.split_once(&format!("\"{key}\""))?.1.trim_start().strip_prefix(':')?.trim_start().strip_prefix('"')?;
     Some(rest.split_once('"')?.0.to_string()).filter(|v| !v.is_empty())
 }

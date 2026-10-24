@@ -8,6 +8,7 @@ pub mod feedback;
 pub mod fetch;
 pub mod font;
 pub mod gog;
+pub mod java;
 pub mod love;
 pub mod peicon;
 pub mod proton;

@@ -105,10 +105,11 @@ impl System {
         self.paths.get(&(name.to_string(), bits)).map(String::as_str)
     }
 
-    /// Whether `java` is on the PATH or in Homebrew (Bazzite's way to install it).
+    /// Whether `java` is on the PATH or in Homebrew (Bazzite's way to install it), else the
+    /// newest runtime gamefix downloaded.
     pub fn java(&self) -> Option<PathBuf> {
         let path = std::env::var_os("PATH").unwrap_or_default();
-        std::env::split_paths(&path).chain([PathBuf::from("/home/linuxbrew/.linuxbrew/bin")]).map(|d| d.join("java")).find(|j| j.is_file())
+        std::env::split_paths(&path).chain([PathBuf::from("/home/linuxbrew/.linuxbrew/bin")]).map(|d| d.join("java")).find(|j| j.is_file()).or_else(|| crate::java::installed().pop().map(|(_, j)| j))
     }
 
     /// Mono, for .NET games built to run with it on Linux: on the PATH, or Homebrew's (`brew
@@ -124,7 +125,7 @@ impl System {
         self.java_up_to(25)
     }
 
-    /// Homebrew's newest openjdk@N up to `max`.
+    /// Homebrew's newest openjdk@N up to `max`, or a runtime gamefix downloaded.
     pub fn java_up_to(&self, max: u32) -> Option<PathBuf> {
         let opt = Path::new("/home/linuxbrew/.linuxbrew/opt");
         let mut found: Vec<(u32, PathBuf)> = std::fs::read_dir(opt)
@@ -137,13 +138,16 @@ impl System {
                 (n <= max && java.is_file()).then_some((n, java))
             })
             .collect();
+        found.extend(crate::java::installed().into_iter().filter(|(n, _)| *n <= max));
         found.sort();
         found.pop().map(|(_, j)| j)
     }
 
-    /// The major version of one of Homebrew's openjdk@N (None for its plain, newest `openjdk`).
+    /// A Java's major version: one of Homebrew's openjdk@N by its folder, any other by its
+    /// `release` file.
     pub fn java_major(java: &Path) -> Option<u32> {
-        java.to_string_lossy().split("/openjdk@").nth(1)?.split('/').next()?.parse().ok()
+        let homebrew = || java.to_string_lossy().split("/openjdk@").nth(1)?.split('/').next()?.parse().ok();
+        homebrew().or_else(|| crate::java::major(java))
     }
 
     /// How to start LÖVE: Flathub's (Bazzite's way to install it; its sandbox can read the whole

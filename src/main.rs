@@ -104,6 +104,23 @@ fn run(command: &str, game: &scan::Game, targets: &setup::Targets, dialog: bool)
                 installed = Some(format!("Installed {} from Flathub (it stays after undo: other games can use it).", runner.name));
             }
         }
+        // A Java game with no Java that fits it: offer to download one.
+        if let Some(major) = setup::missing_java(game, &report) {
+            let size = java::latest(major).map(|r| format!(", {} to download", r.size_text())).unwrap_or_default();
+            let question = format!("{} is a Java game and needs Java {major}, which isn't installed.\n\ngamefix can download Java {major} (Eclipse Temurin, from adoptium.net{size}) into ~/.local/share/gamefix/java, for you only: no password needed.\n\nDownload it now?", game.name);
+            if confirm(&title, &question, dialog) {
+                if dialog {
+                    let _ = Command::new("notify-send").args([title.as_str(), &markup_escaped(&format!("Downloading Java {major}…"))]).status();
+                } else {
+                    println!("Downloading Java {major}…");
+                }
+                if let Err(e) = java::install(major) {
+                    return said(&title, Err(e));
+                }
+                report = check::check(game, &system::System::load());
+                installed = Some(format!("Downloaded Java {major} (Eclipse Temurin) into ~/.local/share/gamefix/java (it stays after undo: other games can use it)."));
+            }
+        }
     }
     // From the right-click menu there's no terminal to say "close Steam first" in, so ask.
     let needs_steam = targets.steam || (command == "undo" && setup::touches_steam(game));
