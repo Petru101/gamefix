@@ -82,6 +82,14 @@ fn resource(rsrc: &[u8], va: u32, kind: u32, id: Option<u32>) -> Option<&[u8]> {
     rsrc.get(at..at + size)
 }
 
+/// A program's RCDATA resource with this id (Unreal's launcher keeps the program it starts and
+/// its arguments in 201 and 202).
+pub(crate) fn rcdata(path: &Path, id: u32) -> Option<Vec<u8>> {
+    const RT_RCDATA: u32 = 10;
+    let (rsrc, va) = resources(path)?;
+    resource(&rsrc, va, RT_RCDATA, Some(id)).map(<[u8]>::to_vec)
+}
+
 /// The program's biggest icon as a PNG's bytes.
 pub fn icon_png(path: &Path) -> Option<Vec<u8>> {
     let (rsrc, va) = resources(path)?;

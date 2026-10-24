@@ -1039,43 +1039,29 @@ pub fn bundle_without_pkg_resources(data: &mut [u8]) -> Result<(), String> {
 }
 
 /// Unreal's launcher (BootstrapPackagedGame, renamed as the game) beside a packaged game: the
-/// program it starts and the arguments it gives it, kept as two UTF-16 strings in its resources
-/// (Starship Troopers: `StarshipTroopers_UBW\Binaries\Win64\StarshipTroopers_UBW-Win64-Shipping.exe`,
-/// then `StarshipTroopers_UBW`). The launcher itself only checks Microsoft's VC++ runtime first.
+/// program it starts and the arguments it gives it, its RCDATA resources 201 and 202 (UTF-16;
+/// Starship Troopers: `StarshipTroopers_UBW\Binaries\Win64\StarshipTroopers_UBW-Win64-Shipping.exe`,
+/// then `StarshipTroopers_UBW`; older UE4 ones write `/`). Read as resources, not as the bytes
+/// after the program's name: Battlements' launcher has padding between the two, and its
+/// arguments were lost. The launcher itself only checks Microsoft's VC++ runtime first.
 pub fn unreal_bootstrap(path: &Path) -> Option<(std::path::PathBuf, String)> {
     if std::fs::metadata(path).ok()?.len() > 8 << 20 {
         return None;
     }
     let data = std::fs::read(path).ok()?;
-    let utf16 = |s: &str| -> Vec<u8> { s.encode_utf16().flat_map(|c| c.to_le_bytes()).collect() };
     // Its name in its version information (UTF-16), or only in its debug file's name (ASCII:
     // UE4 launchers without version information, Ghost Defender's Invade.exe).
-    let marker = utf16("BootstrapPackagedGame");
-    if !data.windows(marker.len()).any(|w| w == marker) && !contains_bytes(&data, b"BootstrapPackagedGame") {
+    let marker: Vec<u8> = "BootstrapPackagedGame".encode_utf16().flat_map(|c| c.to_le_bytes()).collect();
+    if !contains_bytes(&data, &marker) && !contains_bytes(&data, b"BootstrapPackagedGame") {
         return None;
     }
-    // With backslashes, or forward slashes in older UE4 launchers (`Engine/Binaries/Win32/UE4Game.exe`).
-    let (back, forward) = (utf16("Binaries\\Win"), utf16("Binaries/Win"));
-    let at = data.windows(back.len()).position(|w| w == back || w == forward)?;
-    let unit = |i: usize| data.get(i..i + 2).map(|b| u16::from_le_bytes([b[0], b[1]]));
-    let printable = |u: u16| (0x20..0x7f).contains(&u);
-    let mut start = at;
-    while start >= 2 && unit(start - 2).is_some_and(printable) {
-        start -= 2;
-    }
-    let read = |from: usize| -> (String, usize) {
-        let mut units = Vec::new();
-        let mut i = from;
-        while let Some(u) = unit(i).filter(|&u| u != 0) {
-            units.push(u);
-            i += 2;
-        }
-        (String::from_utf16_lossy(&units), i + 2)
+    let text = |id: u32| -> Option<String> {
+        let bytes = crate::peicon::rcdata(path, id)?;
+        let units: Vec<u16> = bytes.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).take_while(|&u| u != 0).collect();
+        Some(String::from_utf16_lossy(&units))
     };
-    let (target, next) = read(start);
-    // The arguments follow; resource padding ("PADDINGX" as bytes) isn't ASCII text in UTF-16.
-    let (args, _) = read(next);
-    let args = if args.encode_utf16().all(printable) { args } else { String::new() };
+    let target = text(201)?;
+    let args = text(202).unwrap_or_default();
     let program = path.parent()?.join(target.replace('\\', "/"));
     program.is_file().then_some((program, args))
 }
@@ -1147,27 +1133,58 @@ fn pe(f: &mut File, h: &[u8]) -> Option<Pe> {
 
 #[cfg(test)]
 mod tests {
+    /// A launcher made like Unreal's: a PE whose resources hold the program (RCDATA 201) and its
+    /// arguments (202), with padding between them as Battlements' has.
     #[test]
     fn reads_unreal_launchers() {
         let dir = std::env::temp_dir().join(format!("gamefix-ue-{}", std::process::id()));
-        std::fs::create_dir_all(dir.join("Game/Binaries/Win64")).unwrap();
-        std::fs::write(dir.join("Game/Binaries/Win64/Game-Win64-Shipping.exe"), b"MZ").unwrap();
-        let utf16 = |s: &str| -> Vec<u8> { s.encode_utf16().flat_map(|c| c.to_le_bytes()).collect() };
-        // UE 5's launcher writes backslashes, older UE4 ones forward slashes.
-        let mut found = Vec::new();
-        for target in ["Game\\Binaries\\Win64\\Game-Win64-Shipping.exe", "Game/Binaries/Win64/Game-Win64-Shipping.exe"] {
-            let mut data = b"MZ..IEND\xaeB`\x82P".to_vec();
-            data.extend(utf16(&format!("{target}\0Game\0")));
-            data.extend(b"PADDINGXX");
-            data.extend(utf16("BootstrapPackagedGame-Win64-Shipping.exe"));
-            let launcher = dir.join("Game.exe");
-            std::fs::write(&launcher, &data).unwrap();
-            found.push(super::unreal_bootstrap(&launcher));
+        std::fs::create_dir_all(dir.join("Engine/Binaries/Win32")).unwrap();
+        std::fs::write(dir.join("Engine/Binaries/Win32/UE4Game-Win32-Shipping.exe"), b"MZ").unwrap();
+        let utf16 = |s: &str| -> Vec<u8> { s.encode_utf16().chain([0]).flat_map(|c| c.to_le_bytes()).collect() };
+        let strings = [utf16("Engine/Binaries/Win32/UE4Game-Win32-Shipping.exe"), utf16("..\\..\\..\\Game\\Game.uproject")];
+        // The resource section at 0x1000 (file offset 0x200): type dir, id dir, two language
+        // dirs, two data entries, then the strings, the first padded with "PA".
+        let mut rsrc = vec![0u8; 0x90];
+        let dir_at = |r: &mut Vec<u8>, at: usize, entries: &[(u32, u32)]| {
+            r[at + 14..at + 16].copy_from_slice(&(entries.len() as u16).to_le_bytes());
+            for (k, (id, off)) in entries.iter().enumerate() {
+                r[at + 16 + k * 8..at + 20 + k * 8].copy_from_slice(&id.to_le_bytes());
+                r[at + 20 + k * 8..at + 24 + k * 8].copy_from_slice(&off.to_le_bytes());
+            }
+        };
+        dir_at(&mut rsrc, 0x00, &[(10, 0x8000_0018)]);
+        dir_at(&mut rsrc, 0x18, &[(201, 0x8000_0038), (202, 0x8000_0050)]);
+        dir_at(&mut rsrc, 0x38, &[(1033, 0x68)]);
+        dir_at(&mut rsrc, 0x50, &[(1033, 0x78)]);
+        let first = 0x90;
+        let second = first + strings[0].len() + 2;
+        for (at, rva, len) in [(0x68, 0x1000 + first, strings[0].len()), (0x78, 0x1000 + second, strings[1].len())] {
+            rsrc[at..at + 4].copy_from_slice(&(rva as u32).to_le_bytes());
+            rsrc[at + 4..at + 8].copy_from_slice(&(len as u32).to_le_bytes());
         }
+        rsrc.extend(&strings[0]);
+        rsrc.extend(b"PA");
+        rsrc.extend(&strings[1]);
+        let mut exe = vec![0u8; 0x200];
+        exe[..2].copy_from_slice(b"MZ");
+        exe[0x3c..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+        exe[0x40..0x44].copy_from_slice(b"PE\0\0");
+        exe[0x46..0x48].copy_from_slice(&1u16.to_le_bytes());
+        exe[0x54..0x56].copy_from_slice(&0xe0u16.to_le_bytes());
+        exe[0x58..0x5a].copy_from_slice(&0x10bu16.to_le_bytes());
+        exe[0x58 + 96 + 16..0x58 + 96 + 20].copy_from_slice(&0x1000u32.to_le_bytes());
+        let section = 0x58 + 0xe0;
+        exe[section + 8..section + 12].copy_from_slice(&(rsrc.len() as u32).to_le_bytes());
+        exe[section + 12..section + 16].copy_from_slice(&0x1000u32.to_le_bytes());
+        exe[section + 16..section + 20].copy_from_slice(&(rsrc.len() as u32).to_le_bytes());
+        exe[section + 20..section + 24].copy_from_slice(&0x200u32.to_le_bytes());
+        exe.extend(&rsrc);
+        exe.extend(b"BootstrapPackagedGame-Win32-Shipping.pdb");
+        let launcher = dir.join("Game.exe");
+        std::fs::write(&launcher, &exe).unwrap();
+        let found = super::unreal_bootstrap(&launcher);
         std::fs::remove_dir_all(&dir).unwrap();
-        for found in found {
-            assert_eq!(found, Some((dir.join("Game/Binaries/Win64/Game-Win64-Shipping.exe"), "Game".to_string())));
-        }
+        assert_eq!(found, Some((dir.join("Engine/Binaries/Win32/UE4Game-Win32-Shipping.exe"), "..\\..\\..\\Game\\Game.uproject".to_string())));
     }
 
     #[test]
