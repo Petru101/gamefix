@@ -77,8 +77,14 @@ gamefix feedback [<game folder or file>]
 Steam has to be closed while gamefix changes Steam's settings, because Steam rewrites them
 when it quits. From the right-click menu, gamefix offers to close Steam for you.
 
-Windows games installed from an installer or a disc go into `~/Games`. To use another folder
-(it must be on a Linux drive, not NTFS or FAT):
+While an installer runs, your drives show up in it as on Windows: every drive mounted under
+`/run/media`, `/media` or `/mnt` gets a letter (D:, E: ...) and its name, so you pick where the
+game goes. For a drive Wine can't name by itself (NTFS, FAT, exFAT), gamefix puts a small
+`.windows-label` file at its top during the install and removes it after. Z: (Wine's view of
+the whole Linux system) is hidden during the install and comes back after.
+
+The installer's Windows settings, and the game unless you pick another drive, go into
+`~/Games`. To use another folder (it must be on a Linux drive, not NTFS or FAT):
 
 ```sh
 gamefix games-folder <folder>

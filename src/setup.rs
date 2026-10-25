@@ -1368,9 +1368,20 @@ fn setup_install(game: &Game, installer: Installer, targets: &Targets) -> Result
                 }
                 Installer::File(file) => (file.clone(), None),
             };
+            // The computer's drives as D:, E: ... and Z: hidden while it runs, so its Browse
+            // lists them by name; the installer started from its own drive's path, so Wine
+            // names it by that drive's letter, else from a link in C:.
+            let drives = crate::drives::letter(&prefix);
+            let link = prefix.join("drive_c/gamefix-setup");
+            let start = drives.on_drive(&setup).or_else(|| {
+                fs::create_dir_all(prefix.join("drive_c")).ok()?;
+                std::os::unix::fs::symlink(setup.parent()?, &link).ok()?;
+                Some(link.join(setup.file_name()?))
+            });
+            let start = start.unwrap_or_else(|| setup.clone());
             let status = std::process::Command::new(&umu)
-                .arg(&setup)
-                .current_dir(setup.parent().unwrap_or(Path::new("/")))
+                .arg(&start)
+                .current_dir(start.parent().unwrap_or(Path::new("/")))
                 .env("WINEPREFIX", &prefix)
                 .env("PROTONPATH", &tool_dir)
                 .env("GAMEID", "umu-0")
@@ -1382,6 +1393,8 @@ fn setup_install(game: &Game, installer: Installer, targets: &Targets) -> Result
                 .stderr(std::process::Stdio::null())
                 .status();
             crate::disc::wait_for_prefix(&prefix);
+            drives.finish();
+            let _ = fs::remove_file(&link);
             if let Some(dir) = unpacked {
                 let _ = fs::remove_dir_all(dir);
             }

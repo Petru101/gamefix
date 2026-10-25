@@ -193,6 +193,18 @@ fn find_installed(pfx: &Path, name: &str) -> Option<(PathBuf, String)> {
                 find_files(&entry.path(), "exe", 0, &mut exes);
             }
         }
+        // On another drive (E:\Games\X) with no shortcut (FitGirl's repacks make none by
+        // default): what's new there since the drive got its letter, the link's own time.
+        if !exes.iter().any(|e| !unwanted(e)) {
+            let own = fs::canonicalize(pfx).unwrap_or_default();
+            for entry in fs::read_dir(pfx.join("dosdevices")).into_iter().flatten().flatten() {
+                let letter = entry.file_name().to_string_lossy().to_lowercase();
+                let since = fs::symlink_metadata(entry.path()).map(|m| std::os::unix::fs::MetadataExt::mtime(&m));
+                if let (true, Ok(since), Ok(root)) = (letter.len() == 2 && letter.ends_with(':') && !["c:", "z:"].contains(&letter.as_str()), since, fs::canonicalize(entry.path())) {
+                    new_files(&root, since, &own, 0, &mut exes);
+                }
+            }
+        }
         let exe = exes.into_iter().filter(|e| !unwanted(e)).max_by_key(|e| size(e))?;
         // Named after its folder, or the one above a System/Bin one (Harry Potter\System\HP.exe).
         let label = exe.ancestors().skip(1).filter_map(|d| d.file_name()).map(|n| n.to_string_lossy().into_owned()).find(|n| !["system", "bin", "binaries", "win32", "win64", "x86", "x64", "exe"].contains(&n.to_lowercase().as_str()))?;
@@ -209,6 +221,26 @@ fn find_files(dir: &Path, ext: &str, depth: usize, out: &mut Vec<PathBuf>) {
                 find_files(&path, ext, depth + 1, out);
             }
         } else if path.extension().is_some_and(|e| e.eq_ignore_ascii_case(ext)) {
+            out.push(path);
+        }
+    }
+}
+
+/// The .exe files made or changed in `dir` since `since` (Unix time), going only into folders changed
+/// since then too (a folder's times change when something is made in it), so a whole drive
+/// costs a few folders. Leaves out `skip` (the prefix), hidden folders and Windows' and Steam's.
+fn new_files(dir: &Path, since: i64, skip: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    use std::os::unix::fs::MetadataExt;
+    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_lowercase();
+        let Ok(meta) = fs::symlink_metadata(&path) else { continue };
+        if meta.ctime().max(meta.mtime()) < since || name.starts_with('.') || path == skip || ["$recycle.bin", "system volume information", "steamapps"].contains(&name.as_str()) {
+            continue;
+        }
+        if meta.is_dir() && depth < 6 {
+            new_files(&path, since, skip, depth + 1, out);
+        } else if meta.is_file() && path.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe")) {
             out.push(path);
         }
     }
@@ -283,6 +315,25 @@ mod tests {
         std::fs::write(root.join("Games/Harry Potter/System/HP.exe"), b"").unwrap();
         assert_eq!(resolve(&root, "Games\\HARR~FNR\\SYSTEM\\HP.exe"), Some(root.join("Games/Harry Potter/System/HP.exe")));
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn new_programs_on_other_drives() {
+        let drive = std::env::temp_dir().join(format!("gamefix-new-files-{}", std::process::id()));
+        for dir in ["Games/X/Bin", "Games/.hidden", "prefix/drive_c"] {
+            fs::create_dir_all(drive.join(dir)).unwrap();
+        }
+        for file in ["Games/X/Bin/x.exe", "Games/.hidden/h.exe", "prefix/drive_c/wine.exe", "Games/X/readme.txt"] {
+            fs::write(drive.join(file), "").unwrap();
+        }
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+        let mut found = Vec::new();
+        new_files(&drive, now - 5, &drive.join("prefix"), 0, &mut found);
+        assert_eq!(found, [drive.join("Games/X/Bin/x.exe")]);
+        found.clear();
+        new_files(&drive, now + 60, &drive.join("prefix"), 0, &mut found);
+        assert!(found.is_empty());
+        fs::remove_dir_all(&drive).unwrap();
     }
 
     #[test]
