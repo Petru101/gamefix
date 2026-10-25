@@ -1317,6 +1317,21 @@ pub fn set_games_folder(path: &Path) -> Result<Vec<String>, String> {
     Ok(vec![format!("Windows games gamefix installs now go into {}, each in a folder named after it.", path.display())])
 }
 
+/// Removes the link setup_install gave an installer to start from: a link to its folder, or a
+/// folder of links to its files (the links only, never what they point to).
+fn remove_links(link: &Path) {
+    if fs::symlink_metadata(link).is_ok_and(|m| m.is_dir()) {
+        for entry in fs::read_dir(link).into_iter().flatten().flatten() {
+            if entry.file_type().is_ok_and(|t| t.is_symlink()) {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+        let _ = fs::remove_dir(link);
+    } else {
+        let _ = fs::remove_file(link);
+    }
+}
+
 /// In a folder setup_install installed a game into: what from, the program, its name.
 const INSTALL_NOTE: &str = "gamefix-install.txt";
 
@@ -1346,11 +1361,37 @@ fn setup_install(game: &Game, installer: Installer, targets: &Targets) -> Result
         let exe = entry.path().join(field("program")?);
         (Path::new(&field("source")?) == source && exe.is_file()).then(|| (entry.path(), exe, field("name").unwrap_or_else(|| game.name.clone())))
     });
+    // A repack unpacks with ISDone's 32-bit unarc.dll, which only GE-Proton's WoW64 gives the
+    // memory it expects (repack.rs).
+    let repack = match &installer {
+        Installer::File(file) => crate::repack::find(file),
+        Installer::Disc { .. } => None,
+    };
+    if let Some(part) = repack.iter().flat_map(|r| &r.unfinished).find(|p| !crate::repack::optional(p)) {
+        return Err(format!("The download isn't finished: {} is still mostly empty. Let it finish, then set it up again.", part.display()));
+    }
     if record_path(game).exists() {
         undo(game)?;
     }
     let mut done = Vec::new();
     let mut not_fixed = Vec::new();
+    // The game then runs with the same GE: its prefix isn't switched between Protons.
+    let (tool, tool_dir) = match &repack {
+        Some(_) => {
+            let ge = match steam.newest_ge() {
+                Some(ge) => ge,
+                None => {
+                    let ge = proton::fetch_ge(&steam).map_err(|e| format!("{e} This repack's installer needs GE-Proton (its unpacker fails under Valve's Protons); ProtonUp-Qt (Flathub) can install it."))?;
+                    done.push(format!("Downloaded {ge} into Steam's compatibility tools (undo leaves it: other games can use it)."));
+                    ge
+                }
+            };
+            let dir = steam.tool_dir(&ge).ok_or(format!("Couldn't find where {ge} is installed."))?;
+            done.push(format!("It's a repack (FreeArc archives unpacked by unarc.dll): installed with {ge} in WoW64 mode, the only Proton whose memory layout its unpacker copes with, and the game runs with it too."));
+            (ge, dir)
+        }
+        None => (tool, tool_dir),
+    };
     let (prefix, exe, name) = match earlier {
         Some(found) => found,
         None => {
@@ -1372,15 +1413,36 @@ fn setup_install(game: &Game, installer: Installer, targets: &Targets) -> Result
             // lists them by name; the installer started from its own drive's path, so Wine
             // names it by that drive's letter, else from a link in C:.
             let drives = crate::drives::letter(&prefix);
+            // A repack's unfinished optional parts left out: it offers every archive there is,
+            // so it gets a folder of links to the rest.
             let link = prefix.join("drive_c/gamefix-setup");
-            let start = drives.on_drive(&setup).or_else(|| {
-                fs::create_dir_all(prefix.join("drive_c")).ok()?;
-                std::os::unix::fs::symlink(setup.parent()?, &link).ok()?;
-                Some(link.join(setup.file_name()?))
-            });
+            let start = match repack.as_ref().filter(|r| !r.unfinished.is_empty()) {
+                Some(r) => (|| {
+                    fs::create_dir_all(&link).ok()?;
+                    for entry in fs::read_dir(setup.parent()?).ok()?.flatten() {
+                        if !r.unfinished.contains(&entry.path()) {
+                            std::os::unix::fs::symlink(entry.path(), link.join(entry.file_name())).ok()?;
+                        }
+                    }
+                    let left_out: Vec<String> = r.unfinished.iter().filter_map(|p| Some(p.file_name()?.to_string_lossy().into_owned())).collect();
+                    done.push(format!("Left the download's unfinished optional parts out of the installer's choices: {}.", left_out.join(", ")));
+                    Some(link.join(setup.file_name()?))
+                })(),
+                None => drives.on_drive(&setup).or_else(|| {
+                    fs::create_dir_all(prefix.join("drive_c")).ok()?;
+                    std::os::unix::fs::symlink(setup.parent()?, &link).ok()?;
+                    Some(link.join(setup.file_name()?))
+                }),
+            };
             let start = start.unwrap_or_else(|| setup.clone());
-            let status = std::process::Command::new(&umu)
-                .arg(&start)
+            let mut command = std::process::Command::new(&umu);
+            if repack.is_some() {
+                // Inno Setup's log says whether it finished: an unpack error can end it quietly.
+                command.arg(&start).arg("/LOG=C:\\gamefix-install.log").env("PROTON_USE_WOW64", "1");
+            } else {
+                command.arg(&start);
+            }
+            let status = command
                 .current_dir(start.parent().unwrap_or(Path::new("/")))
                 .env("WINEPREFIX", &prefix)
                 .env("PROTONPATH", &tool_dir)
@@ -1394,7 +1456,8 @@ fn setup_install(game: &Game, installer: Installer, targets: &Targets) -> Result
                 .status();
             crate::disc::wait_for_prefix(&prefix);
             drives.finish();
-            let _ = fs::remove_file(&link);
+            remove_links(&link);
+            let finished = fs::read(prefix.join("drive_c/gamefix-install.log")).ok().map(|log| String::from_utf8_lossy(&log).contains("Installation process succeeded"));
             if let Some(dir) = unpacked {
                 let _ = fs::remove_dir_all(dir);
             }
@@ -1423,6 +1486,19 @@ fn setup_install(game: &Game, installer: Installer, targets: &Targets) -> Result
             // The program's path from the prefix when it's inside, else as it is (a game the
             // installer put on another drive stays there).
             let program = exe.strip_prefix(&prefix).unwrap_or(&exe);
+            if finished == Some(false) {
+                not_fixed.push(format!("The installer's log ({}) doesn't say it finished: it may have stopped at an unpack error. Install it again if the game doesn't start.", prefix.join("drive_c/gamefix-install.log").display()));
+            }
+            if let Some(checked) = crate::repack::check(&exe) {
+                let some = |files: &[String]| files.iter().take(3).cloned().collect::<Vec<_>>().join(", ") + if files.len() > 3 { " ..." } else { "" };
+                if !checked.differ.is_empty() {
+                    not_fixed.push(format!("{} of the {} files the repack's fitgirl.md5 lists don't match ({}): the unpack went wrong. Install it again; if that happens again, check the download with its \"Verify BIN files\" helper.", checked.differ.len(), checked.listed, some(&checked.differ)));
+                } else if !checked.missing.is_empty() {
+                    not_fixed.push(format!("{} of the {} files the repack's fitgirl.md5 lists aren't there ({}): the install didn't finish, or those are optional parts left out.", checked.missing.len(), checked.listed, some(&checked.missing)));
+                } else {
+                    done.push(format!("Checked the {} files the repack's fitgirl.md5 lists: all there and matching.", checked.listed));
+                }
+            }
             let note = format!("source\t{}\nprogram\t{}\nname\t{name}\n", source.display(), program.display());
             fs::write(prefix.join(INSTALL_NOTE), note).map_err(|e| e.to_string())?;
             done.push(if exe.starts_with(&prefix) {

@@ -270,7 +270,7 @@ fn link_target(data: &[u8]) -> Option<String> {
 /// A Windows path (`Program Files\Game\game.exe`) under `root`, each part matched ignoring
 /// case as Windows does. A short 8.3 name (`HARR~FNR` in Harry Potter's shortcut: Wine makes
 /// up the part after the ~) matches the one name starting like it, with the same extension.
-fn resolve(root: &Path, win: &str) -> Option<PathBuf> {
+pub(crate) fn resolve(root: &Path, win: &str) -> Option<PathBuf> {
     let mut path = root.to_path_buf();
     for part in win.split('\\').filter(|p| !p.is_empty()) {
         let exact = path.join(part);

@@ -1655,6 +1655,19 @@ impl Report {
                     } else if !self.installers.is_empty() {
                         let _ = writeln!(out, "    It's an installer: gamefix setup runs it with Proton (you click through it");
                         let _ = writeln!(out, "    once) and adds the game it installs to the app menu (--steam: to Steam).");
+                        if let Some(repack) = self.installers.iter().find_map(|(p, _)| crate::repack::find(&game.root.join(p))) {
+                            let _ = writeln!(out, "    It's a repack (FreeArc archives): it installs with GE-Proton in WoW64 mode, the only");
+                            let _ = writeln!(out, "    Proton its unpacker works under, and the files are checked after if it lists them.");
+                            match repack.unfinished.iter().find(|p| !crate::repack::optional(p)) {
+                                Some(part) => {
+                                    let _ = writeln!(out, "    The download isn't finished: {} is still mostly empty.", part.display());
+                                }
+                                None if !repack.unfinished.is_empty() => {
+                                    let _ = writeln!(out, "    {} optional parts weren't downloaded; the installer won't offer them.", repack.unfinished.len());
+                                }
+                                None => {}
+                            }
+                        }
                     }
                 }
                 Problem::Flash { file, ruffle: Some(ruffle) } => {
