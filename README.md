@@ -42,7 +42,8 @@ A few examples of what it finds and fixes:
   starts them, and GOG's first-run helper is run once. It runs installers and installs from disc
   images once, then adds the installed game to Steam. Repacks (FitGirl's and the like) install
   with GE-Proton, whose memory layout their unpacker needs; optional parts you didn't download
-  aren't offered, and the installed files are checked against the repack's own list. Games packed in an Unreal Development
+  aren't offered, and the installed files are checked against the repack's own list. Games
+  using RUNE's Steam emulator get the Wine settings it needs. Games packed in an Unreal Development
   Kit installer (`UDKInstall-<name>.exe`) are unpacked next to it instead. It can also add Windows parts an old game needs
   (MFC, Visual Basic 6, XNA ...) to its Proton setup.
 

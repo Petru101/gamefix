@@ -1387,7 +1387,7 @@ fn setup_install(game: &Game, installer: Installer, targets: &Targets) -> Result
                 }
             };
             let dir = steam.tool_dir(&ge).ok_or(format!("Couldn't find where {ge} is installed."))?;
-            done.push(format!("It's a repack (FreeArc archives unpacked by unarc.dll): installed with {ge} in WoW64 mode, the only Proton whose memory layout its unpacker copes with, and the game runs with it too."));
+            done.push(format!("It's a repack (FreeArc archives unpacked by unarc.dll): it installs with {ge} in WoW64 mode, the only Proton whose memory layout its unpacker copes with, and the game runs with it too."));
             (ge, dir)
         }
         None => (tool, tool_dir),
@@ -1529,6 +1529,13 @@ fn setup_install(game: &Game, installer: Installer, targets: &Targets) -> Result
         env.extend(umu.env());
     }
     add_overrides(&mut env, &own);
+    // The installed game's folder: the one up to three above the program that holds the
+    // installer's uninstaller or a repack's _Redist (Mycopunk's steam_emu.ini is three
+    // folders below its program), else the program's own.
+    let game_folder = exe.ancestors().skip(1).take(4).find(|d| d.join("_Redist").is_dir() || fs::read_dir(d).into_iter().flatten().flatten().any(|e| e.file_name().to_string_lossy().to_lowercase().starts_with("unins"))).or(exe.parent());
+    if game_folder.is_some_and(|f| rune_emulator(f, 0)) {
+        add_rune(&mut env, &own, &mut done);
+    }
     let workdir = exe.parent().unwrap_or(&prefix);
     let icon = windows_icon(game, &exe, &mut record);
     let fixed = fixes_tool.is_some();
@@ -1767,6 +1774,9 @@ fn setup_windows(game: &Game, report: &Report, exe: &crate::scan::Found, targets
         own_prefix = Some(dir);
     }
     add_overrides(&mut env, &own);
+    if rune_emulator(&game.root, 0) {
+        add_rune(&mut env, &own, &mut done);
+    }
     let mut record = Vec::new();
     if let Some(prefix) = &own_prefix {
         record.push(format!("game-prefix\t{}", prefix.display()));
@@ -1984,6 +1994,31 @@ fn add_overrides(env: &mut Vec<(&str, String)>, dlls: &[String]) {
     }
 }
 
+/// A game cracked with RUNE's Steam emulator: a `steam_emu.ini` naming RUNE in its folder (it
+/// loads through the game's version.dll and steamclient64.dll, or replaces steam_api64.dll).
+/// Wine has to load those DLLs instead of its own, and Proton's lsteamclient, which passes
+/// steamclient calls on to the real Steam, has to stay out: the settings the user found make
+/// such games (Borderlands 4, Mycopunk) start.
+fn rune_emulator(folder: &Path, depth: usize) -> bool {
+    fs::read_dir(folder).into_iter().flatten().flatten().any(|entry| {
+        let path = entry.path();
+        match entry.file_type() {
+            Ok(t) if t.is_dir() => depth < 5 && rune_emulator(&path, depth + 1),
+            Ok(t) if t.is_file() && entry.file_name().eq_ignore_ascii_case("steam_emu.ini") => fs::read(&path).is_ok_and(|text| String::from_utf8_lossy(&text).to_lowercase().contains("rune")),
+            _ => false,
+        }
+    })
+}
+
+/// RUNE's settings (`rune_emulator`) added to a Windows game's (`own`: the DLLs it already
+/// sends to the game's copies).
+fn add_rune(env: &mut Vec<(&str, String)>, own: &[String], done: &mut Vec<String>) {
+    let dlls: Vec<String> = ["version", "steamclient64"].iter().filter(|d| !own.iter().any(|o| o == *d)).map(|d| d.to_string()).collect();
+    add_overrides(env, &dlls);
+    env.push(("PROTON_DISABLE_LSTEAMCLIENT", "1".into()));
+    done.push("It's cracked with RUNE's Steam emulator: set Wine to load the game's version.dll and steamclient64.dll (WINEDLLOVERRIDES) and kept Proton's Steam client out (PROTON_DISABLE_LSTEAMCLIENT=1).".into());
+}
+
 fn dll_files(dlls: &[String]) -> String {
     dlls.iter().map(|d| format!("{d}.dll")).collect::<Vec<_>>().join(", ")
 }
@@ -2140,6 +2175,19 @@ fn refresh_menu() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rune_emulator_settings() {
+        let dir = std::env::temp_dir().join(format!("gamefix-rune-{}", std::process::id()));
+        fs::create_dir_all(dir.join("Game_Data/Plugins/x86_64")).unwrap();
+        assert!(!super::rune_emulator(&dir, 0));
+        fs::write(dir.join("Game_Data/Plugins/x86_64/steam_emu.ini"), "### =-RUNE- -==\n[Settings]\n").unwrap();
+        assert!(super::rune_emulator(&dir, 0));
+        fs::remove_dir_all(&dir).unwrap();
+        let mut env = vec![("WINEDLLOVERRIDES", "version=n,b".to_string())];
+        super::add_rune(&mut env, &["version".to_string()], &mut Vec::new());
+        assert_eq!(super::launch_options(&env, &[], ""), "WINEDLLOVERRIDES='version=n,b;steamclient64=n,b' PROTON_DISABLE_LSTEAMCLIENT=1 %command%");
+    }
 
     #[test]
     fn umu_commands() {
