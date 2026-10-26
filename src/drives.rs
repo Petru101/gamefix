@@ -174,6 +174,11 @@ impl Lettered {
         Some(point.join(inside.strip_prefix("/").unwrap_or(&inside)))
     }
 
+    /// The tops of the drives given letters.
+    pub fn roots(&self) -> Vec<PathBuf> {
+        self.letters.iter().map(|(point, _)| point.clone()).collect()
+    }
+
     /// Z: back at /, and the drive names written for the install removed.
     pub fn finish(self) {
         let z = self.dosdevices.join("z:");

@@ -71,6 +71,46 @@ pub fn record_path(game: &Game) -> PathBuf {
     data_home().join("gamefix/games").join(format!("{}.log", slug(&game.name)))
 }
 
+/// The wrapper a game's record names (`wrapper\t<word>\t<word>...`), if any.
+fn recorded_wrapper(record: &Path) -> Option<Vec<String>> {
+    let text = fs::read_to_string(record).ok()?;
+    let line = text.lines().find_map(|l| l.strip_prefix("wrapper\t"))?;
+    Some(line.split('\t').map(String::from).collect())
+}
+
+/// Puts a command in front of the game's app-menu entries (`Exec=<wrapper> env ...`), or takes
+/// it away (None): a launcher's sandbox (lobby's `<lobby> sandbox <id> --`), switched on or off
+/// long after setup. Recorded, so setting the game up again keeps it; undo needs nothing more
+/// (the entries go). Steam shortcuts stay as they are.
+pub fn set_wrapper(record: &Path, wrapper: Option<&[String]>) -> Result<(), String> {
+    let text = fs::read_to_string(record).map_err(|_| "That game wasn't set up by gamefix.".to_string())?;
+    if wrapper.is_some_and(|w| w.is_empty() || w.iter().any(|word| word.contains(['\t', '\n', '\r']))) {
+        return Err("A wrapper is one or more words without tabs or line breaks.".into());
+    }
+    let quoted = |words: &[String]| words.iter().map(|w| exec_arg(w)).collect::<Vec<_>>().join(" ") + " ";
+    let old = recorded_wrapper(record).map(|w| quoted(&w));
+    let new = wrapper.map(quoted).unwrap_or_default();
+    for line in text.lines() {
+        let Some(entry) = line.strip_prefix("created\t").filter(|p| p.ends_with(".desktop")) else { continue };
+        let Ok(content) = fs::read_to_string(entry) else { continue };
+        let rewritten: String = content
+            .lines()
+            .map(|l| match l.strip_prefix("Exec=") {
+                Some(exec) => format!("Exec={new}{}\n", old.as_deref().and_then(|o| exec.strip_prefix(o)).unwrap_or(exec)),
+                None => format!("{l}\n"),
+            })
+            .collect();
+        fs::write(entry, rewritten).map_err(|e| format!("{entry}: {e}"))?;
+    }
+    let mut lines: Vec<String> = text.lines().filter(|l| !l.starts_with("wrapper\t")).map(String::from).collect();
+    if let Some(words) = wrapper {
+        lines.push(format!("wrapper\t{}", words.join("\t")));
+    }
+    write_record(record, &lines)?;
+    refresh_menu();
+    Ok(())
+}
+
 /// Writes a setup's record, one change a line. A line break inside one (a file name from the
 /// download can hold one) would start a line of its own, which undo would act on: refused.
 fn write_record(file: &Path, record: &[String]) -> Result<(), String> {
@@ -144,12 +184,18 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
         if targets.steam && Steam::find().is_some_and(|s| s.running()) {
             return Err(STEAM_OPEN.into());
         }
+        // A wrapper set on the entry (lobby's sandbox) stays through setting it up again.
+        let wrapper = recorded_wrapper(&record_path(game));
         undo(game)?;
         // The report saw the game as the last setup left it: undo takes back the exec bit, the
         // converted launcher and case links, which this setup must then redo (Brownie Cove, set
         // up twice, got "Permission denied"). And before anything new is made: a runner's
         // setup undoing later removed the Python environment it had just installed.
-        return setup(game, &crate::check::check(game, &crate::system::System::load()), targets);
+        let outcome = setup(game, &crate::check::check(game, &crate::system::System::load()), targets)?;
+        if let Some(words) = wrapper {
+            set_wrapper(&record_path(game), Some(&words))?;
+        }
+        return Ok(outcome);
     }
     if report.problems.iter().any(|p| matches!(p, Problem::UnityDataMissing(_))) {
         return Err("The download lacks the game's data folder (see gamefix check): nothing to set up.".into());
@@ -1412,7 +1458,9 @@ fn setup_install(game: &Game, installer: Installer, targets: &Targets) -> Result
             // The computer's drives as D:, E: ... and Z: hidden while it runs, so its Browse
             // lists them by name; the installer started from its own drive's path, so Wine
             // names it by that drive's letter, else from a link in C:.
+            let started = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
             let drives = crate::drives::letter(&prefix);
+            let roots = drives.roots();
             // A repack's unfinished optional parts left out: it offers every archive there is,
             // so it gets a folder of links to the rest.
             let link = prefix.join("drive_c/gamefix-setup");
@@ -1462,7 +1510,7 @@ fn setup_install(game: &Game, installer: Installer, targets: &Targets) -> Result
                 let _ = fs::remove_dir_all(dir);
             }
             status.map_err(|e| format!("Couldn't start the installer with umu-run: {e}"))?;
-            let (exe, name) = match crate::disc::installed_program(&prefix.join("pfx"), &game.name) {
+            let (exe, name) = match crate::disc::installed_program_on(&prefix.join("pfx"), &game.name, &roots, started) {
                 crate::disc::Installed::Program(exe, name) => (exe, name),
                 crate::disc::Installed::Unknown => {
                     let target = free(&folder_name(&game.name));
@@ -2175,6 +2223,27 @@ fn refresh_menu() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wrappers_on_entries() {
+        let dir = std::env::temp_dir().join(format!("gamefix-wrapper-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let (entry, record) = (dir.join("gamefix-g.desktop"), dir.join("g.log"));
+        let exec = "env WINEPREFIX=/p /usr/bin/umu-run \"/g/My Game.exe\"";
+        fs::write(&entry, format!("[Desktop Entry]\nName=G\nExec={exec}\nPath=/g\n")).unwrap();
+        fs::write(&record, format!("created\t{}\ngame-prefix\t/p\n", entry.display())).unwrap();
+        let words = |w: &[&str]| w.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        super::set_wrapper(&record, Some(&words(&["/home/x/lobby", "sandbox", "my game", "--"]))).unwrap();
+        assert!(fs::read_to_string(&entry).unwrap().contains(&format!("\nExec=/home/x/lobby sandbox \"my game\" -- {exec}\nPath=/g\n")));
+        assert_eq!(super::recorded_wrapper(&record).unwrap(), words(&["/home/x/lobby", "sandbox", "my game", "--"]));
+        // Replaced, not stacked; then taken away.
+        super::set_wrapper(&record, Some(&words(&["/l", "sandbox", "g", "--"]))).unwrap();
+        assert!(fs::read_to_string(&entry).unwrap().contains(&format!("\nExec=/l sandbox g -- {exec}\n")));
+        super::set_wrapper(&record, None).unwrap();
+        assert!(fs::read_to_string(&entry).unwrap().contains(&format!("\nExec={exec}\n")));
+        assert!(super::recorded_wrapper(&record).is_none() && fs::read_to_string(&record).unwrap().contains("game-prefix"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn rune_emulator_settings() {

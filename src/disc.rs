@@ -119,7 +119,14 @@ pub enum Installed {
 }
 
 pub fn installed_program(pfx: &Path, name: &str) -> Installed {
-    match find_installed(pfx, name) {
+    installed_program_on(pfx, name, &[], 0)
+}
+
+/// Right after an install: also a program new on the drives the install was given (`drives`,
+/// their tops), made since `since` (Unix time). Only then: in an older prefix, "new" would mean
+/// anything made on those drives since (lobby found Borderlands 4's program that way).
+pub fn installed_program_on(pfx: &Path, name: &str, drives: &[PathBuf], since: i64) -> Installed {
+    match find_installed(pfx, name, drives, since) {
         Some((exe, label)) => Installed::Program(exe, label),
         None if !links(pfx).is_empty() => Installed::Unknown,
         None => Installed::Nothing,
@@ -164,7 +171,7 @@ pub fn shortcuts(pfx: &Path) -> Vec<(PathBuf, String)> {
         .collect()
 }
 
-fn find_installed(pfx: &Path, name: &str) -> Option<(PathBuf, String)> {
+fn find_installed(pfx: &Path, name: &str, drives: &[PathBuf], since: i64) -> Option<(PathBuf, String)> {
     let c = pfx.join("drive_c");
     let words = words(name);
     let size = |p: &Path| fs::metadata(p).map_or(0, |m| m.len());
@@ -194,15 +201,11 @@ fn find_installed(pfx: &Path, name: &str) -> Option<(PathBuf, String)> {
             }
         }
         // On another drive (E:\Games\X) with no shortcut (FitGirl's repacks make none by
-        // default): what's new there since the drive got its letter, the link's own time.
+        // default): what's new there since the install started.
         if !exes.iter().any(|e| !unwanted(e)) {
             let own = fs::canonicalize(pfx).unwrap_or_default();
-            for entry in fs::read_dir(pfx.join("dosdevices")).into_iter().flatten().flatten() {
-                let letter = entry.file_name().to_string_lossy().to_lowercase();
-                let since = fs::symlink_metadata(entry.path()).map(|m| std::os::unix::fs::MetadataExt::mtime(&m));
-                if let (true, Ok(since), Ok(root)) = (letter.len() == 2 && letter.ends_with(':') && !["c:", "z:"].contains(&letter.as_str()), since, fs::canonicalize(entry.path())) {
-                    new_files(&root, since, &own, 0, &mut exes);
-                }
+            for drive in drives {
+                new_files(drive, since, &own, 0, &mut exes);
             }
         }
         let exe = exes.into_iter().filter(|e| !unwanted(e)).max_by_key(|e| size(e))?;
