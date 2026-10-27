@@ -175,11 +175,11 @@ const KNOWN_DLLS: [&str; 30] = [
 /// Used without an installed Proton to read the list from: Windows parts that wrappers replace.
 const WRAPPED: [&str; 10] = ["ddraw", "d3dimm", "dinput", "dinput8", "dsound", "winmm", "version", "opengl32", "d3d10", "d3d10_1"];
 
-/// The files Proton's Wine has built in (DLLs, drivers: "ddraw.dll"), from the Proton Steam
-/// uses by default.
+/// The files Proton's Wine has built in (DLLs, drivers: "ddraw.dll"), from the Proton games
+/// that aren't Steam's run with: GE-Proton, else Valve's default.
 fn wine_builtins() -> Option<Vec<String>> {
     let steam = Steam::find()?;
-    let lib = steam.tool_dir(&steam.proton()?)?.join("files/lib/wine");
+    let lib = steam.tool_dir(&steam.newest_ge().or_else(|| steam.proton())?)?.join("files/lib/wine");
     let mut names: Vec<String> = ["i386-windows", "x86_64-windows"]
         .iter()
         .flat_map(|d| fs::read_dir(lib.join(d)).into_iter().flatten().flatten())

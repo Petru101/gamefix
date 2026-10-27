@@ -35,10 +35,12 @@ A few examples of what it finds and fixes:
   - TIC-80 cartridges in TIC-80
 - **Windows games:** it adds them to your app menu (started with Proton through
   [umu-launcher](https://github.com/Open-Wine-Components/umu-launcher), in a Wine prefix of
-  the game's own) or to Steam with Proton, with the game's own icon. For Steam games, it picks the Proton
-  version that ProtonDB players' reports say works. For GOG and Epic games that
+  the game's own) or to Steam with Proton, with the game's own icon. Games that aren't Steam's
+  run with GE-Proton (downloaded if you have none): Valve's Protons can't play most game videos
+  outside Steam. Games already set up with Valve's Proton keep it. For Steam games, it picks the
+  Proton version that ProtonDB players' reports say works. For GOG and Epic games that
   [protonfixes](https://github.com/Open-Wine-Components/umu-protonfixes) has a fix for, it
-  picks GE-Proton and tells protonfixes which game it is. GOG games start the way GOG Galaxy
+  tells protonfixes which game it is. GOG games start the way GOG Galaxy
   starts them, and GOG's first-run helper is run once. It runs installers and installs from disc
   images once, then adds the installed game to Steam. Repacks (FitGirl's and the like) install
   with GE-Proton, whose memory layout their unpacker needs; optional parts you didn't download

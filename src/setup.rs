@@ -1391,8 +1391,6 @@ fn setup_install(game: &Game, installer: Installer, targets: &Targets) -> Result
     if targets.steam && steam.running() {
         return Err(STEAM_OPEN.into());
     }
-    let tool = steam.proton().ok_or("No Proton is installed in Steam: install Proton Experimental (Library → Tools), then set it up again.")?;
-    let tool_dir = steam.tool_dir(&tool).ok_or(format!("Couldn't find where {tool} is installed."))?;
     let source = match &installer {
         Installer::Disc { iso, .. } => iso.clone(),
         Installer::File(file) => file.clone(),
@@ -1436,7 +1434,11 @@ fn setup_install(game: &Game, installer: Installer, targets: &Targets) -> Result
             done.push(format!("It's a repack (FreeArc archives unpacked by unarc.dll): it installs with {ge} in WoW64 mode, the only Proton whose memory layout its unpacker copes with, and the game runs with it too."));
             (ge, dir)
         }
-        None => (tool, tool_dir),
+        None => {
+            let tool = game_proton(&steam, earlier.as_ref().map(|(prefix, ..)| prefix.as_path()), &mut done, &mut not_fixed)?;
+            let dir = steam.tool_dir(&tool).ok_or(format!("Couldn't find where {tool} is installed."))?;
+            (tool, dir)
+        }
     };
     let (prefix, exe, name) = match earlier {
         Some(found) => found,
@@ -1655,7 +1657,7 @@ fn jogl_natives(lib: &Path) -> Result<(Vec<PathBuf>, String), String> {
 /// A Windows-only game, run with Proton by Steam, like ticking "Force the use of a specific
 /// Steam Play compatibility tool" in its properties. A Steam game gets the Proton ProtonDB's
 /// reports say runs it (Steam's own choice stays when there's none); a download becomes a
-/// non-Steam shortcut with Experimental. Games whose anti-cheat stops them are left alone.
+/// non-Steam shortcut with GE-Proton (`game_proton`). Games whose anti-cheat stops them are left alone.
 fn setup_windows(game: &Game, report: &Report, exe: &crate::scan::Found, targets: &Targets) -> Result<Outcome, String> {
     // Steam's Protons are used for app-menu entries too, so Steam is needed either way.
     let steam = Steam::find().ok_or("Steam isn't installed, or nobody has logged in to it yet.")?;
@@ -1760,7 +1762,7 @@ fn setup_windows(game: &Game, report: &Report, exe: &crate::scan::Found, targets
     let fixes_tool = umu.as_ref().and_then(|u| protonfixes_tool(&steam, u, &mut done, &mut not_fixed));
     let proton = match &fixes_tool {
         Some(tool) => tool.clone(),
-        None => steam.proton().ok_or("No Proton is installed in Steam. Install \"Proton Experimental\" from the Steam library (it's listed under Tools) and try again.")?,
+        None => game_proton(&steam, Some(&data_home().join("gamefix/prefixes").join(slug(&game.name))), &mut done, &mut not_fixed)?,
     };
     // GOG's own way of starting it, when gamefix picked GOG's program.
     let gog = crate::gog::read(&game.root).filter(|g| g.program == program);
@@ -2002,6 +2004,46 @@ fn install_components(steam: &Steam, game: &Game, appid: u32, components: &[&str
     } else {
         not_fixed.push(format!("Installing {list} with protontricks failed; `protontricks {appid} {list}` in a terminal shows why."));
     }
+}
+
+/// The Proton a game that isn't Steam's runs with: GE-Proton, the newest installed, else the
+/// latest downloaded (the user's choice). Valve's Protons can't play most game videos outside
+/// Steam: their GStreamer has no libav (Experimental 11.0's libgstlibav.so needs
+/// libavcodec.so.58, which neither it nor steamrt4 has), so no H.264, MPEG-2 or WMV; Steam
+/// covers its own games by converting their videos on Valve's side. Corrupted Boundary (Unreal
+/// 4) sat on a black screen waiting on an MPEG-2 intro; GE ships FFmpeg. protonfixes only runs
+/// in GE too. A prefix Valve's Proton already made (its `version` file says "11.0-100", GE's
+/// "GE-Proton11-11") keeps Valve's: switching would upgrade it under the game.
+fn game_proton(steam: &Steam, prefix: Option<&Path>, done: &mut Vec<String>, not_fixed: &mut Vec<String>) -> Result<String, String> {
+    let made_by = prefix.and_then(|p| fs::read_to_string(p.join("version")).ok());
+    if made_by.is_some_and(|v| !v.trim().starts_with("GE-Proton")) {
+        if let Some(valve) = steam.proton() {
+            return Ok(valve);
+        }
+    }
+    if let Some(ge) = steam.newest_ge() {
+        return Ok(ge);
+    }
+    match proton::fetch_ge(steam) {
+        Ok(ge) => {
+            done.push(format!("Downloaded {ge} into Steam's compatibility tools (undo leaves it: other games can use it). Games that aren't Steam's run with it: Valve's Protons can't play most game videos outside Steam."));
+            Ok(ge)
+        }
+        Err(e) => {
+            let valve = steam.proton().ok_or(format!("{e} No other Proton is installed in Steam either: install Proton Experimental (Library → Tools), or GE-Proton with ProtonUp-Qt (Flathub), then set it up again."))?;
+            not_fixed.push(format!("{e} It runs with {valve} for now, which can't play most game videos outside Steam; ProtonUp-Qt (Flathub) can install GE-Proton."));
+            Ok(valve)
+        }
+    }
+}
+
+/// Whether setting this game up would download GE-Proton first (about 560 MB), for a launcher
+/// to ask before: a game that isn't Steam's, set up with Proton (a Windows program, an
+/// installer or a disc), no GE installed, and no prefix Valve's Proton made already.
+pub fn missing_ge(game: &Game, report: &Report) -> bool {
+    let with_proton = game.main().is_none() && (game.windows.is_some() || game.cd_installer.is_some() || !report.installers.is_empty() || report.problems.iter().any(|p| matches!(p, Problem::Disc { installer: Some(_), .. })));
+    let valve_prefix = fs::read_to_string(data_home().join("gamefix/prefixes").join(slug(&game.name)).join("version")).is_ok_and(|v| !v.trim().starts_with("GE-Proton"));
+    with_proton && !valve_prefix && steam::installed_app(&game.root).is_none() && Steam::find().is_some_and(|s| s.newest_ge().is_none())
 }
 
 /// A Proton whose protonfixes has a fix for this game: the newest GE-Proton installed, else
