@@ -1951,11 +1951,103 @@ fn winetricks_into(steam: &Steam, tool: &str, prefix: &Path, components: &[&str]
 /// The command an app-menu entry starts a Windows game with: umu-run with the prefix, the
 /// Proton (Steam's tool folder; else umu fetches GE-Proton itself) and the game's id for
 /// protonfixes (UMU_ID is GAMEID under umu-run), then the launch settings Steam would get.
+/// Where umu-run looks up a Proton given by name: Steam's compatibilitytools.d in the data
+/// folder (umu's STEAM_COMPAT).
+fn umu_tools() -> PathBuf {
+    data_home().join("Steam/compatibilitytools.d")
+}
+
+/// A Proton as an entry names it for umu-run: by its folder's name when it's in umu's tools
+/// folder (GE-Proton: that folder stays where it is when a Steam library moves), else by its path.
+fn entry_proton(tool_dir: &Path) -> String {
+    let canonical = |p: &Path| fs::canonicalize(p).ok();
+    match (tool_dir.parent().and_then(canonical), canonical(&umu_tools()), tool_dir.file_name()) {
+        (Some(parent), Some(tools), Some(name)) if parent == tools => name.to_string_lossy().into_owned(),
+        _ => tool_dir.display().to_string(),
+    }
+}
+
+/// App-menu entries gamefix made whose Proton isn't where they say any more: Steam moves its
+/// own Protons along with a library (moving the user's to another drive broke 23 entries).
+/// Each is pointed at the Proton of the same folder name where Steam has it now. Runs whenever
+/// gamefix does; a launcher can call it at start. Returns the entries it changed.
+pub fn repair_protons() -> Vec<PathBuf> {
+    let Some(steam) = Steam::find() else { return Vec::new() };
+    let find = |name: &str| {
+        steam.libraries().into_iter().map(|l| l.join("steamapps/common").join(name)).chain([steam.root.join("compatibilitytools.d").join(name), umu_tools().join(name)]).find(|d| d.join("toolmanifest.vdf").is_file())
+    };
+    let mut changed = Vec::new();
+    for entry in fs::read_dir(data_home().join("applications")).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if !entry.file_name().to_string_lossy().starts_with("gamefix-") {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(&path) else { continue };
+        let mut moved = false;
+        let rewritten: String = text
+            .lines()
+            .map(|line| {
+                let fixed = line.strip_prefix("Exec=").and_then(|exec| {
+                    let (start, end, value) = exec_token(exec, "PROTONPATH=")?;
+                    let old = Path::new(&value);
+                    if !old.is_absolute() || old.is_dir() {
+                        return None;
+                    }
+                    let new = find(&old.file_name()?.to_string_lossy())?;
+                    Some(format!("Exec={}{}{}", &exec[..start], exec_arg(&format!("PROTONPATH={}", entry_proton(&new))), &exec[end..]))
+                });
+                moved |= fixed.is_some();
+                fixed.unwrap_or_else(|| line.to_string()) + "\n"
+            })
+            .collect();
+        if moved && fs::write(&path, rewritten).is_ok() {
+            changed.push(path);
+        }
+    }
+    if !changed.is_empty() {
+        refresh_menu();
+    }
+    changed
+}
+
+/// The argument of an Exec line starting with `prefix` (`PROTONPATH=`): where it is in the line
+/// and what follows the prefix, its quotes taken off. An argument with escapes in it (exec_arg's
+/// backslashes) isn't one gamefix would rewrite, so it's left out.
+fn exec_token(exec: &str, prefix: &str) -> Option<(usize, usize, String)> {
+    let bytes = exec.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b' ' {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let quoted = bytes[i] == b'"';
+        if quoted {
+            i += 1;
+            while i < bytes.len() && bytes[i] != b'"' {
+                i += if bytes[i] == b'\\' { 2 } else { 1 };
+            }
+            i = (i + 1).min(bytes.len());
+        } else {
+            while i < bytes.len() && bytes[i] != b' ' {
+                i += 1;
+            }
+        }
+        let token = &exec[start..i];
+        let inner = if quoted { token.trim_start_matches('"').trim_end_matches('"') } else { token };
+        if let Some(value) = inner.strip_prefix(prefix) {
+            return (!value.contains('\\')).then(|| (start, i, value.replace("%%", "%")));
+        }
+    }
+    None
+}
+
 fn umu_command(umu_run: &Path, tool_dir: Option<&Path>, env: &[(&str, String)], program: &Path, args: &[String]) -> Vec<String> {
     let get = |key: &str| env.iter().find(|(k, _)| *k == key).map(|(_, v)| v.clone());
     let mut command = vec!["env".to_string()];
     command.extend(get("STEAM_COMPAT_DATA_PATH").map(|p| format!("WINEPREFIX={p}")));
-    command.push(format!("PROTONPATH={}", tool_dir.map_or("GE-Proton".to_string(), |d| d.display().to_string())));
+    command.push(format!("PROTONPATH={}", tool_dir.map_or("GE-Proton".to_string(), entry_proton)));
     command.push(format!("GAMEID={}", get("UMU_ID").unwrap_or_else(|| "umu-0".into())));
     command.extend(env.iter().filter(|(k, _)| !["STEAM_COMPAT_DATA_PATH", "UMU_ID"].contains(k)).map(|(k, v)| format!("{k}={v}")));
     command.push(umu_run.display().to_string());
@@ -2308,6 +2400,16 @@ mod tests {
         // No Proton found in Steam, no fix: umu fetches GE-Proton, no protonfixes id.
         let command = umu_command(Path::new("/usr/bin/umu-run"), None, &[], Path::new("/g/game.exe"), &[]);
         assert_eq!(command, ["env", "PROTONPATH=GE-Proton", "GAMEID=umu-0", "/usr/bin/umu-run", "/g/game.exe"]);
+    }
+
+    #[test]
+    fn exec_tokens() {
+        let exec = "env WINEPREFIX=/p \"PROTONPATH=/s/common/Proton - Experimental\" GAMEID=umu-0 /usr/bin/umu-run /g/x.exe";
+        let (start, end, value) = super::exec_token(exec, "PROTONPATH=").unwrap();
+        assert_eq!((&exec[start..end], value.as_str()), ("\"PROTONPATH=/s/common/Proton - Experimental\"", "/s/common/Proton - Experimental"));
+        let exec = "env PROTONPATH=GE-Proton11-11 GAMEID=umu-0 /usr/bin/umu-run /g/x.exe";
+        assert_eq!(super::exec_token(exec, "PROTONPATH=").unwrap().2, "GE-Proton11-11");
+        assert!(super::exec_token("env GAMEID=umu-0 umu-run x", "PROTONPATH=").is_none());
     }
 
     #[test]

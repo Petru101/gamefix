@@ -31,6 +31,8 @@ fn main() -> ExitCode {
     let mut args: Vec<&str> = args.iter().map(String::as_str).collect();
     let dialog = args.contains(&"--dialog");
     args.retain(|a| *a != "--dialog");
+    // Entries whose Proton moved with a Steam library point at it again.
+    setup::repair_protons();
 
     let result = match args.as_slice() {
         ["right-click", "on"] => said("gamefix", rightclick::enable()),
