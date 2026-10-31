@@ -1,16 +1,27 @@
 # gamefix
 
-**Makes games that won't start on Linux start.** Point it at a game you downloaded (from
-itch.io, a zip, an installer, a disc image) or at a Steam game that misbehaves. gamefix works
-out why it won't run, tells you in plain words, and sets it up once. After that you start the
-game from your app menu/start menu or from Steam, like any other game.
+**Downloaded a game and it won't start on Linux? gamefix finds out why and fixes it.**
 
-gamefix isn't a launcher: you never start games through it. What it sets up keeps working
-even if you uninstall it.
+Point it at a game (an itch.io download, a zip, an installer, a disc image, a repack) or at a
+Steam game that misbehaves. It reads the game's files, without running them, and works out
+what the game needs that your system doesn't have:
+
+- the old libraries it was built for, taken from Steam's runtime or your distribution's
+  packages
+- the program it really runs on: the right LÖVE, Java, Python or .NET, DOSBox for DOS games,
+  Ruffle for Flash, EasyRPG for RPG Maker, mGBA for Game Boy games
+- for Windows games, a Proton that plays their intro videos and cutscenes (Valve's can't
+  outside Steam), and the Windows parts old games expect (MFC, Visual Basic, XNA, PhysX)
+- fixes for engine quirks: old Unity menus with no text, games that crash or lose their sound
+  over a clash between libraries
+
+It tells you in plain words what it found, gets what's missing, and sets the game up once.
+After that you start it from your app menu or from Steam, like any other game. gamefix isn't
+a launcher, and what it sets up keeps working even if you uninstall it.
 
 ## What it fixes
 
-A few examples of what it finds and fixes:
+In more detail:
 
 - **Missing old libraries.** Older native games need libraries that newer systems dropped
   (libssl 1.0, GTK 2, SDL 1.2, Allegro 5.0 ...). gamefix takes them from Steam's runtime for
