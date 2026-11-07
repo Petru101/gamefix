@@ -51,23 +51,32 @@ fn named_unfinished(file: &Path) -> bool {
 /// sharedassets3.assets is 12% on disk, From_Dust.exe 99%), so those must be mostly empty.
 fn holes(file: &Path, meta: &fs::Metadata) -> bool {
     let on_disk = meta.blocks() * 512;
-    meta.len() >= 1 << 20 && if compressed(file) { on_disk < meta.len() / 100 * 99 } else { packed(file) && on_disk < meta.len() / 2 }
+    // Sizes first: telling what a .bin is reads the files beside it.
+    meta.len() >= 1 << 20 && on_disk < meta.len() / 100 * 99 && (compressed(file) || (on_disk < meta.len() / 2 && packed(file)))
 }
 
 /// What's compressed: nothing in it should be blank for a whole block. Not disc images, which
 /// have long empty stretches. A .bin can be anything (a disc's raw track, a game's data), so
-/// only an installer's parts count: Inno Setup's (setup-1.bin, setup_game-1.bin), a repack's.
+/// only an installer's parts count: Inno Setup's (setup-1.bin, setup_game-1.bin), a repack's,
+/// or any beside an installer (a repack named otherwise, none of its parts' starts here yet).
 fn compressed(file: &Path) -> bool {
     let extension = file.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
     match extension.as_str() {
         "bin" => {
             let name = lower_name(file);
-            name.starts_with("setup") || name.starts_with("fg-") || crate::repack::beside_freearc(file)
+            name.starts_with("setup") || name.starts_with("fg-") || crate::repack::beside_freearc(file) || beside_installer(file)
         }
         "rar" | "7z" | "zip" | "cab" => true,
         // Split archives: game.7z.001, game.r00.
         e => e.len() >= 2 && e.trim_start_matches('r').len() >= 2 && e.trim_start_matches('r').chars().all(|c| c.is_ascii_digit()),
     }
+}
+
+fn beside_installer(file: &Path) -> bool {
+    let Some(dir) = file.parent() else { return false };
+    fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.path()).any(|p| {
+        p.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe")) && matches!(crate::binary::identify(&p), Some(crate::binary::Binary::Pe(pe)) if pe.installer.is_some())
+    })
 }
 
 fn is_blank(block: &[u8]) -> bool {
@@ -112,9 +121,10 @@ pub fn parts(file: &Path, own_folder: Option<&Path>) -> Vec<PathBuf> {
     fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.is_file() && same_set(p)).collect()
 }
 
-/// The quick look, for asking often (a launcher's badge): names and sizes only, nothing read. A
-/// file finished in the last two minutes looks unfinished here. A part left out on purpose keeps
-/// its holes: that's no sign for an optional one.
+/// The quick look, for asking often (a launcher's badge): names and sizes, read further only for
+/// a big .bin with holes (what's beside it says what it is). A file finished in the last two
+/// minutes looks unfinished here. A part left out on purpose keeps its holes: that's no sign for
+/// an optional one.
 pub fn looks_unfinished(file: &Path) -> bool {
     let Ok(meta) = fs::metadata(file) else { return false };
     written_lately(&meta) || named_unfinished(file) || (holes(file, &meta) && !crate::repack::optional(file))
