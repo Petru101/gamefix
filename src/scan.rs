@@ -51,6 +51,9 @@ pub struct Game {
     /// else to run.
     pub archive: Option<usize>,
     pub engine: Option<Engine>,
+    /// The file pointed at, when it stands alone: a download among others in the folder, or an
+    /// archive or a disc image, whatever is beside it (`root`-relative).
+    pub alone: Option<PathBuf>,
 }
 
 impl Game {
@@ -214,7 +217,8 @@ pub fn scan(path: &Path) -> Option<Game> {
         .or_else(|| chosen.as_ref().and_then(|_| folder_title(&root)))
         .or_else(|| root.file_name().map(|n| n.to_string_lossy().into_owned()))
         .unwrap_or_else(|| root.display().to_string());
-    Some(Game { root, name, files, main, windows, portable, cd_installer, linux_installer, packed, disc, archive, engine })
+    let alone = chosen.filter(|c| among_others || files.iter().any(|f| &f.path == c && matches!(f.binary, Binary::Archive | Binary::Disc)));
+    Some(Game { root, name, files, main, windows, portable, cd_installer, linux_installer, packed, disc, archive, engine, alone })
 }
 
 /// Files that hold a whole download by themselves: an installer, a disc image, an archive, a
@@ -280,7 +284,7 @@ pub fn udk_title(name: &str) -> &str {
 }
 
 /// Folders that hold unrelated downloads rather than one game.
-fn shared_folder(dir: &Path) -> bool {
+pub(crate) fn shared_folder(dir: &Path) -> bool {
     let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
     let dir = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
     ["", "Downloads", "Desktop", "Documents"].iter().any(|d| fs::canonicalize(home.join(d)).is_ok_and(|h| h == dir))

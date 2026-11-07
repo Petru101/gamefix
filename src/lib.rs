@@ -4,6 +4,7 @@ pub mod binary;
 pub mod check;
 pub mod disc;
 pub mod dotnet;
+pub mod download;
 pub mod drives;
 pub mod feedback;
 pub mod fetch;

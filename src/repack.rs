@@ -9,32 +9,34 @@
 //!   2 GB high half free and unarc's search for the biggest block overflows and loops forever.
 //!   GE-Proton's WoW64 keeps its top 1 MB reserved, as Windows does in effect: that works.
 //! - Torrent clients make the optional parts left out of a download anyway, full size but
-//!   empty (sparse, zeros), and the installer offers every archive there is.
+//!   empty (sparse, zeros), and the installer offers every archive there is. Parts not all there
+//!   (`download::left_out`) are hidden from it; a required one stops setup (`download::of_game`).
 //! - An unpack error can end the install quietly: the repack's `_Redist/fitgirl.md5` lists
 //!   every file it should have made, which tells.
 
 use std::fs;
 use std::io::Read;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 const FREEARC: &[u8] = b"ArC\x01";
 
+/// Whether a FreeArc archive is in the same folder with the same ending as this file, itself
+/// included.
+pub(crate) fn beside_freearc(file: &Path) -> bool {
+    let (Some(dir), extension) = (file.parent(), file.extension()) else { return false };
+    fs::read_dir(dir).into_iter().flatten().flatten().any(|e| e.path().extension() == extension && starts_with(&e.path(), FREEARC))
+}
+
 /// A repack's installer folder.
 pub struct Repack {
-    /// Archives the download didn't finish, which only the optional parts may be.
+    /// Archives the download didn't finish, which only optional parts may be by the time an
+    /// install starts.
     pub unfinished: Vec<PathBuf>,
 }
 
 fn starts_with(path: &Path, magic: &[u8]) -> bool {
     let mut head = vec![0u8; magic.len()];
     fs::File::open(path).and_then(|mut f| f.read_exact(&mut head)).is_ok() && head == magic
-}
-
-/// An archive torrent's placeholder: most of it not on disk yet, or its start still zeros.
-fn unfinished(path: &Path) -> bool {
-    let Ok(meta) = fs::metadata(path) else { return false };
-    meta.blocks() * 512 < meta.len() / 2 || starts_with(path, &[0; 16])
 }
 
 /// The installer `setup` as a repack: FreeArc archives beside it.
@@ -47,7 +49,7 @@ pub fn find(setup: &Path) -> Option<Repack> {
         return None;
     }
     // Every file of an archive's kind ("bin"), a placeholder possibly not even starting right.
-    let unfinished = files.into_iter().filter(|p| kinds.contains(&extension(p)) && unfinished(p)).collect();
+    let unfinished = files.into_iter().filter(|p| kinds.contains(&extension(p)) && crate::download::left_out(p)).collect();
     Some(Repack { unfinished })
 }
 

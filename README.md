@@ -60,6 +60,9 @@ In more detail:
   Kit installer (`UDKInstall-<name>.exe`) are unpacked next to it instead. It can also add Windows parts an old game needs
   (MFC, Visual Basic 6, XNA ...) to its Proton setup.
 
+A download that hasn't finished is caught before anything runs: gamefix says which files aren't
+all there yet and leaves the game alone until they are.
+
 When something can't be fixed, gamefix says so and why. Examples: anti-cheat that doesn't run
 under Proton, a download that's missing files, a web game, source code that has to be built
 first, an Android app, a program for another processor.

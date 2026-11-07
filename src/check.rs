@@ -28,6 +28,8 @@ pub enum Problem {
     /// Nothing to run, but an archive the game may still be packed in (C-Dogs SDL: a .tar.gz
     /// inside the .zip).
     Archive(PathBuf),
+    /// Files of a download that hasn't finished (full paths).
+    Unfinished(Vec<PathBuf>),
     /// The Linux program is there but damaged (went through a text conversion): no fixing it.
     Damaged(PathBuf),
     /// A Linux installer (MojoSetup) with the game packed inside, and no program besides.
@@ -437,6 +439,16 @@ fn stand_in_font() -> Option<PathBuf> {
 }
 
 pub fn check(game: &Game, system: &System) -> Report {
+    let mut report = check_files(game, system);
+    // Whatever else the files seem to say, half of them aren't there.
+    let unfinished = crate::download::of_game(game);
+    if !unfinished.is_empty() {
+        report.problems = vec![Problem::Unfinished(unfinished)];
+    }
+    report
+}
+
+fn check_files(game: &Game, system: &System) -> Report {
     let mut windows = Vec::new();
     let mut installers = Vec::new();
     for f in &game.files {
@@ -1530,6 +1542,17 @@ impl Report {
         }
         for problem in &self.problems {
             match problem {
+                Problem::Unfinished(files) => {
+                    let _ = writeln!(out, "✗ This download isn't finished. These files aren't all there yet:");
+                    for file in files.iter().take(5) {
+                        let _ = writeln!(out, "      {}", file.strip_prefix(&game.root).unwrap_or(file).display());
+                    }
+                    if files.len() > 5 {
+                        let _ = writeln!(out, "      and {} more", files.len() - 5);
+                    }
+                    let _ = writeln!(out, "    Fix: let it finish, then check it again. If your download app says it's done, download");
+                    let _ = writeln!(out, "    those files again.");
+                }
                 Problem::Archive(path) if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("zip")) && !binary::zip_complete(&game.root.join(path)) => {
                     let _ = writeln!(out, "✗ There's no program to run here, and the archive the game is in is incomplete:");
                     let _ = writeln!(out, "      {}", path.display());
@@ -1658,14 +1681,8 @@ impl Report {
                         if let Some(repack) = self.installers.iter().find_map(|(p, _)| crate::repack::find(&game.root.join(p))) {
                             let _ = writeln!(out, "    It's a repack (FreeArc archives): it installs with GE-Proton in WoW64 mode, the only");
                             let _ = writeln!(out, "    Proton its unpacker works under, and the files are checked after if it lists them.");
-                            match repack.unfinished.iter().find(|p| !crate::repack::optional(p)) {
-                                Some(part) => {
-                                    let _ = writeln!(out, "    The download isn't finished: {} is still mostly empty.", part.display());
-                                }
-                                None if !repack.unfinished.is_empty() => {
-                                    let _ = writeln!(out, "    {} optional parts weren't downloaded; the installer won't offer them.", repack.unfinished.len());
-                                }
-                                None => {}
+                            if !repack.unfinished.is_empty() {
+                                let _ = writeln!(out, "    {} optional parts weren't downloaded; the installer won't offer them.", repack.unfinished.len());
                             }
                         }
                     }

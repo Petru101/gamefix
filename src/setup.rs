@@ -180,6 +180,10 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
     if let Some(path) = line_break_name(game) {
         return Err(format!("A name in the game's folder has a line break in it, which gamefix can't record safely; rename it first: {}", path.display().to_string().escape_debug()));
     }
+    // Before anything changes: setting a game up again undoes the last setup first.
+    if let Some(Problem::Unfinished(files)) = report.problems.iter().find(|p| matches!(p, Problem::Unfinished(_))) {
+        return Err(format!("This download isn't finished: {} isn't all there yet. Let it finish, then set it up again.", files[0].strip_prefix(&game.root).unwrap_or(&files[0]).display()));
+    }
     if record_path(game).exists() {
         if targets.steam && Steam::find().is_some_and(|s| s.running()) {
             return Err(STEAM_OPEN.into());
@@ -698,7 +702,7 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
             Problem::Alsa32(None) => not_fixed.push("Its 32-bit ALSA sound: needs Steam's runtime (install Steam), which has a plugin that works.".into()),
             Problem::KickFiles(files) => not_fixed.push(format!("Its missing Mono files ({}): only the developer can add them; the .exe with Proton works.", files.join(", "))),
             Problem::FnaLibs(libs) => not_fixed.push(format!("Its missing native libraries ({}): get FNA's fnalibs, or use the Windows download with Proton.", libs.join(", "))),
-            Problem::NoLinuxBuild | Problem::UnityDataMissing(_) | Problem::LinuxInstaller(_) | Problem::UdkInstaller(_) | Problem::OwnWindowsDlls(_) | Problem::MissingWindowsParts(_) | Problem::Source(..) | Problem::Web(_) | Problem::UnityWeb(_) | Problem::Damaged(_) | Problem::Package(..) | Problem::Flash { .. } | Problem::Tic { .. } | Problem::Rom { .. } | Problem::Mono { .. } | Problem::Dotnet { .. } | Problem::RpgMaker { .. } | Problem::RpgMakerPacked { .. } | Problem::RgssRtp(_) | Problem::Dos { .. } | Problem::Disc { .. } | Problem::CdFiles { .. } | Problem::Protected { .. } | Problem::Archive(_) | Problem::WrongMachine(_) | Problem::Love { .. } | Problem::Python { .. } | Problem::Java { .. } => {}
+            Problem::NoLinuxBuild | Problem::UnityDataMissing(_) | Problem::LinuxInstaller(_) | Problem::UdkInstaller(_) | Problem::Unfinished(_) | Problem::OwnWindowsDlls(_) | Problem::MissingWindowsParts(_) | Problem::Source(..) | Problem::Web(_) | Problem::UnityWeb(_) | Problem::Damaged(_) | Problem::Package(..) | Problem::Flash { .. } | Problem::Tic { .. } | Problem::Rom { .. } | Problem::Mono { .. } | Problem::Dotnet { .. } | Problem::RpgMaker { .. } | Problem::RpgMakerPacked { .. } | Problem::RgssRtp(_) | Problem::Dos { .. } | Problem::Disc { .. } | Problem::CdFiles { .. } | Problem::Protected { .. } | Problem::Archive(_) | Problem::WrongMachine(_) | Problem::Love { .. } | Problem::Python { .. } | Problem::Java { .. } => {}
         }
     }
     if !preload.is_empty() {
@@ -1411,9 +1415,6 @@ fn setup_install(game: &Game, installer: Installer, targets: &Targets) -> Result
         Installer::File(file) => crate::repack::find(file),
         Installer::Disc { .. } => None,
     };
-    if let Some(part) = repack.iter().flat_map(|r| &r.unfinished).find(|p| !crate::repack::optional(p)) {
-        return Err(format!("The download isn't finished: {} is still mostly empty. Let it finish, then set it up again.", part.display()));
-    }
     if record_path(game).exists() {
         undo(game)?;
     }
