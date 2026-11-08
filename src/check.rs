@@ -492,22 +492,26 @@ pub fn check(game: &Game, system: &System) -> Report {
     report
 }
 
-/// Why a Linux build's start must be left alone. Its fixes load libraries into the game, or start
-/// it another way, and anti-cheat is there to notice what's loaded: Valve doesn't say what VAC
-/// makes of a preload, and a ban can't be taken back, so it's no here whatever the fix. A game
-/// Steam runs in its own container has that container's libraries: what the system has says
-/// nothing about it, and Dota 2's "clash" with the system's HarfBuzz doesn't exist where it runs
-/// (its dota.sh quits outside the container, which a menu entry would be).
+/// Why a game's start must be left alone. Fixes change what's loaded into the game, a preload in
+/// a Linux build or a DLL override in a Windows one (Counter-Strike 2's own amd_ags_x64.dll), or
+/// start it another way, and anti-cheat is there to notice: Valve doesn't say what VAC makes of
+/// that, and a ban can't be taken back, so a Steam game with VAC is left alone whichever build is
+/// here, and so is a Linux build with other anti-cheat (a Windows build's is dealt with where its
+/// report and setup_windows choose a Proton). A Linux build Steam runs in its own container has
+/// that container's libraries: what the system has says nothing about it, and Dota 2's "clash"
+/// with the system's HarfBuzz doesn't exist where it runs (its dota.sh quits outside the
+/// container, which a menu entry would be).
 fn hands_off(game: &Game) -> Option<String> {
-    game.main()?;
+    let linux = game.main().is_some();
     let mut said = Vec::new();
     let facts = crate::steam::installed_app(&game.root).map(|appid| crate::steam::Steam::find().and_then(|s| crate::appinfo::read(&s.root, appid)));
-    if let Some(tool) = facts.as_ref().and_then(|f| f.as_ref()?.linux_runtime.as_deref()) {
+    if let Some(tool) = facts.as_ref().and_then(|f| f.as_ref()?.linux_runtime.as_deref()).filter(|_| linux) {
         said.push(format!("Steam runs this game in its own container (Steam Linux Runtime, {}), with that container's libraries, so what this system has doesn't matter. Start it from Steam.", tool.trim_start_matches("SteamLinuxRuntime_")));
     }
-    let anticheat: Vec<&str> = crate::proton::anticheat(&game.root).into_iter().map(|(what, _)| what).chain(facts.as_ref().and_then(|f| f.as_ref()?.vac.then_some("Valve Anti-Cheat"))).collect();
+    let folders = if linux { crate::proton::anticheat(&game.root) } else { Vec::new() };
+    let anticheat: Vec<&str> = folders.into_iter().map(|(what, _)| what).chain(facts.as_ref().and_then(|f| f.as_ref()?.vac.then_some("Valve Anti-Cheat"))).collect();
     if !anticheat.is_empty() {
-        said.push(format!("It uses {}, so gamefix doesn't change how it starts: a library it didn't come with could look like cheating, and a ban can't be undone.", anticheat.join(" and ")));
+        said.push(format!("It uses {}, so gamefix doesn't change how it starts: changing what it loads could look like cheating, and a ban can't be undone.", anticheat.join(" and ")));
     } else if matches!(facts, Some(None)) {
         said.push("Steam's data on this game couldn't be read, so gamefix can't tell whether it has anti-cheat, and doesn't change how it starts: a ban can't be undone.".to_string());
     }
