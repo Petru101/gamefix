@@ -63,6 +63,10 @@ In more detail:
 A download that hasn't finished is caught before anything runs: gamefix says which files aren't
 all there yet and leaves the game alone until they are.
 
+gamefix doesn't change how a Linux game with anti-cheat starts, Valve Anti-Cheat included: a
+library the game didn't come with could look like cheating, and a ban can't be undone. It also
+leaves alone Linux games Steam runs in its own container, which don't use your system's libraries.
+
 When something can't be fixed, gamefix says so and why. Examples: anti-cheat that doesn't run
 under Proton, a download that's missing files, a web game, source code that has to be built
 first, an Android app, a program for another processor.

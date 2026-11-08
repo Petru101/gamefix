@@ -184,6 +184,15 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
     if let Some(Problem::Unfinished(files)) = report.problems.iter().find(|p| matches!(p, Problem::Unfinished(_))) {
         return Err(format!("This download isn't finished: {} isn't all there yet. Let it finish, then set it up again.", files[0].strip_prefix(&game.root).unwrap_or(&files[0]).display()));
     }
+    // A fix made before gamefix knew better goes; nothing new is made.
+    if let Some(why) = &report.hands_off {
+        if !record_path(game).exists() {
+            return Err(why.clone());
+        }
+        let mut done = undo(game)?;
+        done.push(format!("Took back what gamefix had changed for it. {why}"));
+        return Ok(Outcome { done, not_fixed: Vec::new() });
+    }
     if record_path(game).exists() {
         if targets.steam && Steam::find().is_some_and(|s| s.running()) {
             return Err(STEAM_OPEN.into());

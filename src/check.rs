@@ -229,8 +229,49 @@ impl Problem {
     }
 }
 
+/// A report as a program with its own window says it (`Report::for_app`).
+pub struct ForApp {
+    pub text: String,
+    /// Something's wrong, not counting what every Windows game has (no Linux version).
+    pub problems: bool,
+    /// Setting the game up has something to do about it.
+    pub fixable: bool,
+}
+
+const NO_LINUX: &str = "✗ There is no Linux version of this game.";
+/// What a Windows game's report says when anti-cheat that can't run under Proton stops it.
+const ANTI_CHEAT_WINS: &str = "othing on this side gets past that";
+
+impl Problem {
+    /// Whether setup does something about it. Not: what only the game's developer or a new
+    /// download can mend, and a game that has no Linux build, whose advice is told apart in
+    /// `for_app`.
+    fn fixable(&self) -> bool {
+        !matches!(
+            self,
+            Problem::NoLinuxBuild
+                | Problem::Unfinished(_)
+                | Problem::Damaged(_)
+                | Problem::UnityDataMissing(_)
+                | Problem::Source(..)
+                | Problem::Web(_)
+                | Problem::UnityWeb(_)
+                | Problem::Package(..)
+                | Problem::WrongMachine(_)
+                | Problem::Protected { .. }
+                | Problem::Archive(_)
+                | Problem::KickFiles(_)
+                | Problem::FnaLibs(_)
+                | Problem::UnityH264(_)
+                | Problem::Alsa32(None)
+        )
+    }
+}
+
 pub struct Report {
     pub problems: Vec<Problem>,
+    /// Why gamefix changes nothing about how this game starts (`hands_off`).
+    pub hands_off: Option<String>,
     pub libs_checked: usize,
     pub windows: Vec<(PathBuf, u8)>,
     pub installers: Vec<(PathBuf, &'static str)>,
@@ -444,8 +485,37 @@ pub fn check(game: &Game, system: &System) -> Report {
     let unfinished = crate::download::of_game(game);
     if !unfinished.is_empty() {
         report.problems = vec![Problem::Unfinished(unfinished)];
+    } else if let Some(why) = hands_off(game) {
+        report.problems.clear();
+        report.hands_off = Some(why);
     }
     report
+}
+
+/// Why a Linux build's start must be left alone. Its fixes load libraries into the game, or start
+/// it another way, and anti-cheat is there to notice what's loaded: Valve doesn't say what VAC
+/// makes of a preload, and a ban can't be taken back, so it's no here whatever the fix. A game
+/// Steam runs in its own container has that container's libraries: what the system has says
+/// nothing about it, and Dota 2's "clash" with the system's HarfBuzz doesn't exist where it runs
+/// (its dota.sh quits outside the container, which a menu entry would be).
+fn hands_off(game: &Game) -> Option<String> {
+    game.main()?;
+    let mut said = Vec::new();
+    let facts = crate::steam::installed_app(&game.root).map(|appid| crate::steam::Steam::find().and_then(|s| crate::appinfo::read(&s.root, appid)));
+    if let Some(tool) = facts.as_ref().and_then(|f| f.as_ref()?.linux_runtime.as_deref()) {
+        said.push(format!("Steam runs this game in its own container (Steam Linux Runtime, {}), with that container's libraries, so what this system has doesn't matter. Start it from Steam.", tool.trim_start_matches("SteamLinuxRuntime_")));
+    }
+    let anticheat: Vec<&str> = crate::proton::anticheat(&game.root).into_iter().map(|(what, _)| what).chain(facts.as_ref().and_then(|f| f.as_ref()?.vac.then_some("Valve Anti-Cheat"))).collect();
+    if !anticheat.is_empty() {
+        said.push(format!("It uses {}, so gamefix doesn't change how it starts: a library it didn't come with could look like cheating, and a ban can't be undone.", anticheat.join(" and ")));
+    } else if matches!(facts, Some(None)) {
+        said.push("Steam's data on this game couldn't be read, so gamefix can't tell whether it has anti-cheat, and doesn't change how it starts: a ban can't be undone.".to_string());
+    }
+    if said.is_empty() {
+        return None;
+    }
+    said.push("If it won't start, Steam's \"Verify integrity of game files\" is the safe thing to try.".to_string());
+    Some(said.join("\n"))
 }
 
 fn check_files(game: &Game, system: &System) -> Report {
@@ -464,7 +534,7 @@ fn check_files(game: &Game, system: &System) -> Report {
         }
     }
     let mut problems = Vec::new();
-    let mut report = Report { problems: Vec::new(), libs_checked: 0, windows, installers, glibc: system.glibc, packed: false, pyinstaller: false, launcher_libs: Vec::new(), appimage: None, inside_appimage: false, old_runtime: system.old_runtime.as_ref().map(|r| r.run.clone()), harmless: Vec::new() };
+    let mut report = Report { problems: Vec::new(), hands_off: None, libs_checked: 0, windows, installers, glibc: system.glibc, packed: false, pyinstaller: false, launcher_libs: Vec::new(), appimage: None, inside_appimage: false, old_runtime: system.old_runtime.as_ref().map(|r| r.run.clone()), harmless: Vec::new() };
 
     let Some((main, elf)) = game.main() else {
         match game.portable.map(|i| &game.files[i]) {
@@ -1451,6 +1521,35 @@ fn list(out: &mut String, paths: &[PathBuf]) {
 }
 
 impl Report {
+    /// The report for a program with its own window (a launcher), which has buttons where the
+    /// terminal has commands: no heading, none of gamefix's commands (`word` says what does it
+    /// there: "Fix"), and without "no Linux version" with its advice to run the game with Proton,
+    /// which every Windows game would have.
+    pub fn for_app(&self, game: &Game, word: &str) -> ForApp {
+        let rendered = self.render(game);
+        let body = rendered.split_once("\n\n").map_or(rendered.as_str(), |(_, rest)| rest).trim();
+        let mut advice = false;
+        let blocks: Vec<String> = body
+            .split("\n\n")
+            .filter_map(|block| {
+                let Some(rest) = block.strip_prefix(NO_LINUX) else { return Some(block.to_string()) };
+                let kept: Vec<&str> = rest.lines().filter(|l| !l.is_empty() && !l.contains("Steam runs it with Proton. ProtonDB's reports don't name") && !l.contains("that run it better than Steam's own setup") && !l.trim_start().starts_with("Fix: run ")).collect();
+                advice = kept.iter().any(|l| l.trim_start().starts_with("Fix: gamefix setup"));
+                (!kept.is_empty()).then(|| kept.iter().map(|l| l.trim_start()).collect::<Vec<_>>().join("\n"))
+            })
+            .collect();
+        let text = blocks.join("\n\n");
+        let text = if text.is_empty() { "If it still doesn't start, the game has to run to show why: its files look fine.".to_string() } else { text };
+        // Its anti-cheat stops it, and nothing here can change that.
+        let blocked = text.contains(ANTI_CHEAT_WINS);
+        let others = self.problems.iter().any(|p| !matches!(p, Problem::NoLinuxBuild));
+        ForApp {
+            text: text.replace(" (--steam: to Steam)", "").replace("gamefix setup --steam", word).replace("gamefix setup", word).replace("Fix: Fix", "Fix"),
+            problems: others || advice || blocked,
+            fixable: (advice || self.problems.iter().any(Problem::fixable)) && !blocked && self.hands_off.is_none(),
+        }
+    }
+
     pub fn render(&self, game: &Game) -> String {
         let mut out = String::new();
         let _ = writeln!(out, "{}  ({})", game.name, game.root.display());
@@ -1533,6 +1632,10 @@ impl Report {
         }
         // The AppImage file itself has nothing to say beyond what's inside.
         if self.problems.is_empty() && self.appimage.is_some() {
+            return out;
+        }
+        if let Some(why) = &self.hands_off {
+            let _ = writeln!(out, "• {}", why.replace('\n', "\n  "));
             return out;
         }
         if self.problems.is_empty() {
@@ -2335,6 +2438,37 @@ impl Report {
             let _ = writeln!(out);
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod for_app_tests {
+    use super::*;
+
+    fn game() -> Game {
+        Game { root: "/g".into(), name: "G".into(), files: Vec::new(), main: None, windows: None, portable: None, cd_installer: None, linux_installer: None, packed: None, disc: None, archive: None, engine: None, alone: None }
+    }
+
+    fn report(problems: Vec<Problem>) -> Report {
+        Report { problems, hands_off: None, libs_checked: 3, windows: Vec::new(), installers: Vec::new(), glibc: None, packed: false, pyinstaller: false, launcher_libs: Vec::new(), appimage: None, inside_appimage: false, old_runtime: None, harmless: Vec::new() }
+    }
+
+    #[test]
+    fn the_report_in_an_apps_words() {
+        // Nothing wrong.
+        let said = report(Vec::new()).for_app(&game(), "Fix");
+        assert!(said.text.starts_with("No problems found") && !said.problems && !said.fixable);
+        // Something to do, without gamefix's commands.
+        let said = report(vec![Problem::WindowsLineEndings("run.sh".into())]).for_app(&game(), "Fix");
+        assert!(said.problems && said.fixable && !said.text.contains("gamefix setup") && said.text.contains("Fix does that"), "{}", said.text);
+        // Something only a new download can mend.
+        let said = report(vec![Problem::Unfinished(vec!["/g/a.zip".into()])]).for_app(&game(), "Fix");
+        assert!(said.problems && !said.fixable);
+        // A game left alone, with nothing else to say.
+        let mut alone = report(Vec::new());
+        alone.hands_off = Some("It uses Valve Anti-Cheat.\nStart it from Steam.".into());
+        let said = alone.for_app(&game(), "Fix");
+        assert!(said.text.starts_with("• It uses Valve Anti-Cheat.\n  Start it from Steam.") && !said.problems && !said.fixable, "{}", said.text);
     }
 }
 

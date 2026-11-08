@@ -1,5 +1,6 @@
 //! gamefix's parts, for the gamefix command and for programs built on it (a launcher).
 
+pub mod appinfo;
 pub mod binary;
 pub mod check;
 pub mod disc;

@@ -157,8 +157,7 @@ fn feedback(path: Option<&str>, dialog: bool) -> Option<Said> {
         Some(Some(game)) => Some(game),
         None => None,
     };
-    let checked = game.as_ref().map(|g| check::check(g, &system::System::load()).render(g));
-    let mut report = feedback::Report::new(game.as_ref(), checked);
+    let mut report = game.as_ref().map_or_else(|| feedback::Report::new(None, None), feedback::Report::about);
     let title = match &game {
         Some(g) => format!("gamefix: report a problem with {}", g.name),
         None => "gamefix: report a problem".into(),

@@ -43,6 +43,13 @@ pub struct Report {
 }
 
 impl Report {
+    /// A report on a game, with gamefix's check of it as `gamefix feedback` sends it. The caller
+    /// fills in `message` and `contact`, shows `preview`, then calls `send`.
+    pub fn about(game: &Game) -> Report {
+        let checked = crate::check::check(game, &crate::system::System::load()).render(game);
+        Report::new(Some(game), Some(checked))
+    }
+
     /// Everything gamefix knows about the game, ready for a message.
     pub fn new(game: Option<&Game>, report: Option<String>) -> Report {
         let read = |path: PathBuf| fs::read_to_string(path).ok().map(|t| scrub(&t)).filter(|t| !t.trim().is_empty());
