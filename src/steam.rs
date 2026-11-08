@@ -165,6 +165,32 @@ pub fn official_name(version: &str) -> String {
     if minor == "0" { format!("proton_{major}") } else { format!("proton_{major}{minor}") }
 }
 
+/// A Proton's version from Steam's internal name, or from a prefix's `version` file: proton_513
+/// is 5.13, proton_11 is 11.0, GE-Proton11-7 is 11.7, "11.0-100" is 11.0. None: Experimental and
+/// Hotfix, which follow the newest.
+pub fn tool_version(name: &str) -> Option<(u32, u32)> {
+    if let Some(digits) = name.strip_prefix("proton_") {
+        let number: u32 = digits.parse().ok()?;
+        // Up to 30 is a major version (proton_9, proton_11); more is two run together (proton_63).
+        return Some(match (number, digits.split_at(1)) {
+            (0..=30, _) => (number, 0),
+            (_, (major, minor)) => (major.parse().ok()?, minor.parse().ok()?),
+        });
+    }
+    let mut numbers = name.split(|c: char| !c.is_ascii_digit()).filter(|n| !n.is_empty()).map(|n| n.parse::<u32>());
+    Some((numbers.next()?.ok()?, numbers.next().and_then(Result::ok).unwrap_or(0)))
+}
+
+/// A Proton as Steam's list names it.
+pub fn tool_label(name: &str) -> String {
+    match name {
+        "proton_experimental" => "Proton Experimental".into(),
+        "proton_hotfix" => "Proton Hotfix".into(),
+        _ if name.starts_with("proton_") => tool_version(name).map_or(name.to_string(), |(major, minor)| format!("Proton {major}.{minor}")),
+        _ => name.to_string(),
+    }
+}
+
 /// A custom tool's internal name, from the compatibilitytool.vdf in its folder.
 pub fn custom_tool(dir: &Path) -> Option<String> {
     let doc = vdf::parse(&fs::read_to_string(dir.join("compatibilitytool.vdf")).ok()?).ok()?;

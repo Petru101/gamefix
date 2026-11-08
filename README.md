@@ -65,7 +65,8 @@ all there yet and leaves the game alone until they are.
 
 gamefix doesn't change how a Steam game with Valve Anti-Cheat starts, Windows or Linux build, nor
 a Linux game with other anti-cheat: changing what a game loads could look like cheating, and a ban
-can't be undone. It also leaves alone Linux games Steam runs in its own container, which don't use your system's libraries.
+can't be undone. The one thing it will change for such a game's Windows build is which Proton Steam
+uses, when you ask (`gamefix proton`). It also leaves alone Linux games Steam runs in its own container, which don't use your system's libraries.
 
 When something can't be fixed, gamefix says so and why. Examples: anti-cheat that doesn't run
 under Proton, a download that's missing files, a web game, source code that has to be built
@@ -94,6 +95,7 @@ The same from a terminal:
 gamefix check <game folder or file>
 gamefix setup <game folder or file> [--menu] [--steam]   # --menu if neither is given
 gamefix undo <game folder or file>
+gamefix proton <Steam game's folder> [<name>]             # its Protons to try, or switch to one
 gamefix feedback [<game folder or file>]
 ```
 

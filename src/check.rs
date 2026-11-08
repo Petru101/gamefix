@@ -1548,7 +1548,7 @@ impl Report {
         let blocked = text.contains(ANTI_CHEAT_WINS);
         let others = self.problems.iter().any(|p| !matches!(p, Problem::NoLinuxBuild));
         ForApp {
-            text: text.replace(" (--steam: to Steam)", "").replace("gamefix setup --steam", word).replace("gamefix setup", word).replace("Fix: Fix", "Fix"),
+            text: text.lines().filter(|l| !l.contains("gamefix proton")).collect::<Vec<_>>().join("\n").replace(" (--steam: to Steam)", "").replace("gamefix setup --steam", word).replace("gamefix setup", word).replace("Fix: Fix", "Fix"),
             problems: others || advice || blocked,
             fixable: (advice || self.problems.iter().any(Problem::fixable)) && !blocked && self.hands_off.is_none(),
         }
@@ -1640,6 +1640,9 @@ impl Report {
         }
         if let Some(why) = &self.hands_off {
             let _ = writeln!(out, "• {}", why.replace('\n', "\n  "));
+            if game.main().is_none() {
+                let _ = writeln!(out, "  The one thing gamefix will change for it is which Proton Steam uses: gamefix proton \"{}\".", game.root.display());
+            }
             return out;
         }
         if self.problems.is_empty() {

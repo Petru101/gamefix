@@ -186,7 +186,9 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
     }
     // A fix made before gamefix knew better goes; nothing new is made.
     if let Some(why) = &report.hands_off {
-        if !record_path(game).exists() {
+        // Another Proton is the one thing such a game may have (`switch_proton`): that stays.
+        let record = fs::read_to_string(record_path(game)).unwrap_or_default();
+        if record.lines().all(|l| l.starts_with("steam-compat\t")) {
             return Err(why.clone());
         }
         let mut done = undo(game)?;
@@ -1664,6 +1666,100 @@ fn jogl_natives(lib: &Path) -> Result<(Vec<PathBuf>, String), String> {
     Ok((created, version))
 }
 
+/// A Proton a Steam game could be switched to.
+#[derive(Debug, PartialEq)]
+pub struct ProtonChoice {
+    /// Steam's internal name, for `switch_proton`.
+    pub tool: String,
+    /// As Steam's list names it.
+    pub label: String,
+    /// ProtonDB's reports say it runs with this one.
+    pub suggested: bool,
+    /// What to tell the person before they pick it.
+    pub warnings: Vec<String>,
+}
+
+/// Valve's before anything else for a game with anti-cheat, which isn't tested on other builds of
+/// Wine; ProtonDB's pick first otherwise. Newest first within each.
+fn ordered_protons(tools: Vec<String>, current: Option<&str>, suggested: Option<&str>, prefix: Option<(u32, u32)>, anticheat: bool) -> Vec<ProtonChoice> {
+    let valve = |t: &str| t.starts_with("proton_");
+    let mut choices: Vec<ProtonChoice> = tools
+        .into_iter()
+        .filter(|t| Some(t.as_str()) != current)
+        .map(|tool| {
+            let mut warnings = Vec::new();
+            if let (Some((major, _)), Some((made, _))) = (steam::tool_version(&tool), prefix) {
+                if major < made {
+                    warnings.push("It's older than the Proton that made this game's Windows setup: going back can break that setup, saves included. Back them up first.".to_string());
+                }
+            }
+            if anticheat && !valve(&tool) {
+                warnings.push("It isn't made by Valve: the game's anti-cheat wasn't tested on it.".to_string());
+            }
+            ProtonChoice { label: steam::tool_label(&tool), suggested: suggested == Some(tool.as_str()), warnings, tool }
+        })
+        .collect();
+    // Experimental and Hotfix (no version) count as newest.
+    choices.sort_by_key(|c| std::cmp::Reverse(steam::tool_version(&c.tool).unwrap_or((u32::MAX, 0))));
+    choices.sort_by_key(|c| (!valve(&c.tool) && anticheat, !c.suggested || anticheat, !valve(&c.tool)));
+    choices
+}
+
+/// The Protons a Steam game's Windows build could be switched to, for when it won't start on the
+/// one it has. This is the one thing gamefix changes for a game with anti-cheat: it's Steam's own
+/// setting and leaves what the game loads of its own alone (`check::hands_off`). The person picks
+/// (a failed start may have nothing to do with Proton). Err says why there are none.
+pub fn proton_choices(game: &Game, report: &Report) -> Result<Vec<ProtonChoice>, String> {
+    let appid = steam::installed_app(&game.root).ok_or("It isn't a Steam game: Steam's Proton setting doesn't start it.")?;
+    if game.main().is_some() {
+        return Err("This is its Linux build: setting a Proton would make Steam swap in the Windows build instead.".into());
+    }
+    if game.windows.is_none() {
+        return Err("gamefix doesn't see a Windows program here for Proton to run.".into());
+    }
+    if let Some(hint) = proton::hint(appid).filter(|h| h.advice == Advice::AntiCheat) {
+        return Err(format!("Its anti-cheat stops it under Proton ({}). Another Proton wouldn't get past that.", hint.reason()));
+    }
+    let anticheat = proton::anticheat(&game.root);
+    if let Some((what, _)) = anticheat.iter().find(|(_, works)| !works) {
+        return Err(format!("It uses {what}, an anti-cheat that doesn't run under Proton. Another Proton wouldn't get past that."));
+    }
+    let steam = Steam::find().ok_or("Steam isn't installed, or nobody has logged in to it yet.")?;
+    let suggested = proton::hint(appid).and_then(|h| match h.advice {
+        Advice::Ge => steam.newest_ge(),
+        Advice::Official(version) => Some(steam::official_name(&version)),
+        _ => None,
+    });
+    let mut tools = steam.tools();
+    // Steam fetches one of Valve's by itself when a game is set to it.
+    tools.extend(suggested.clone().filter(|s| !tools.contains(s)));
+    let current = steam::compat_tool(&steam.config(), appid).ok().flatten();
+    let compat = steam.prefix(&game.root, appid);
+    let made = compat.parent().and_then(|d| fs::read_to_string(d.join("version")).ok()).and_then(|v| steam::tool_version(v.trim()));
+    Ok(ordered_protons(tools, current.as_deref(), suggested.as_deref(), made, report.hands_off.is_some() || !anticheat.is_empty()))
+}
+
+/// Sets a Steam game to one of `proton_choices`, as Properties → Compatibility does; undo puts
+/// back what it had.
+pub fn switch_proton(game: &Game, report: &Report, tool: &str) -> Result<Vec<String>, String> {
+    let choices = proton_choices(game, report)?;
+    let choice = choices.iter().find(|c| c.tool == tool).ok_or_else(|| format!("{tool} isn't one of the Protons this game can be switched to."))?;
+    let steam = Steam::find().ok_or("Steam isn't installed, or nobody has logged in to it yet.")?;
+    if steam.running() {
+        return Err(STEAM_OPEN.into());
+    }
+    let appid = steam::installed_app(&game.root).ok_or("It isn't a Steam game.")?;
+    let config = steam.config();
+    let previous = steam::compat_tool(&config, appid)?;
+    let file = record_path(game);
+    fs::create_dir_all(file.parent().unwrap()).map_err(|e| e.to_string())?;
+    let mut record: Vec<String> = fs::read_to_string(&file).unwrap_or_default().lines().map(String::from).collect();
+    record.push(format!("steam-compat\t{appid}\t{}\t{}", config.display(), previous.map_or("-".to_string(), |p| format!("={p}"))));
+    write_record(&file, &record)?;
+    steam::set_compat_tool(&config, appid, Some(tool))?;
+    Ok(vec![format!("Set it to run with {} in Steam. Undo puts back what it had.", choice.label)])
+}
+
 /// A Windows-only game, run with Proton by Steam, like ticking "Force the use of a specific
 /// Steam Play compatibility tool" in its properties. A Steam game gets the Proton ProtonDB's
 /// reports say runs it (Steam's own choice stays when there's none); a download becomes a
@@ -2367,6 +2463,26 @@ fn refresh_menu() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protons_in_the_order_to_try_them() {
+        let tools = || ["proton_9", "GE-Proton11-11", "proton_experimental", "proton_11", "GE-Proton11-7", "proton_513"].map(String::from).to_vec();
+        let order = |c: &[ProtonChoice]| c.iter().map(|c| c.tool.clone()).collect::<Vec<_>>();
+        // With anti-cheat Valve's come first, even past ProtonDB's pick, and the others say why.
+        let held = ordered_protons(tools(), Some("proton_11"), Some("GE-Proton11-11"), Some((11, 0)), true);
+        assert_eq!(order(&held), ["proton_experimental", "proton_9", "proton_513", "GE-Proton11-11", "GE-Proton11-7"]);
+        assert!(held[3].suggested && held[3].warnings.iter().any(|w| w.contains("isn't made by Valve")));
+        assert!(held[0].warnings.is_empty());
+        // Older than what made the prefix: said so.
+        assert!(held[1].warnings.iter().any(|w| w.contains("older")) && held[2].warnings.iter().any(|w| w.contains("older")));
+        // Without it, ProtonDB's pick first.
+        let free = ordered_protons(tools(), None, Some("GE-Proton11-11"), None, false);
+        assert_eq!(order(&free)[..3], ["GE-Proton11-11", "proton_experimental", "proton_11"]);
+        assert!(free.iter().all(|c| c.warnings.is_empty()));
+        assert_eq!(free[1].label, "Proton Experimental");
+        assert_eq!((steam::tool_label("proton_513"), steam::tool_label("proton_11")), ("Proton 5.13".to_string(), "Proton 11.0".to_string()));
+        assert_eq!((steam::tool_version("GE-Proton11-7"), steam::tool_version("11.0-100")), (Some((11, 7)), Some((11, 0))));
+    }
 
     #[test]
     fn wrappers_on_entries() {

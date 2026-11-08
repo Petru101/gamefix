@@ -6,6 +6,7 @@ use std::process::{Command, ExitCode};
 const USAGE: &str = "usage: gamefix check <game>
        gamefix setup <game> [--menu] [--steam]   (default: --menu)
        gamefix undo <game>
+       gamefix proton <game> [<name>]            a Steam game's Protons, or switch to one
        gamefix right-click [on|off]              Dolphin's right-click menu
        gamefix games-folder [<folder>]           where installed Windows games go
        gamefix feedback [<game>]                 report a problem to gamefix's developer
@@ -44,6 +45,24 @@ fn main() -> ExitCode {
             Some(said) => said,
             // Cancelled: nothing to say.
             None => return ExitCode::SUCCESS,
+        },
+        ["proton", path, rest @ ..] if rest.len() <= 1 => match scan::scan(std::path::Path::new(path)) {
+            None => said("gamefix", Err(format!("{path}: not a folder or a file that can be read"))),
+            Some(game) => {
+                let report = check::check(&game, &system::System::load());
+                let title = format!("gamefix: {}", game.name);
+                match rest.first() {
+                    Some(tool) => said(&title, setup::switch_proton(&game, &report, tool)),
+                    None => said(&title, setup::proton_choices(&game, &report).map(|choices| {
+                        let mut lines = vec!["Protons to try, in this order (gamefix proton <game> <name>):".to_string()];
+                        for c in choices {
+                            lines.push(format!("  {}{}{}", c.tool, if c.label == c.tool { String::new() } else { format!(" ({})", c.label) }, if c.suggested { ": ProtonDB's reports name this one" } else { "" }));
+                            lines.extend(c.warnings.iter().map(|w| format!("    {w}")));
+                        }
+                        lines
+                    })),
+                }
+            }
         },
         [command @ ("check" | "setup" | "undo"), rest @ ..] => {
             // Dolphin passes the path last, after the flags.
