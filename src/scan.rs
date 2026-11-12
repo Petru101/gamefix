@@ -836,6 +836,13 @@ fn engine(root: &Path, main: &Path, files: &[Found]) -> Option<Engine> {
     if dir.join(format!("{s}.pck")).is_file() || dir.join("data.pck").is_file() || ends_with_pck(&dir.join(main.file_name()?)) {
         return Some(Engine { name: "Godot", version: None, guess: None });
     }
+    // CryEngine keeps its own data in Engine/Engine.pak, at the top or above the program, and
+    // its programs in Bin32, bin/Win64 or Binaries (Prey): Unreal's Engine folder holds Binaries,
+    // Content or Extras instead (Kingdom Come, Prey and Sniper: Ghost Warrior 2 were "Unreal").
+    let cry = main.ancestors().map(|a| root.join(a).join("Engine")).any(|e| fs::read_dir(&e).into_iter().flatten().flatten().any(|f| f.file_name().eq_ignore_ascii_case("engine.pak")));
+    if cry {
+        return Some(Engine { name: "CryEngine", version: None, guess: None });
+    }
     if main.components().any(|c| c.as_os_str() == "Binaries") || root.join("Engine").is_dir() || dir.join("Engine/Binaries").is_dir() {
         return Some(Engine { name: "Unreal Engine", version: None, guess: None });
     }

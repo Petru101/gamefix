@@ -597,8 +597,11 @@ fn check_files(game: &Game, system: &System) -> Report {
             }
             None => {
                 let damaged = game.files.iter().find(|f| matches!(f.binary, Binary::Damaged));
+                // A Windows program as high up as the package is the game: PvZ2 Reflourished's
+                // Windows build keeps its code as Game/pvz2.apk below its .exe.
+                let windows_depth = game.windows.map(|i| game.files[i].path.components().count());
                 let package = game.files.iter().find_map(|f| match f.binary {
-                    Binary::Package(kind) => Some((f.path.clone(), kind)),
+                    Binary::Package(kind) if windows_depth.is_none_or(|d| d > f.path.components().count()) => Some((f.path.clone(), kind)),
                     _ => None,
                 });
                 let udk = report.installers.iter().find(|(_, kind)| *kind == "UnSetup").map(|(p, _)| p.clone());
