@@ -193,7 +193,7 @@ pub fn scan(path: &Path) -> Option<Game> {
         None => pick_portable(&root, &files).or_else(|| if windows.is_none() { pick_dos(&root, &files) } else { None }),
     };
     let nothing = main.is_none() && windows.is_none() && portable.is_none() && cd_installer.is_none() && linux_installer.is_none() && packed.is_none();
-    let disc = nothing.then(|| files.iter().enumerate().filter(|(_, f)| matches!(f.binary, Binary::Disc)).min_by_key(|(_, f)| f.path.components().count()).map(|(i, _)| i)).flatten();
+    let disc = nothing.then(|| files.iter().enumerate().filter(|(_, f)| matches!(f.binary, Binary::Disc)).min_by_key(|(_, f)| (f.path.components().count(), f.path.clone())).map(|(i, _)| i)).flatten();
     let archive = (nothing && disc.is_none())
         .then(|| files.iter().enumerate().filter(|(_, f)| matches!(f.binary, Binary::Archive)).min_by_key(|(_, f)| f.path.components().count()).map(|(i, _)| i))
         .flatten();

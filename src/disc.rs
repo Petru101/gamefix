@@ -76,6 +76,37 @@ pub fn installer(iso: &Path, files: &[String], name: &str) -> Option<String> {
     })
 }
 
+/// A game on several CDs: the disc images beside this one named the same but for their numbers
+/// (NFSUDISK1.iso, NFSUDISK2.iso), this one first, the others by name.
+pub fn set(iso: &Path) -> Vec<PathBuf> {
+    let unnumbered = |p: &Path| p.file_name().map(|n| n.to_string_lossy().to_lowercase().replace(|c: char| c.is_ascii_digit(), ""));
+    let mine = unnumbered(iso);
+    let mut others: Vec<PathBuf> = fs::read_dir(iso.parent().unwrap_or(Path::new(".")))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p != iso && p.is_file() && unnumbered(p) == mine && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("iso")))
+        .collect();
+    others.sort();
+    [vec![iso.to_path_buf()], others].concat()
+}
+
+/// A disc's own name (its ISO 9660 volume id, "NFSUDISK2"), which Windows shows for the drive:
+/// some installers ask for the next disc by it.
+pub fn volume_id(iso: &Path) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = fs::File::open(iso).ok()?;
+    f.seek(SeekFrom::Start(0x8000)).ok()?;
+    let mut pvd = [0u8; 72];
+    f.read_exact(&mut pvd).ok()?;
+    if pvd[0] != 1 || &pvd[1..6] != b"CD001" {
+        return None;
+    }
+    let id = String::from_utf8_lossy(&pvd[40..72]).trim().to_string();
+    (!id.is_empty()).then_some(id)
+}
+
 /// Unpacks a disc image into `dir`.
 pub fn unpack(iso: &Path, dir: &Path) -> Result<(), String> {
     let seven = seven_zip().ok_or("7-Zip (7z) is needed to unpack the disc image.")?;
@@ -342,5 +373,26 @@ mod tests {
     #[test]
     fn name_words() {
         assert_eq!(words("Bookworm-Deluxe_Win_EN_ISO"), ["bookworm", "deluxe"]);
+    }
+
+    #[test]
+    fn a_games_other_discs() {
+        let dir = std::env::temp_dir().join(format!("gamefix-discs-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        // An ISO 9660 image's start: the volume descriptor at 32 KB, its name at byte 40.
+        let mut image = vec![0u8; 0x8000 + 2048];
+        image[0x8000] = 1;
+        image[0x8001..0x8006].copy_from_slice(b"CD001");
+        image[0x8028..0x8048].copy_from_slice(b"NFSUDISK2                       ");
+        for name in ["NFSUDISK1.iso", "NFSUDISK2.iso", "Other.iso", "NFSUDISK.txt"] {
+            fs::write(dir.join(name), &image).unwrap();
+        }
+        assert_eq!(set(&dir.join("NFSUDISK2.iso")), [dir.join("NFSUDISK2.iso"), dir.join("NFSUDISK1.iso")]);
+        assert_eq!(set(&dir.join("Other.iso")), [dir.join("Other.iso")]);
+        assert_eq!(volume_id(&dir.join("NFSUDISK1.iso")).as_deref(), Some("NFSUDISK2"));
+        assert_eq!(volume_id(&dir.join("NFSUDISK.txt")).as_deref(), Some("NFSUDISK2"));
+        fs::write(dir.join("Other.iso"), b"not a disc").unwrap();
+        assert_eq!(volume_id(&dir.join("Other.iso")), None);
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -1461,11 +1461,26 @@ fn setup_install(game: &Game, installer: Installer, targets: &Targets) -> Result
             fs::create_dir_all(&prefix).map_err(|e| format!("Couldn't make {}: {e}", prefix.display()))?;
             // Its real path (/var/home, not /home, on Bazzite), as the installed program's will be.
             let prefix = fs::canonicalize(&prefix).map_err(|e| e.to_string())?;
+            // A disc is unpacked beside the prefix, each disc of a game on several into its own
+            // folder (not /tmp, which is memory: two CDs are 1.4 GB).
+            let mut discs = Vec::new();
             let (setup, unpacked) = match &installer {
                 Installer::Disc { iso, inside } => {
-                    let dir = std::env::temp_dir().join(format!("gamefix-disc-{}", std::process::id()));
-                    crate::disc::unpack(iso, &dir)?;
-                    (dir.join(inside), Some(dir))
+                    let dir = games.join(format!(".gamefix-disc-{}", std::process::id()));
+                    let _ = fs::remove_dir_all(&dir);
+                    for (n, disc) in crate::disc::set(iso).iter().enumerate() {
+                        let to = dir.join((n + 1).to_string());
+                        if let Err(e) = crate::disc::unpack(disc, &to) {
+                            let _ = fs::remove_dir_all(&dir);
+                            let _ = fs::remove_dir_all(&prefix);
+                            return Err(e);
+                        }
+                        discs.push((to, crate::disc::volume_id(disc)));
+                    }
+                    if discs.len() > 1 {
+                        done.push(format!("It's on {} discs: the installer finds each in its own CD drive, as if they'd all been put in.", discs.len()));
+                    }
+                    (dir.join("1").join(inside), Some(dir))
                 }
                 Installer::File(file) => (file.clone(), None),
             };
@@ -1473,8 +1488,26 @@ fn setup_install(game: &Game, installer: Installer, targets: &Targets) -> Result
             // lists them by name; the installer started from its own drive's path, so Wine
             // names it by that drive's letter, else from a link in C:.
             let started = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
-            let drives = crate::drives::letter(&prefix);
+            let mut drives = crate::drives::letter(&prefix);
             let roots = drives.roots();
+            // The discs as CD drives. Wine reads which drives are CDs from the registry when
+            // the prefix starts, so that's written in a run of its own first (which also makes
+            // the prefix).
+            let cds = drives.add_discs(&discs);
+            for letter in &cds {
+                let _ = std::process::Command::new(&umu)
+                    .args(["reg", "add", "HKLM\\Software\\Wine\\Drives", "/v", letter, "/d", "cdrom", "/f"])
+                    .env("WINEPREFIX", &prefix)
+                    .env("PROTONPATH", &tool_dir)
+                    .env("GAMEID", "umu-0")
+                    .env("PROTON_SET_GAME_DRIVE", "0")
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+            }
+            if !cds.is_empty() {
+                crate::disc::wait_for_prefix(&prefix);
+            }
             // A repack's unfinished optional parts left out: it offers every archive there is,
             // so it gets a folder of links to the rest.
             let link = prefix.join("drive_c/gamefix-setup");
@@ -1490,6 +1523,8 @@ fn setup_install(game: &Game, installer: Installer, targets: &Targets) -> Result
                     done.push(format!("Left the download's unfinished optional parts out of the installer's choices: {}.", left_out.join(", ")));
                     Some(link.join(setup.file_name()?))
                 })(),
+                // Started from its CD drive, as Windows' autorun would.
+                None if !cds.is_empty() => Some(setup.clone()),
                 None => drives.on_drive(&setup).or_else(|| {
                     fs::create_dir_all(prefix.join("drive_c")).ok()?;
                     std::os::unix::fs::symlink(setup.parent()?, &link).ok()?;

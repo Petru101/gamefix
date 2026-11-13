@@ -131,6 +131,8 @@ pub struct Lettered {
     letters: Vec<(PathBuf, String)>,
     /// The `.windows-label` files written for it.
     labels: Vec<PathBuf>,
+    /// The CD drives given to it (their links in dosdevices).
+    discs: Vec<PathBuf>,
 }
 
 /// Where Z: points while the installer runs: nowhere, so Wine leaves it out.
@@ -142,7 +144,7 @@ pub fn letter(prefix: &Path) -> Lettered {
     let dosdevices = prefix.join("dosdevices");
     let _ = fs::create_dir_all(&dosdevices);
     let mountinfo = fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
-    let mut lettered = Lettered { dosdevices: dosdevices.clone(), letters: Vec::new(), labels: Vec::new() };
+    let mut lettered = Lettered { dosdevices: dosdevices.clone(), letters: Vec::new(), labels: Vec::new(), discs: Vec::new() };
     let free = (b'd'..b'z').map(|c| format!("{}:", c as char)).filter(|l| fs::symlink_metadata(dosdevices.join(l)).is_err());
     for (drive, letter) in drives(&mountinfo).into_iter().zip(free) {
         if std::os::unix::fs::symlink(&drive.point, dosdevices.join(&letter)).is_err() {
@@ -174,6 +176,28 @@ impl Lettered {
         Some(point.join(inside.strip_prefix("/").unwrap_or(&inside)))
     }
 
+    /// Unpacked discs as CD drives, after the other drives' letters, each named as its disc
+    /// was: an installer asks for disc 2 by looking at every CD drive (EA's reads each one's
+    /// AutoRun.inf for `Disk=2`, others look for the disc's name). Returns their letters
+    /// ("f:"), which the prefix's registry has to call CD drives (`HKLM\Software\Wine\Drives`)
+    /// before the installer starts. They go in `finish`.
+    pub fn add_discs(&mut self, discs: &[(PathBuf, Option<String>)]) -> Vec<String> {
+        let mut letters = Vec::new();
+        for (dir, name) in discs {
+            let Some(letter) = (b'd'..b'z').map(|c| format!("{}:", c as char)).find(|l| fs::symlink_metadata(self.dosdevices.join(l)).is_err()) else { break };
+            let link = self.dosdevices.join(&letter);
+            if std::os::unix::fs::symlink(dir, &link).is_err() {
+                continue;
+            }
+            if let Some(name) = name {
+                let _ = fs::write(dir.join(".windows-label"), name);
+            }
+            self.discs.push(link);
+            letters.push(letter);
+        }
+        letters
+    }
+
     /// The tops of the drives given letters.
     pub fn roots(&self) -> Vec<PathBuf> {
         self.letters.iter().map(|(point, _)| point.clone()).collect()
@@ -188,6 +212,9 @@ impl Lettered {
         }
         for label in self.labels {
             let _ = fs::remove_file(label);
+        }
+        for disc in self.discs {
+            let _ = fs::remove_file(disc);
         }
     }
 }
