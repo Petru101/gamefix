@@ -486,6 +486,33 @@ pub fn remove_shortcut(file: &Path, appid: u32) -> Result<bool, String> {
     Ok(true)
 }
 
+/// Rewrites the text fields (Exe, StartDir, icon, LaunchOptions ...) of the shortcut with this
+/// app id through `change`; whether anything changed. With `save` false nothing is written (to
+/// ask first whether a change is due, Steam being open).
+pub fn edit_shortcut(file: &Path, appid: u32, change: &dyn Fn(&str) -> String, save: bool) -> Result<bool, String> {
+    let mut doc = read_shortcuts(file)?;
+    let list = shortcut_list(&mut doc)?;
+    let mut changed = false;
+    for (_, node) in list.iter_mut().filter(|(_, n)| has_appid(n, appid)) {
+        let Node::Map(fields) = node else { continue };
+        for (_, value) in fields.iter_mut() {
+            if let Node::Str(s) = value {
+                if let Ok(text) = std::str::from_utf8(s) {
+                    let new = change(text);
+                    if new != text {
+                        *s = new.into_bytes();
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+    if changed && save {
+        save_shortcuts(file, &doc)?;
+    }
+    Ok(changed)
+}
+
 fn has_appid(node: &Node, appid: u32) -> bool {
     matches!(node, Node::Map(fields) if fields.iter().any(|(k, v)| k.eq_ignore_ascii_case(b"appid") && *v == Node::Int(appid)))
 }

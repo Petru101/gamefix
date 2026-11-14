@@ -80,6 +80,119 @@ pub fn set_up_as(name: &str) -> bool {
     record_for(name).exists()
 }
 
+/// Points what gamefix keeps about games at a folder that moved from `from` to `to` (a launcher
+/// moved it; the files are already there): the records, the app-menu entries and install
+/// notes they name, links into the folder (a game's library links), and the Steam shortcuts
+/// gamefix added (Steam closed, if one has to change). Only whole paths change: "Woodo" never
+/// matches "Woodo 2". Says what changed.
+pub fn relocate(from: &Path, to: &Path) -> Result<Vec<String>, String> {
+    let records: Vec<(PathBuf, String)> = fs::read_dir(data_home().join("gamefix/games"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "log"))
+        .filter_map(|p| fs::read_to_string(&p).ok().map(|t| (p, t)))
+        // The game's folder is often only in the entries a record lists (Exec, Path, X-Gamefix-Game).
+        .filter(|(_, t)| {
+            repoint(t, from, to, false) != *t
+                || t.lines().filter_map(|l| l.strip_prefix("created\t")).filter(|p| p.ends_with(".desktop")).any(|p| fs::read_to_string(p).is_ok_and(|e| repoint(&e, from, to, true) != e))
+        })
+        .collect();
+    let lines = |kind: &str| -> Vec<Vec<String>> {
+        records.iter().flat_map(|(_, t)| t.lines().filter_map(|l| l.strip_prefix(kind)?.strip_prefix('\t').map(|r| r.split('\t').map(String::from).collect())).collect::<Vec<_>>()).collect()
+    };
+    let shortcuts: Vec<(u32, PathBuf)> = lines("steam-shortcut").into_iter().filter_map(|f| Some((f.first()?.parse().ok()?, PathBuf::from(f.get(1)?)))).collect();
+    let change = |s: &str| repoint(s, from, to, true);
+    let due: Vec<&(u32, PathBuf)> = shortcuts.iter().filter(|(id, file)| steam::edit_shortcut(file, *id, &change, false).unwrap_or(false)).collect();
+    if !due.is_empty() && Steam::find().is_some_and(|s| s.running()) {
+        return Err(STEAM_OPEN.into());
+    }
+    let mut done = Vec::new();
+    for (id, file) in due {
+        if steam::edit_shortcut(file, *id, &change, true)? {
+            done.push(format!("Pointed its Steam shortcut at {}.", to.display()));
+        }
+    }
+    let mut texts: Vec<PathBuf> = lines("created").into_iter().filter_map(|f| f.into_iter().next()).map(|p| PathBuf::from(repoint(&p, from, to, false))).filter(|p| p.extension().is_some_and(|x| x == "desktop")).collect();
+    texts.extend(lines("installed-game").into_iter().filter_map(|f| f.into_iter().next()).map(|p| PathBuf::from(repoint(&p, from, to, false)).join(INSTALL_NOTE)));
+    for file in texts {
+        let Ok(text) = fs::read_to_string(&file) else { continue };
+        let new = repoint(&text, from, to, file.extension().is_some_and(|x| x == "desktop"));
+        if new != text {
+            let tmp = file.with_extension("gamefix-tmp");
+            fs::write(&tmp, &new).and_then(|()| fs::rename(&tmp, &file)).map_err(|e| format!("{}: {e}", file.display()))?;
+            done.push(format!("Pointed {} at {}.", file.display(), to.display()));
+        }
+    }
+    // Links gamefix made, alone or in folders of its own (a game's libs/), into the old place.
+    let mut links: Vec<PathBuf> = lines("created").into_iter().filter_map(|f| f.into_iter().next()).map(|p| PathBuf::from(repoint(&p, from, to, false))).collect();
+    for dir in lines("created-dir").into_iter().filter_map(|f| f.into_iter().next()) {
+        links.extend(fs::read_dir(repoint(&dir, from, to, false)).into_iter().flatten().flatten().map(|e| e.path()));
+    }
+    let mut relinked = 0;
+    for link in links {
+        let Ok(target) = fs::read_link(&link) else { continue };
+        let new = repoint(&target.display().to_string(), from, to, false);
+        if new != target.display().to_string() {
+            fs::remove_file(&link).and_then(|()| std::os::unix::fs::symlink(&new, &link)).map_err(|e| format!("{}: {e}", link.display()))?;
+            relinked += 1;
+        }
+    }
+    if relinked > 0 {
+        done.push(format!("Pointed {relinked} links at the new place."));
+    }
+    for (file, text) in &records {
+        let tmp = file.with_extension("gamefix-tmp");
+        fs::write(&tmp, repoint(text, from, to, false)).and_then(|()| fs::rename(&tmp, file)).map_err(|e| format!("{}: {e}", file.display()))?;
+    }
+    let named = records.iter().filter(|(_, t)| repoint(t, from, to, false) != *t).count();
+    if named > 0 {
+        done.push(format!("Pointed {named} of gamefix's game records at {}.", to.display()));
+    }
+    Ok(done)
+}
+
+/// `text` with the folder `from` replaced by `to` where it's a whole path or the start of one:
+/// followed by "/", a quote, a tab, ":" or ";" (LD_LIBRARY_PATH, WINEDLLOVERRIDES), a line's
+/// end. In command lines (`words`: menu entries, launch options) a space ends a path too, as in
+/// an unquoted `WINEPREFIX=/a/pfx umu-run`, unless a folder beside it is named on with that
+/// space ("Woodo" and "Woodo 2"). Both spellings of the home folder (/var/home is /home).
+fn repoint(text: &str, from: &Path, to: &Path, words: bool) -> String {
+    let from_text = from.display().to_string().trim_end_matches('/').to_string();
+    let mut spellings = vec![from_text.clone()];
+    if let Some(rest) = from_text.strip_prefix("/var/home/") {
+        spellings.push(format!("/home/{rest}"));
+    } else if let Some(rest) = from_text.strip_prefix("/home/") {
+        spellings.push(format!("/var/home/{rest}"));
+    }
+    let name = from.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let siblings: Vec<String> = if words {
+        fs::read_dir(from.parent().unwrap_or(Path::new("/"))).into_iter().flatten().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n.len() > name.len() && n.starts_with(&format!("{name} "))).collect()
+    } else {
+        Vec::new()
+    };
+    let to = to.display().to_string();
+    let mut out = text.to_string();
+    for old in spellings {
+        let mut result = String::with_capacity(out.len());
+        let mut rest = out.as_str();
+        while let Some(i) = rest.find(&old) {
+            let tail = &rest[i + old.len()..];
+            // Not inside a longer path that merely contains it (/var/home/x when replacing /home/x).
+            let before_ok = !rest[..i].ends_with(|c: char| c.is_alphanumeric() || c == '/' || c == '_' || c == '-' || c == '.');
+            let space = words && tail.starts_with(' ') && !siblings.iter().any(|s| tail.starts_with(&s[name.len()..]));
+            let ends = space || tail.chars().next().is_none_or(|c| matches!(c, '/' | '"' | '\'' | '\n' | '\t' | '\\' | ';' | ':' | '\0'));
+            result.push_str(&rest[..i]);
+            result.push_str(if ends && before_ok { &to } else { &old });
+            rest = tail;
+        }
+        result.push_str(rest);
+        out = result;
+    }
+    out
+}
+
 /// The wrapper a game's record names (`wrapper\t<word>\t<word>...`), if any.
 fn recorded_wrapper(record: &Path) -> Option<Vec<String>> {
     let text = fs::read_to_string(record).ok()?;
@@ -2569,6 +2682,22 @@ fn refresh_menu() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repoints_whole_paths_only() {
+        let (from, to) = (Path::new("/run/media/u/Games/Woodo"), Path::new("/mnt/new/Woodo"));
+        // Records: tab-separated; a longer name beside it stays.
+        assert_eq!(repoint("created\t/run/media/u/Games/Woodo/run.sh\n", from, to, false), "created\t/mnt/new/Woodo/run.sh\n");
+        assert_eq!(repoint("x\t/run/media/u/Games/Woodo 2/a\t/run/media/u/Games/Woodoo\n", from, to, false), "x\t/run/media/u/Games/Woodo 2/a\t/run/media/u/Games/Woodoo\n");
+        // Menu entries: an unquoted path ends at a space; library paths at a colon.
+        assert_eq!(repoint("Exec=env WINEPREFIX=/run/media/u/Games/Woodo umu-run x", from, to, true), "Exec=env WINEPREFIX=/mnt/new/Woodo umu-run x");
+        assert_eq!(repoint("LD_LIBRARY_PATH=/run/media/u/Games/Woodo:/usr/lib", from, to, true), "LD_LIBRARY_PATH=/mnt/new/Woodo:/usr/lib");
+        assert_eq!(repoint("\"/run/media/u/Games/Woodo/Woodo.exe\"", from, to, true), "\"/mnt/new/Woodo/Woodo.exe\"");
+        // Both spellings of home, never inside a longer path.
+        let (from, to) = (Path::new("/var/home/u/G/x"), Path::new("/var/home/u/H/x"));
+        assert_eq!(repoint("a /home/u/G/x/b /var/home/u/G/x", from, to, false), "a /var/home/u/H/x/b /var/home/u/H/x");
+        assert_eq!(repoint("/srv/home/u/G/x/b", Path::new("/home/u/G/x"), to, false), "/srv/home/u/G/x/b");
+    }
 
     #[test]
     fn protons_in_the_order_to_try_them() {

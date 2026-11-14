@@ -100,7 +100,11 @@ gamefix setup <game folder or file> [--menu] [--steam]   # --menu if neither is 
 gamefix undo <game folder or file>
 gamefix proton <Steam game's folder> [<name>]             # its Protons to try, or switch to one
 gamefix feedback [<game folder or file>]
+gamefix moved <old folder> <new folder>                   # after moving a game's folder
 ```
+
+Moved a game you set up to another folder or drive? Move it first, then run `gamefix moved`
+with both places: its app-menu entry, Steam shortcut and gamefix's records follow it.
 
 Steam has to be closed while gamefix changes Steam's settings, because Steam rewrites them
 when it quits. From the right-click menu, gamefix offers to close Steam for you.

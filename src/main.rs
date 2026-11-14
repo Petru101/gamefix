@@ -9,6 +9,7 @@ const USAGE: &str = "usage: gamefix check <game>
        gamefix proton <game> [<name>]            a Steam game's Protons, or switch to one
        gamefix right-click [on|off]              Dolphin's right-click menu
        gamefix games-folder [<folder>]           where installed Windows games go
+       gamefix moved <old folder> <new folder>   after moving a game: point its setup there
        gamefix feedback [<game>]                 report a problem to gamefix's developer
 <game> is the game's folder or its program; --dialog shows the result in a window";
 
@@ -41,6 +42,15 @@ fn main() -> ExitCode {
         ["right-click"] => said("gamefix", Ok(vec![format!("The right-click menu is {}.", if rightclick::enabled() { "on" } else { "off" })])),
         ["games-folder"] => said("gamefix", Ok(vec![format!("Windows games gamefix installs go into {}.", setup::games_folder().display())])),
         ["games-folder", path] => said("gamefix", setup::set_games_folder(std::path::Path::new(path))),
+        ["moved", from, to] => {
+            let (from, to) = (std::path::Path::new(from), std::path::Path::new(to));
+            // The old place is gone by now: made absolute by hand, the new one by the system.
+            let from = if from.is_absolute() { from.to_path_buf() } else { std::env::current_dir().unwrap_or_default().join(from) };
+            match std::fs::canonicalize(to) {
+                Ok(to) if to.is_dir() => said("gamefix", setup::relocate(&from, &to).map(|done| if done.is_empty() { vec![format!("Nothing gamefix set up names {}.", from.display())] } else { done })),
+                _ => said("gamefix", Err(format!("{} isn't a folder: move the game there first.", to.display()))),
+            }
+        }
         ["feedback", rest @ ..] if rest.len() <= 1 => match feedback(rest.first().copied(), dialog) {
             Some(said) => said,
             // Cancelled: nothing to say.
