@@ -248,11 +248,30 @@ pub enum Provider {
     Unknown,
 }
 
-/// The winetricks component providing a DLL Wine lacks, from what old games use: MFC, the
-/// Visual Basic runtimes, OpenAL, PhysX's loader, an MP3 codec, Games for Windows Live (gone
-/// since 2014; xliveless stands in for it, as protonfixes does for Dirt 2 and Fable III).
+/// The winetricks component providing a DLL Wine lacks: Microsoft's debug runtimes are a
+/// developer's build (never redistributable); else what winetricks itself says installs it
+/// (`winetricks_dlls`); else the short list of what old games use, for when no winetricks is
+/// found: MFC, the Visual Basic runtimes, OpenAL, PhysX's loader, an MP3 codec, Games for
+/// Windows Live (gone since 2014; xliveless stands in for it, as protonfixes does for Dirt 2
+/// and Fable III).
 pub(crate) fn provider(dll: &str) -> Provider {
+    let dll = dll.to_lowercase();
     let stem = dll.trim_end_matches(".dll");
+    if ["msvcp", "msvcr", "vcruntime", "ucrtbase", "concrt", "vcomp"].iter().any(|p| stem.starts_with(p)) && stem.ends_with('d') {
+        return Provider::DebugBuild;
+    }
+    // Games for Windows Live's servers are gone: protonfixes' stand-in, not winetricks' own
+    // runtime (`gfw`).
+    if stem == "xlive" {
+        return Provider::Component("xliveless");
+    }
+    if let Some(verb) = winetricks_dlls().get(&format!("{stem}.dll")) {
+        return Provider::Component(verb);
+    }
+    short_list(stem)
+}
+
+fn short_list(stem: &str) -> Provider {
     let stem = stem.strip_suffix('u').filter(|s| s.starts_with("mfc")).unwrap_or(stem);
     const MFC: [&str; 10] = ["mfc40", "mfc42", "mfc70", "mfc71", "mfc80", "mfc90", "mfc100", "mfc110", "mfc120", "mfc140"];
     if let Some(mfc) = MFC.iter().find(|m| **m == stem) {
@@ -269,6 +288,121 @@ pub(crate) fn provider(dll: &str) -> Provider {
         s if ["msvcp", "msvcr", "vcruntime", "ucrtbase", "concrt", "vcomp"].iter().any(|p| s.starts_with(p)) && s.ends_with('d') => Provider::DebugBuild,
         _ => Provider::Unknown,
     }
+}
+
+/// Components as winetricks takes them: protonfixes' own (xliveless, dgvoodoo2: `.verb` files in
+/// a GE-Proton's protonfixes/verbs) by their file's path, which winetricks loads; it doesn't
+/// know them by name.
+pub fn winetricks_args(tool_dir: Option<&Path>, components: &[&str]) -> Vec<String> {
+    let steam = Steam::find().unwrap_or_else(|| Steam::umu_only(&crate::setup::data_home()));
+    let dirs: Vec<PathBuf> = tool_dir.map(Path::to_path_buf).into_iter().chain(steam.newest_ge().and_then(|ge| steam.tool_dir(&ge))).collect();
+    components
+        .iter()
+        .map(|c| dirs.iter().map(|d| d.join("protonfixes/verbs").join(format!("{c}.verb"))).find(|v| v.is_file()).map_or(c.to_string(), |v| v.display().to_string()))
+        .collect()
+}
+
+/// The winetricks that installs components: the newest GE-Proton's own (umu-run's `winetricks`
+/// verb runs protonfixes' copy in the Proton it's given), else the system's.
+fn winetricks_script() -> Option<PathBuf> {
+    let steam = Steam::find().unwrap_or_else(|| Steam::umu_only(&crate::setup::data_home()));
+    steam.newest_ge().and_then(|ge| steam.tool_dir(&ge)).map(|d| d.join("protonfixes/winetricks")).filter(|p| p.is_file()).or_else(|| on_path("winetricks"))
+}
+
+/// DLL (lower case, with ".dll") → winetricks component, read once from winetricks itself.
+fn winetricks_dlls() -> &'static std::collections::HashMap<String, &'static str> {
+    static DLLS: std::sync::OnceLock<std::collections::HashMap<String, &'static str>> = std::sync::OnceLock::new();
+    DLLS.get_or_init(|| winetricks_script().and_then(|p| fs::read_to_string(p).ok()).map(|t| winetricks_map(&t)).unwrap_or_default())
+}
+
+/// Which "dlls" component installs each DLL, from winetricks' script: a component named after
+/// the DLL that installs it, then the file its metadata names
+/// (`installed_file1="${W_SYSTEM32_DLLS_WIN}/d3dx9_43.dll"`), then the DLLs its load function extracts (`-F 'x3daudio1_7.dll'`) or makes
+/// Wine prefer (`w_override_dlls native xinput1_1 ...`, the whole msvcp140 family for
+/// vcrun2022). On a tie a component that isn't only for 64-bit wins (xact over xact_x64: most
+/// games needing XAudio are 32-bit), then the later one (winetricks lists older versions first).
+fn winetricks_map(script: &str) -> std::collections::HashMap<String, &'static str> {
+    let mut category: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    // dll → ((strength, not 64-bit only, order), component)
+    let mut best: std::collections::HashMap<String, ((u8, bool, usize), String)> = std::collections::HashMap::new();
+    let mut offer = |dll: String, strength: u8, order: usize, verb: &str| {
+        let dll = dll.to_lowercase();
+        if dll.contains('*') || !dll.ends_with(".dll") || !dll.starts_with(|c: char| c.is_ascii_alphabetic()) || dll.len() < 5 {
+            return;
+        }
+        // Named after the DLL counts most, but only when it really installs it: riched30
+        // installs RichEdit 3.0 as riched20.dll, and no riched30.dll exists.
+        let strength = if dll.trim_end_matches(".dll") == verb { 3 } else { strength };
+        let rank = (strength, !verb.ends_with("_x64"), order);
+        if best.get(&dll).is_none_or(|(r, _)| *r < rank) {
+            best.insert(dll, (rank, verb.to_string()));
+        }
+    };
+    let mut meta: Option<String> = None;
+    let mut load: Option<String> = None;
+    // Wildcards a load function extracts by (`-F "mfc42*.dll"`): its own name's DLL among them
+    // counts as named (mfc42 installs mfc42.dll and mfc42u.dll that way).
+    let mut patterns: Vec<(String, String, usize)> = Vec::new();
+    for (order, line) in script.lines().enumerate() {
+        let trimmed = line.trim();
+        if let Some(rest) = line.strip_prefix("w_metadata ") {
+            let mut words = rest.split_whitespace();
+            if let (Some(verb), Some(cat)) = (words.next(), words.next()) {
+                category.insert(verb.to_string(), cat.to_string());
+                meta = (cat == "dlls").then(|| verb.to_string());
+            }
+            continue;
+        }
+        if let Some(verb) = &meta {
+            if let Some(value) = trimmed.strip_prefix("installed_file").and_then(|r| r.split_once('=')).map(|(_, v)| v.trim_matches(|c| c == '"' || c == '\\' || c == ' ')) {
+                offer(value.rsplit('/').next().unwrap_or_default().to_string(), 2, order, verb);
+            }
+            if !line.trim_end().ends_with('\\') {
+                meta = None;
+            }
+            continue;
+        }
+        if let Some(verb) = line.strip_prefix("load_").and_then(|r| r.strip_suffix("()")) {
+            load = (category.get(verb).map(String::as_str) == Some("dlls")).then(|| verb.to_string());
+            continue;
+        }
+        if trimmed == "}" && !line.starts_with(' ') {
+            load = None;
+            continue;
+        }
+        let Some(verb) = &load else { continue };
+        if let Some(names) = trimmed.strip_prefix("w_override_dlls ") {
+            for name in names.split_whitespace().skip(1).filter(|w| w.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')) {
+                offer(format!("{name}.dll"), 1, order, verb);
+            }
+        }
+        for word in trimmed.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '*')) {
+            if word.to_lowercase().ends_with(".dll") {
+                if word.contains('*') {
+                    patterns.push((verb.clone(), word.to_lowercase(), order));
+                }
+                offer(word.to_string(), 1, order, verb);
+            }
+        }
+    }
+    let glob = |pattern: &str, name: &str| {
+        let parts: Vec<&str> = pattern.split('*').collect();
+        let mut rest = name;
+        for (i, part) in parts.iter().enumerate() {
+            match rest.find(part) {
+                Some(at) if i > 0 || at == 0 => rest = &rest[at + part.len()..],
+                _ => return false,
+            }
+        }
+        parts.last().is_some_and(|l| l.is_empty()) || rest.is_empty()
+    };
+    for (verb, pattern, order) in patterns {
+        let own = format!("{verb}.dll");
+        if glob(&pattern, &own) {
+            offer(own, 3, order, &verb);
+        }
+    }
+    best.into_iter().map(|(dll, (_, verb))| (dll, &*Box::leak(verb.into_boxed_str()))).collect()
 }
 
 /// Follows the program's imports through the DLLs next to it (where Windows looks first), and
@@ -517,6 +651,82 @@ fn tarball_url(release: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn winetricks_list() {
+        let script = r#"
+w_metadata d3dx9_43 dlls \
+    title="MS d3dx9_43.dll" \
+    installed_file1="${W_SYSTEM32_DLLS_WIN}/d3dx9_43.dll"
+
+load_d3dx9_43()
+{
+    helper_d3dx9_xx 43
+}
+
+w_metadata xinput dlls \
+    title="Microsoft XInput" \
+    installed_file1="${W_SYSTEM32_DLLS_WIN}/xinput1_1.dll"
+
+load_xinput()
+{
+    w_try_cabextract -d "${W_SYSTEM32_DLLS}" -L -F 'xinput*.dll' "${x}"
+    w_override_dlls native xinput1_3
+}
+
+w_metadata vcrun2019 dlls \
+    installed_file1="${W_SYSTEM32_DLLS_WIN}/vcruntime140.dll"
+
+load_vcrun2019()
+{
+    w_override_dlls native,builtin msvcp140 vcruntime140
+}
+
+w_metadata vcrun2022 dlls \
+    installed_file1="${W_SYSTEM32_DLLS_WIN}/vcruntime140.dll"
+
+load_vcrun2022()
+{
+    w_override_dlls native,builtin msvcp140 vcruntime140
+    w_try mv -f "${W_TMP}/win32/msvcp140_2.dll_x86" "${W_SYSTEM32_DLLS}/msvcp140_2.dll"
+}
+
+w_metadata steam apps \
+    installed_file1="${W_PROGRAMS_X86_WIN}/Steam/steam.dll"
+"#;
+        let map = winetricks_map(script);
+        assert_eq!(map.get("d3dx9_43.dll").copied(), Some("d3dx9_43"));
+        assert_eq!(map.get("xinput1_1.dll").copied(), Some("xinput"));
+        assert_eq!(map.get("xinput1_3.dll").copied(), Some("xinput"));
+        // The newer component wins; apps aren't components for DLLs.
+        assert_eq!(map.get("msvcp140.dll").copied(), Some("vcrun2022"));
+        assert_eq!(map.get("vcruntime140.dll").copied(), Some("vcrun2022"));
+        assert_eq!(map.get("msvcp140_2.dll").copied(), Some("vcrun2022"));
+        assert_eq!(map.get("steam.dll"), None);
+        // A name alone isn't a file: riched30 installs riched20.dll.
+        let r = winetricks_map("w_metadata riched30 dlls \\\n    installed_file1=\"${W_SYSTEM32_DLLS_WIN}/riched20.dll\"\n\nload_riched30()\n{\n    w_override_dlls native,builtin riched20\n}\n");
+        assert_eq!((r.get("riched30.dll"), r.get("riched20.dll").copied()), (None, Some("riched30")));
+        // Its own DLL through a wildcard: mfc42 over vcrun6sp6, which names mfc42.dll.
+        let m = winetricks_map("w_metadata mfc42 dlls \\\n    installed_file1=\"${W_SYSTEM32_DLLS_WIN}/mfc42u.dll\"\n\nload_mfc42()\n{\n    w_try_cabextract x -d y -F \"mfc42*.dll\"\n}\n\nw_metadata vcrun6sp6 dlls \\\n    installed_file1=\"${W_SYSTEM32_DLLS_WIN}/mfc42.dll\"\n");
+        assert_eq!(m.get("mfc42.dll").copied(), Some("mfc42"));
+        let x = winetricks_map("w_metadata xact dlls \\\n    installed_file1=\"${W_SYSTEM32_DLLS_WIN}/xactengine3_7.dll\"\n\nw_metadata xact_x64 dlls \\\n    installed_file1=\"${W_SYSTEM32_DLLS_WIN}/xactengine3_7.dll\"\n");
+        assert_eq!(x.get("xactengine3_7.dll").copied(), Some("xact"));
+        // A real winetricks: GAMEFIX_WINETRICKS=<script> cargo test -- --nocapture
+        if let Ok(path) = std::env::var("GAMEFIX_WINETRICKS") {
+            let map = winetricks_map(&fs::read_to_string(path).unwrap());
+            eprintln!("{} DLLs", map.len());
+            if std::env::var("GAMEFIX_WINETRICKS_ALL").is_ok() {
+                let mut all: Vec<_> = map.iter().collect();
+                all.sort();
+                for (dll, verb) in all {
+                    eprintln!("ALL {dll} {verb}");
+                }
+            }
+            for dll in ["d3dx9_43.dll", "xinput1_3.dll", "msvcp140.dll", "mfc42u.dll", "mfc42.dll", "msvbvm60.dll", "physxloader.dll", "xactengine3_7.dll", "d3dcompiler_47.dll", "x3daudio1_7.dll", "openal32.dll", "l3codeca.acm", "mscoree.dll", "vb6run.dll", "xlive.dll", "msxml4.dll", "quartz.dll", "devenum.dll", "atl71.dll", "riched30.dll", "riched20.dll"] {
+                eprintln!("  {dll} -> {:?}", map.get(dll));
+            }
+        }
+    }
 
     #[test]
     fn table_reads() {

@@ -61,7 +61,7 @@ In more detail:
   with gilrs before 0.6.8) start without controller support instead, playable with keyboard and
   mouse. Games packed in an Unreal Development
   Kit installer (`UDKInstall-<name>.exe`) are unpacked next to it instead. It can also add Windows parts an old game needs
-  (MFC, Visual Basic 6, XNA ...) to its Proton setup.
+  (MFC, Visual Basic 6, XNA, and whatever else winetricks can install) to its Proton setup.
 
 A download that hasn't finished is caught before anything runs: gamefix says which files aren't
 all there yet and leaves the game alone until they are.

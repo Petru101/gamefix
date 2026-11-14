@@ -2294,7 +2294,7 @@ fn winetricks_into(steam: &Steam, tool: &str, prefix: &Path, components: &[&str]
     }
     let list = components.join(" ");
     let installed = proton::umu_run(done).ok().zip(steam.tool_dir(tool)).is_some_and(|(umu, tool_dir)| {
-        let status = Command::new(umu).arg("winetricks").arg("-q").args(components).env("WINEPREFIX", prefix).env("PROTONPATH", tool_dir).env("GAMEID", "umu-0").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
+        let status = Command::new(umu).arg("winetricks").arg("-q").args(proton::winetricks_args(Some(&tool_dir), components)).env("WINEPREFIX", prefix).env("PROTONPATH", tool_dir).env("GAMEID", "umu-0").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
         crate::disc::wait_for_prefix(prefix);
         status.is_ok_and(|s| s.success())
     });
@@ -2551,7 +2551,8 @@ fn install_components(steam: &Steam, game: &Game, appid: u32, components: &[&str
         not_fixed.push(format!("The Windows parts it needs ({list}) go into its Proton prefix, which Steam makes the first time it starts the game: start it once (it may fail), close Steam, then run gamefix setup again."));
         return;
     }
-    let run = |mut command: Command| command.arg(appid.to_string()).arg("-q").args(components).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().is_ok_and(|s| s.success());
+    let args = proton::winetricks_args(None, components);
+    let run = |mut command: Command| command.arg(appid.to_string()).arg("-q").args(&args).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().is_ok_and(|s| s.success());
     let installed = match Command::new("protontricks").arg("--version").output() {
         Ok(_) => run(Command::new("protontricks")),
         Err(_) => {
