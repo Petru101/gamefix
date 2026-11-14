@@ -23,7 +23,7 @@ fn installed_binary() -> PathBuf {
 /// Game folders, Linux programs (some games' are marked as libraries), Windows programs and
 /// installers, disc images, and one-file games another program runs (AppImages, Java, Flash,
 /// Game Boy). A .love file is just a zip to KDE, so it's set up through its folder.
-const MIME_TYPES: &str = "inode/directory;application/x-executable;application/x-pie-executable;application/x-sharedlib;application/vnd.microsoft.portable-executable;application/x-ms-dos-executable;application/x-msdownload;application/x-cd-image;application/vnd.efi.iso;application/vnd.appimage;application/x-iso9660-appimage;application/java-archive;application/vnd.adobe.flash.movie;application/x-gameboy-rom;application/x-gameboy-color-rom;application/x-gba-rom;";
+const MIME_TYPES: &str = "inode/directory;application/x-executable;application/x-pie-executable;application/x-sharedlib;application/vnd.microsoft.portable-executable;application/x-ms-dos-executable;application/x-msdownload;application/x-cd-image;application/vnd.efi.iso;application/vnd.appimage;application/x-iso9660-appimage;application/java-archive;application/vnd.adobe.flash.movie;application/x-gameboy-rom;application/x-gameboy-color-rom;application/x-gba-rom;application/x-nes-rom;application/vnd.nintendo.snes.rom;application/x-n64-rom;application/x-genesis-rom;application/x-sms-rom;application/x-gamegear-rom;application/x-pc-engine-rom;application/x-atari-2600-rom;application/x-nintendo-ds-rom;application/x-gamecube-rom;application/x-wii-rom;application/x-dreamcast-rom;application/x-cue;";
 
 const ACTIONS: [(&str, &str, &str, &str); 6] = [
     ("check", "Check what's wrong", "dialog-information", "check"),

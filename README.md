@@ -9,7 +9,8 @@ what the game needs that your system doesn't have:
 - the old libraries it was built for, taken from Steam's runtime or your distribution's
   packages
 - the program it really runs on: the right LÖVE, Java, Python or .NET, DOSBox for DOS games,
-  Ruffle for Flash, EasyRPG for RPG Maker, mGBA for Game Boy games
+  Ruffle for Flash, EasyRPG for RPG Maker, ScummVM for classic adventure games, and emulators
+  for console games (mGBA, ares, melonDS, Dolphin, PPSSPP, Flycast)
 - for Windows games, a Proton that plays their intro videos and cutscenes (Valve's can't
   outside Steam), and the Windows parts old games expect (MFC, Visual Basic, XNA, PhysX)
 - fixes for engine quirks: old Unity menus with no text, games that crash or lose their sound
@@ -43,6 +44,12 @@ In more detail:
   - Flash games in Ruffle
   - RPG Maker 2000/2003 games in EasyRPG Player
   - Game Boy games in mGBA
+  - NES, Super Nintendo, Nintendo 64, Mega Drive, Master System, Game Gear, PC Engine and Atari
+    2600 games in ares; DS games in melonDS; GameCube and Wii games in Dolphin; PSP games in
+    PPSSPP; Dreamcast games in Flycast. PlayStation games are only reported: their emulators
+    need the console's BIOS, which you'd have to copy from your own console
+  - classic adventure games (LucasArts, Sierra, Beneath a Steel Sky ...) in ScummVM, even when
+    they came with a DOS or Windows program
   - TIC-80 cartridges in TIC-80
 - **Windows games:** it adds them to your app menu (started with Proton through
   [umu-launcher](https://github.com/Open-Wine-Components/umu-launcher), in a Wine prefix of

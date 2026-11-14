@@ -60,7 +60,10 @@ pub enum Problem {
     /// whether Steam's old runtime has each.
     Mono { file: PathBuf, mono: Option<PathBuf>, libs: Vec<(String, bool)>, standard: Vec<String> },
     /// A console cartridge (`console` names it); `mgba` is how to start an installed mGBA.
-    Rom { file: PathBuf, console: &'static str, mgba: Option<Vec<String>> },
+    Rom { file: PathBuf, console: &'static str, emulator: Option<Vec<String>> },
+    /// A game ScummVM plays from its data files (`scummvm_game`), in `dir`; `scummvm` is how to
+    /// start an installed ScummVM.
+    ScummVm { dir: PathBuf, scummvm: Option<Vec<String>> },
     /// A CD's files, with the installer among them.
     CdFiles { installer: PathBuf },
     /// Disc copy protection (SafeDisc, SecuROM) around the game's program, which Wine can't
@@ -272,6 +275,52 @@ impl Problem {
                 | Problem::Alsa32(None)
         )
     }
+}
+
+/// The folder (relative, up to two down) holding a game ScummVM plays, known by files specific
+/// to its engine: SCUMM 5/6's index (`<game>.000` beside `.001`, its first block "RNAM" or
+/// "MAXS" XOR 0x69) and 7/8's (`.la0`, plain), SCUMM 1-4's numbered `.lfl` files, Sierra SCI's
+/// `resource.map` with a volume (`resource.000`/`.001`, `ressci.000`), Sierra AGI's directories
+/// (`logdir`, `picdir`, `viewdir` with `vol.0`, or `<game>dir` with `<game>vol.0`), and freeware
+/// games' own files (Beneath a Steel Sky's sky.dsk + sky.dnr, Flight of the Amazon Queen's
+/// queen.1, Lure of the Temptress' disk1.vga + disk2.vga, Dreamweb's dreamweb.r00, Soltys'
+/// vol.cat + vol.dat, Broken Sword's swordres.rif). ScummVM's own detection confirms it at
+/// setup (`--auto-detect`).
+pub fn scummvm_game(root: &Path) -> Option<PathBuf> {
+    use std::fs;
+    use std::io::Read;
+    fn names(dir: &Path) -> Vec<String> {
+        fs::read_dir(dir).into_iter().flatten().flatten().filter(|e| e.file_type().is_ok_and(|t| t.is_file())).map(|e| e.file_name().to_string_lossy().to_lowercase()).collect()
+    }
+    let scumm_index = |file: &Path, xor: u8| {
+        let mut d = [0u8; 4];
+        fs::File::open(file).and_then(|mut f| f.read_exact(&mut d)).is_ok() && [b"RNAM", b"MAXS"].iter().any(|tag| d.iter().zip(tag.iter()).all(|(b, t)| b ^ xor == *t))
+    };
+    let is_game = |dir: &Path| {
+        let files = names(dir);
+        let has = |n: &str| files.iter().any(|f| f == n);
+        let real = |n: &str| fs::read_dir(dir).into_iter().flatten().flatten().find(|e| e.file_name().to_string_lossy().eq_ignore_ascii_case(n)).map(|e| e.path());
+        let scumm56 = files.iter().filter_map(|f| f.strip_suffix(".000")).any(|stem| has(&format!("{stem}.001")) && real(&format!("{stem}.000")).is_some_and(|p| scumm_index(&p, 0x69)));
+        let scumm78 = files.iter().filter(|f| f.ends_with(".la0")).any(|f| real(f).is_some_and(|p| scumm_index(&p, 0)));
+        let scumm14 = (has("00.lfl") || has("000.lfl")) && (has("01.lfl") || has("disk01.lec"));
+        let sci = has("resource.map") && (has("resource.000") || has("resource.001") || has("ressci.000"));
+        let agi = (has("logdir") && has("picdir") && has("viewdir") && has("vol.0")) || files.iter().filter_map(|f| f.strip_suffix("vol.0")).any(|g| !g.is_empty() && has(&format!("{g}dir")));
+        let freeware = (has("sky.dsk") && has("sky.dnr")) || has("queen.1") || has("queen.1c") || (has("disk1.vga") && has("disk2.vga")) || has("dreamweb.r00") || (has("vol.cat") && has("vol.dat")) || has("swordres.rif");
+        scumm56 || scumm78 || scumm14 || sci || agi || freeware
+    };
+    let mut todo = vec![(PathBuf::new(), 0)];
+    while let Some((rel, depth)) = todo.pop() {
+        let dir = root.join(&rel);
+        if is_game(&dir) {
+            return Some(rel);
+        }
+        if depth < 2 {
+            for e in fs::read_dir(&dir).into_iter().flatten().flatten().filter(|e| e.file_type().is_ok_and(|t| t.is_dir())) {
+                todo.push((rel.join(e.file_name()), depth + 1));
+            }
+        }
+    }
+    None
 }
 
 /// What a failed start printed that reading the game's files didn't show: a library the game
@@ -593,6 +642,13 @@ fn check_files(game: &Game, system: &System) -> Report {
     let mut report = Report { problems: Vec::new(), hint: None, hands_off: None, libs_checked: 0, windows, installers, glibc: system.glibc, packed: false, pyinstaller: false, launcher_libs: Vec::new(), appimage: None, inside_appimage: false, old_runtime: system.old_runtime.as_ref().map(|r| r.run.clone()), harmless: Vec::new() };
 
     let Some((main, elf)) = game.main() else {
+        // Classic adventure games' data (a GOG release wraps them in its own ScummVM or DOSBox,
+        // a CD carries the DOS program): ScummVM plays them, whatever program sits beside.
+        if let Some(dir) = scummvm_game(&game.root) {
+            problems.push(Problem::ScummVm { dir, scummvm: system.scummvm() });
+            report.problems = problems;
+            return report;
+        }
         match game.portable.map(|i| &game.files[i]) {
             Some(f) if matches!(f.binary, Binary::Love) => problems.push(Problem::Love { file: f.path.clone(), version: game.engine.as_ref().and_then(|e| e.version.clone()), love: system.love() }),
             Some(f) if matches!(f.binary, Binary::Jar) => {
@@ -614,7 +670,7 @@ fn check_files(game: &Game, system: &System) -> Report {
             }
             Some(f) if matches!(f.binary, Binary::Flash) => problems.push(Problem::Flash { file: f.path.clone(), ruffle: system.ruffle() }),
             Some(f) if matches!(f.binary, Binary::Tic) => problems.push(Problem::Tic { file: f.path.clone(), tic80: system.tic80() }),
-            Some(scan::Found { path, binary: Binary::Rom(console) }) => problems.push(Problem::Rom { file: path.clone(), console, mgba: system.mgba() }),
+            Some(scan::Found { path, binary: Binary::Rom(console) }) => problems.push(Problem::Rom { file: path.clone(), console, emulator: system.emulator(console) }),
             Some(f) if matches!(f.binary, Binary::Dos) => problems.push(Problem::Dos { file: f.path.clone(), dosbox: system.dosbox() }),
             Some(f) if matches!(f.binary, Binary::RpgMaker) => {
                 let dir = f.path.parent().unwrap_or(Path::new("")).to_path_buf();
@@ -1717,7 +1773,7 @@ impl Report {
                 (Binary::Jar, _) => "Java game".into(),
                 (Binary::Flash, _) => "Flash game".into(),
                 (Binary::Tic, _) => "TIC-80 cartridge".into(),
-                (Binary::Rom(console), _) => format!("{console} cartridge"),
+                (Binary::Rom(console), _) => format!("{console} game image"),
                 (Binary::Dos, _) => "DOS game".into(),
                 (Binary::Pe(_), _) if f.path.extension().is_some_and(|e| e.eq_ignore_ascii_case("dll")) => ".NET game for any system".into(),
                 (Binary::Pe(_), _) => ".NET game for Mono on Linux".into(),
@@ -1987,14 +2043,34 @@ impl Report {
                         let _ = writeln!(out, "    fetches the others into ~/.local/share/gamefix/libs.");
                     }
                 }
-                Problem::Rom { file, console, mgba: Some(mgba) } => {
-                    let _ = writeln!(out, "• This is a {console} game (a cartridge image); mGBA, which plays them, is installed:");
-                    let _ = writeln!(out, "  {} \"{}\"", mgba.join(" "), file.display());
+                Problem::Rom { file, console, emulator: Some(command) } => {
+                    let name = crate::system::emulator_for(console).map_or("its emulator", |e| e.name);
+                    let _ = writeln!(out, "• This is {} {console} game (an image of it); {name}, which plays them, is installed:", crate::system::article(console));
+                    let _ = writeln!(out, "  {} \"{}\"", command.join(" "), file.display());
                     let _ = writeln!(out, "  gamefix setup adds that to the app menu.");
                 }
-                Problem::Rom { file, console, mgba: None } => {
-                    let _ = writeln!(out, "✗ This is a {console} game ({}): a cartridge image for that console, not a program.", file.display());
-                    let _ = writeln!(out, "    Fix: mGBA from Flathub (io.mgba.mGBA) plays it: gamefix setup offers to install it,");
+                Problem::Rom { file, console, emulator: None } => match crate::system::emulator_for(console) {
+                    Some(e) => {
+                        let _ = writeln!(out, "✗ This is {} {console} game ({}): an image of it for an emulator, not a program.", crate::system::article(console), file.display());
+                        let _ = writeln!(out, "    Fix: {} from Flathub ({}) plays it: gamefix setup offers to install it,", e.name, e.app);
+                        let _ = writeln!(out, "    then adds the game to the app menu or Steam.");
+                    }
+                    None => {
+                        let _ = writeln!(out, "✗ This is {} {console} game ({}): an image of it for an emulator, not a program.", crate::system::article(console), file.display());
+                        let _ = writeln!(out, "  Its emulators (DuckStation for the PlayStation, PCSX2 for the PlayStation 2, both on");
+                        let _ = writeln!(out, "  Flathub) need the console's BIOS, copied from your own console: it can't be downloaded");
+                        let _ = writeln!(out, "  legally, so gamefix can't set this up by itself.");
+                    }
+                },
+                Problem::ScummVm { dir, scummvm: Some(command) } => {
+                    let _ = writeln!(out, "• This is a game ScummVM plays from its data files ({}); ScummVM is installed:", if dir.as_os_str().is_empty() { "this folder".to_string() } else { dir.display().to_string() });
+                    let _ = writeln!(out, "  {} --auto-detect -p \"{}\"", command.join(" "), dir.display());
+                    let _ = writeln!(out, "  gamefix setup adds that to the app menu, instead of the program that came with it.");
+                }
+                Problem::ScummVm { dir, scummvm: None } => {
+                    let _ = writeln!(out, "✗ This is a classic adventure game's data ({}): ScummVM plays it, better than", if dir.as_os_str().is_empty() { "this folder".to_string() } else { dir.display().to_string() });
+                    let _ = writeln!(out, "  the DOS or Windows program that may come with it.");
+                    let _ = writeln!(out, "    Fix: ScummVM from Flathub (org.scummvm.ScummVM): gamefix setup offers to install it,");
                     let _ = writeln!(out, "    then adds the game to the app menu or Steam.");
                 }
                 Problem::CdFiles { installer } => {
@@ -2640,6 +2716,33 @@ mod for_app_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scummvm_games() {
+        use super::scummvm_game;
+        let dir = std::env::temp_dir().join(format!("gamefix-scummvm-{}", std::process::id()));
+        let game = |name: &str, files: &[(&str, &[u8])]| {
+            let d = dir.join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            for (f, data) in files {
+                std::fs::write(d.join(f), data).unwrap();
+            }
+            d
+        };
+        // SCUMM 5: the index's first block name XOR 0x69.
+        let rnam: Vec<u8> = b"RNAM".iter().map(|b| b ^ 0x69).collect();
+        assert_eq!(scummvm_game(&game("monkey", &[("MONKEY.000", &rnam), ("MONKEY.001", b"x")])), Some(PathBuf::new()));
+        // A split archive's parts aren't: no index block.
+        assert_eq!(scummvm_game(&game("split", &[("game.000", b"7z\xbc\xaf"), ("game.001", b"x")])), None);
+        // Sierra's SCI, in a folder below (a GOG release's data/).
+        std::fs::create_dir_all(dir.join("sq3b/data")).unwrap();
+        std::fs::write(dir.join("sq3b/data/RESOURCE.MAP"), b"x").unwrap();
+        std::fs::write(dir.join("sq3b/data/RESOURCE.001"), b"x").unwrap();
+        assert_eq!(scummvm_game(&dir.join("sq3b")), Some(PathBuf::from("data")));
+        assert_eq!(scummvm_game(&game("bass", &[("sky.dsk", b"x"), ("sky.dnr", b"x")])), Some(PathBuf::new()));
+        assert_eq!(scummvm_game(&game("plain", &[("game.exe", b"MZ")])), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn start_hints() {

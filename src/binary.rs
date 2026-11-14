@@ -104,6 +104,8 @@ pub fn identify(path: &Path) -> Option<Binary> {
             None if ext == "exe" && dos(&mut f, head) => Some(Binary::Dos),
             None => None,
         }
+    } else if let Some(console) = console_image(path, &mut f, head, &ext) {
+        Some(Binary::Rom(console))
     } else if ext == "iso" && matches!(read_at(&mut f, 0x8001, 5).as_deref(), Some(b"CD001" | b"BEA01")) {
         // ISO 9660 (or UDF) volume descriptors start at sector 16.
         Some(Binary::Disc)
@@ -651,6 +653,48 @@ pub fn find_groups(path: &Path, groups: &[&[&[u8]]]) -> Vec<bool> {
         }
         carry = (longest - 1).min(end);
         buf.copy_within(end - carry..end, 0);
+    }
+}
+
+/// A console game's image: its ending, and where the console (or its disc format) has
+/// something to check, that: the NES header, the Nintendo 64's byte-order marker in its three
+/// dumps, "SEGA" at 0x100 for the Mega Drive, the Nintendo logo in a DS cartridge's header,
+/// GameCube's and Wii's disc magic numbers, the system name an ISO 9660 image of a PSP or
+/// PlayStation disc carries at 0x8008 ("PSP GAME", "PLAYSTATION"; at sector 16 of a raw
+/// 2352-byte image for a PlayStation .bin, or the .bin a .cue names). Super Nintendo, Master
+/// System, Game Gear, PC Engine and Atari 2600 images have nothing to check: their ending.
+fn console_image(path: &Path, f: &mut File, head: &[u8], ext: &str) -> Option<&'static str> {
+    const N64: [&[u8]; 3] = [b"\x80\x37\x12\x40", b"\x37\x80\x40\x12", b"\x40\x12\x37\x80"];
+    let playstation = |f: &mut File| {
+        // ISO (2048-byte sectors), then raw Mode 2 (24 bytes in) and Mode 1 (16 in).
+        [0x8008u64, 16 * 2352 + 24 + 8, 16 * 2352 + 16 + 8].iter().any(|&at| read_at(f, at, 11).as_deref() == Some(b"PLAYSTATION"))
+    };
+    match ext {
+        "nes" if head.starts_with(b"NES\x1a") => Some("NES"),
+        "sfc" | "smc" => Some("Super Nintendo"),
+        "z64" | "n64" | "v64" if N64.iter().any(|m| head.starts_with(m)) => Some("Nintendo 64"),
+        "md" | "gen" | "bin" if read_at(f, 0x100, 4).as_deref() == Some(b"SEGA") => Some("Mega Drive"),
+        "sms" => Some("Master System"),
+        "gg" => Some("Game Gear"),
+        "pce" => Some("PC Engine"),
+        "a26" => Some("Atari 2600"),
+        "nds" if read_at(f, 0xC0, 8).as_deref() == Some(GBA_LOGO) => Some("Nintendo DS"),
+        "iso" | "gcm" if read_at(f, 0x1C, 4).as_deref() == Some(b"\xC2\x33\x9F\x3D") => Some("GameCube"),
+        "iso" if read_at(f, 0x18, 4).as_deref() == Some(b"\x5D\x1C\x9E\xA3") => Some("Wii"),
+        "rvz" if head.starts_with(b"RVZ\x01") => Some("GameCube or Wii"),
+        "wbfs" if head.starts_with(b"WBFS") => Some("Wii"),
+        "iso" if read_at(f, 0x8008, 8).as_deref() == Some(b"PSP GAME") => Some("PSP"),
+        "cso" if head.starts_with(b"CISO") => Some("PSP"),
+        "iso" | "bin" if playstation(f) => Some("PlayStation"),
+        "cue" => {
+            let text = std::fs::read_to_string(path).ok()?;
+            let bin = text.lines().find_map(|l| l.trim().strip_prefix("FILE ")?.split('"').nth(1).map(String::from))?;
+            let mut data = File::open(path.with_file_name(bin)).ok()?;
+            playstation(&mut data).then_some("PlayStation")
+        }
+        "gdi" if head.iter().take_while(|b| **b != b'\n').all(|b| b.is_ascii_digit() || b.is_ascii_whitespace()) && head.first().is_some_and(u8::is_ascii_digit) => Some("Dreamcast"),
+        "cdi" => Some("Dreamcast"),
+        _ => None,
     }
 }
 
@@ -1232,6 +1276,42 @@ mod tests {
         assert_eq!(console("b.gbc"), Some("Game Boy Color"));
         assert_eq!(console("c.gba"), Some("Game Boy Advance"));
         assert_eq!(console("d.gb"), None);
+        // Other consoles, by what each checks.
+        let write = |n: &str, data: Vec<u8>| std::fs::write(dir.join(n), data).unwrap();
+        let at = |size: usize, off: usize, bytes: &[u8]| {
+            let mut v = vec![0u8; size];
+            v[off..off + bytes.len()].copy_from_slice(bytes);
+            v
+        };
+        write("g.nes", b"NES\x1a\x02\x01".to_vec());
+        write("h.nes", b"not a rom".to_vec());
+        write("i.z64", b"\x80\x37\x12\x40rest".to_vec());
+        write("j.md", at(0x200, 0x100, b"SEGA MEGA DRIVE"));
+        write("k.bin", at(0x200, 0x100, b"SEGA GENESIS"));
+        write("l.bin", vec![0u8; 0x200]);
+        let mut nds = vec![0u8; 0x200];
+        nds[0xC0..0xC8].copy_from_slice(super::GBA_LOGO);
+        write("m.nds", nds);
+        write("n.iso", at(0x40, 0x1C, b"\xC2\x33\x9F\x3D"));
+        write("o.iso", at(0x9000, 0x8008, b"PSP GAME"));
+        write("p.iso", at(0x9000, 0x8008, b"PLAYSTATION"));
+        write("q.bin", at(0xA000, 16 * 2352 + 24 + 8, b"PLAYSTATION"));
+        write("q.cue", b"FILE \"q.bin\" BINARY\n  TRACK 01 MODE2/2352\n".to_vec());
+        write("r.gdi", b"3\n1 0 4 2352 track01.bin 0\n".to_vec());
+        let mut pc = at(0x9000, 0x8001, b"CD001");
+        pc[0x8008..0x800D].copy_from_slice(b"WIN32");
+        write("s.iso", pc);
+        assert_eq!(console("g.nes"), Some("NES"));
+        assert_eq!(console("h.nes"), None);
+        assert_eq!(console("i.z64"), Some("Nintendo 64"));
+        assert_eq!((console("j.md"), console("k.bin"), console("l.bin")), (Some("Mega Drive"), Some("Mega Drive"), None));
+        assert_eq!(console("m.nds"), Some("Nintendo DS"));
+        assert_eq!(console("n.iso"), Some("GameCube"));
+        assert_eq!(console("o.iso"), Some("PSP"));
+        assert_eq!((console("p.iso"), console("q.cue")), (Some("PlayStation"), Some("PlayStation")));
+        assert_eq!(console("r.gdi"), Some("Dreamcast"));
+        // A PC game's disc image stays one.
+        assert!(matches!(super::identify(&dir.join("s.iso")), Some(super::Binary::Disc)));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

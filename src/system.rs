@@ -35,6 +35,54 @@ pub fn runtime_run(path: &str) -> bool {
     path.file_name().is_some_and(|n| n == "run.sh") && path.parent().and_then(Path::file_name).is_some_and(|d| d == "steam-runtime" || d == "LegacySteamRuntime")
 }
 
+/// An emulator: its name, Flathub app, program name outside Flathub, and the arguments that go
+/// before the game's file.
+pub struct Emulator {
+    pub name: &'static str,
+    pub app: &'static str,
+    pub program: &'static str,
+    pub args: &'static [&'static str],
+}
+
+/// The emulator for a console's games (`binary::console_image`'s names), one each, all on
+/// Flathub and needing no BIOS: mGBA for the Game Boys; ares (one app, `--system` picking the
+/// console; `--no-file-prompt` skips its question about a 64DD disc) for NES, Super Nintendo,
+/// Nintendo 64, Mega Drive, Master System, Game Gear, PC Engine, Atari 2600; melonDS for the
+/// DS; Dolphin for GameCube and Wii (`-b`: quit with the game, `-e`: run this file); PPSSPP for
+/// the PSP; Flycast for the Dreamcast (its own BIOS stand-in plays most games). None for the
+/// PlayStation: DuckStation and PCSX2 won't start without Sony's BIOS, which can't be
+/// downloaded legally.
+pub fn emulator_for(console: &str) -> Option<Emulator> {
+    let ares = |system: &'static [&'static str]| Emulator { name: "ares", app: "dev.ares.ares", program: "ares", args: system };
+    Some(match console {
+        "Game Boy" | "Game Boy Color" | "Game Boy Advance" => Emulator { name: "mGBA", app: "io.mgba.mGBA", program: "mgba-qt", args: &[] },
+        "NES" => ares(&["--system", "Famicom"]),
+        "Super Nintendo" => ares(&["--system", "Super Famicom"]),
+        "Nintendo 64" => ares(&["--system", "Nintendo 64", "--no-file-prompt"]),
+        "Mega Drive" => ares(&["--system", "Mega Drive"]),
+        "Master System" => ares(&["--system", "Master System"]),
+        "Game Gear" => ares(&["--system", "Game Gear"]),
+        "PC Engine" => ares(&["--system", "PC Engine"]),
+        "Atari 2600" => ares(&["--system", "Atari 2600"]),
+        "Nintendo DS" => Emulator { name: "melonDS", app: "net.kuribo64.melonDS", program: "melonDS", args: &[] },
+        "GameCube" | "Wii" | "GameCube or Wii" => Emulator { name: "Dolphin", app: "org.DolphinEmu.dolphin-emu", program: "dolphin-emu", args: &["-b", "-e"] },
+        "PSP" => Emulator { name: "PPSSPP", app: "org.ppsspp.PPSSPP", program: "PPSSPPSDL", args: &[] },
+        "Dreamcast" => Emulator { name: "Flycast", app: "org.flycast.Flycast", program: "flycast", args: &[] },
+        _ => return None,
+    })
+}
+
+/// "a" or "an" before a console's name, as it's said ("an NES game", "an Atari 2600 game").
+pub fn article(console: &str) -> &'static str {
+    if console == "NES" || console.starts_with(['A', 'E', 'I', 'O', 'U']) { "an" } else { "a" }
+}
+
+/// Whether a Flathub app is installed, for the system or the user.
+pub fn flatpak_installed(app: &str) -> bool {
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+    [PathBuf::from("/var/lib/flatpak"), home.join(".local/share/flatpak")].iter().any(|d| d.join("app").join(app).join("current").exists())
+}
+
 impl OldRuntime {
     pub(crate) fn find() -> Option<OldRuntime> {
         let home = PathBuf::from(std::env::var_os("HOME")?);
@@ -218,17 +266,25 @@ impl System {
         std::env::split_paths(&path).map(|d| d.join("tic80")).find(|l| l.is_file()).map(|l| vec![l.display().to_string(), "--skip".into()])
     }
 
-    /// How to start mGBA, which plays Game Boy (Color, Advance) cartridges: Flathub's (it may
-    /// read and write the whole file system, so its saves land beside the cartridge as on a
-    /// desktop install), else an `mgba-qt` on the PATH.
-    pub fn mgba(&self) -> Option<Vec<String>> {
-        let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
-        let flatpak = [PathBuf::from("/var/lib/flatpak"), home.join(".local/share/flatpak")].iter().any(|d| d.join("app/io.mgba.mGBA/current").exists());
-        if flatpak {
-            return Some(vec!["flatpak".into(), "run".into(), "io.mgba.mGBA".into()]);
+    /// How to start the emulator that plays a console's games (`emulator_for`): its Flathub app
+    /// if installed (system or user), with its arguments, else its program on the PATH. None
+    /// when it isn't installed, or no emulator here plays it without a BIOS (PlayStation).
+    pub fn emulator(&self, console: &str) -> Option<Vec<String>> {
+        let e = emulator_for(console)?;
+        if flatpak_installed(e.app) {
+            return Some(["flatpak", "run", e.app].iter().chain(e.args).map(|s| s.to_string()).collect());
         }
         let path = std::env::var_os("PATH").unwrap_or_default();
-        std::env::split_paths(&path).map(|d| d.join("mgba-qt")).find(|l| l.is_file()).map(|l| vec![l.display().to_string()])
+        std::env::split_paths(&path).map(|d| d.join(e.program)).find(|l| l.is_file()).map(|l| std::iter::once(l.display().to_string()).chain(e.args.iter().map(|s| s.to_string())).collect())
+    }
+
+    /// How to start ScummVM, which plays classic adventure games from their data files.
+    pub fn scummvm(&self) -> Option<Vec<String>> {
+        if flatpak_installed("org.scummvm.ScummVM") {
+            return Some(vec!["flatpak".into(), "run".into(), "org.scummvm.ScummVM".into()]);
+        }
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        std::env::split_paths(&path).map(|d| d.join("scummvm")).find(|l| l.is_file()).map(|l| vec![l.display().to_string()])
     }
 
     /// How to start EasyRPG Player, which plays RPG Maker 2000/2003 games: Flathub's (it sees

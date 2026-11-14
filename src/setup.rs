@@ -411,7 +411,24 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
                 }
                 Some((command, file, "TIC-80"))
             }
-            Problem::Rom { file, mgba: Some(mgba), .. } => Some((mgba.clone(), file, "mGBA")),
+            // Flathub's emulators see the game's folder (saves may go beside the image: mGBA's).
+            Problem::Rom { file, console, emulator: Some(emulator) } => {
+                let mut command = emulator.clone();
+                if command[0] == "flatpak" {
+                    let dir = game.root.join(file).parent().map(|d| d.display().to_string()).unwrap_or_default();
+                    command.insert(2, format!("--filesystem={dir}"));
+                }
+                Some((command, file, crate::system::emulator_for(console).map_or("its emulator", |e| e.name)))
+            }
+            // ScummVM finds the game in its folder and starts it (`--auto-detect -p <folder>`).
+            Problem::ScummVm { dir, scummvm: Some(scummvm) } => {
+                let mut command = scummvm.clone();
+                if command[0] == "flatpak" {
+                    command.insert(2, format!("--filesystem={}:ro", game.root.join(dir).display()));
+                }
+                command.extend(["--auto-detect".to_string(), "-p".to_string()]);
+                Some((command, dir, "ScummVM"))
+            }
             // EasyRPG writes saves into the game's folder; Flathub's sees only the home folder.
             Problem::RpgMaker { dir, easyrpg: Some(easyrpg), .. } => {
                 let mut command = easyrpg.clone();
@@ -859,7 +876,7 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
             Problem::Alsa32(None) => not_fixed.push("Its 32-bit ALSA sound: needs Steam's runtime (install Steam), which has a plugin that works.".into()),
             Problem::KickFiles(files) => not_fixed.push(format!("Its missing Mono files ({}): only the developer can add them; the .exe with Proton works.", files.join(", "))),
             Problem::FnaLibs(libs) => not_fixed.push(format!("Its missing native libraries ({}): get FNA's fnalibs, or use the Windows download with Proton.", libs.join(", "))),
-            Problem::NoLinuxBuild | Problem::UnityDataMissing(_) | Problem::LinuxInstaller(_) | Problem::UdkInstaller(_) | Problem::Unfinished(_) | Problem::OwnWindowsDlls(_) | Problem::GamepadCrash(_) | Problem::UmuBlocked | Problem::MissingWindowsParts(_) | Problem::Source(..) | Problem::Web(_) | Problem::UnityWeb(_) | Problem::Damaged(_) | Problem::Package(..) | Problem::Flash { .. } | Problem::Tic { .. } | Problem::Rom { .. } | Problem::Mono { .. } | Problem::Dotnet { .. } | Problem::RpgMaker { .. } | Problem::RpgMakerPacked { .. } | Problem::RgssRtp(_) | Problem::Dos { .. } | Problem::Disc { .. } | Problem::CdFiles { .. } | Problem::Protected { .. } | Problem::Archive(_) | Problem::WrongMachine(_) | Problem::Love { .. } | Problem::Python { .. } | Problem::Java { .. } => {}
+            Problem::NoLinuxBuild | Problem::UnityDataMissing(_) | Problem::LinuxInstaller(_) | Problem::UdkInstaller(_) | Problem::Unfinished(_) | Problem::OwnWindowsDlls(_) | Problem::GamepadCrash(_) | Problem::UmuBlocked | Problem::MissingWindowsParts(_) | Problem::Source(..) | Problem::Web(_) | Problem::UnityWeb(_) | Problem::Damaged(_) | Problem::Package(..) | Problem::Flash { .. } | Problem::Tic { .. } | Problem::Rom { .. } | Problem::ScummVm { .. } | Problem::Mono { .. } | Problem::Dotnet { .. } | Problem::RpgMaker { .. } | Problem::RpgMakerPacked { .. } | Problem::RgssRtp(_) | Problem::Dos { .. } | Problem::Disc { .. } | Problem::CdFiles { .. } | Problem::Protected { .. } | Problem::Archive(_) | Problem::WrongMachine(_) | Problem::Love { .. } | Problem::Python { .. } | Problem::Java { .. } => {}
         }
     }
     if !preload.is_empty() {
@@ -984,7 +1001,9 @@ pub struct Runner {
 /// (no Linux program, no Windows one, no other runner installed). Installing it is the
 /// caller's to offer: it asks first.
 pub fn missing_runner(game: &Game, report: &Report) -> Option<Runner> {
-    if game.main().is_some() || game.windows.is_some() {
+    // A ScummVM game's folder may carry GOG's Windows ScummVM or the DOS program.
+    let scummvm = report.problems.iter().any(|p| matches!(p, Problem::ScummVm { .. }));
+    if game.main().is_some() || (game.windows.is_some() && !scummvm) {
         return None;
     }
     let runnable = report.problems.iter().any(|p| match p {
@@ -992,7 +1011,8 @@ pub fn missing_runner(game: &Game, report: &Report) -> Option<Runner> {
         Problem::Love { love, version, .. } => love.is_some() || crate::check::old_love(version.as_deref()),
         Problem::Flash { ruffle, .. } => ruffle.is_some(),
         Problem::Tic { tic80, .. } => tic80.is_some(),
-        Problem::Rom { mgba, .. } => mgba.is_some(),
+        Problem::Rom { emulator, .. } => emulator.is_some(),
+        Problem::ScummVm { scummvm, .. } => scummvm.is_some(),
         Problem::RpgMaker { easyrpg, .. } => easyrpg.is_some(),
         Problem::Mono { mono, .. } => mono.is_some(),
         Problem::Dos { dosbox, .. } => dosbox.is_some(),
@@ -1005,7 +1025,8 @@ pub fn missing_runner(game: &Game, report: &Report) -> Option<Runner> {
         Problem::Love { love: None, .. } => Some(Runner { name: "LÖVE", app: "org.love2d.love2d" }),
         Problem::Flash { ruffle: None, .. } => Some(Runner { name: "Ruffle", app: "rs.ruffle.Ruffle" }),
         Problem::Tic { tic80: None, .. } => Some(Runner { name: "TIC-80", app: "com.tic80.TIC_80" }),
-        Problem::Rom { mgba: None, .. } => Some(Runner { name: "mGBA", app: "io.mgba.mGBA" }),
+        Problem::Rom { emulator: None, console, .. } => crate::system::emulator_for(console).map(|e| Runner { name: e.name, app: e.app }),
+        Problem::ScummVm { scummvm: None, .. } => Some(Runner { name: "ScummVM", app: "org.scummvm.ScummVM" }),
         Problem::RpgMaker { easyrpg: None, .. } => Some(Runner { name: "EasyRPG Player", app: "org.easyrpg.player" }),
         Problem::Dos { dosbox: None, .. } => Some(Runner { name: "DOSBox Staging", app: "io.github.dosbox-staging" }),
         _ => None,
@@ -1046,7 +1067,11 @@ fn runner_needed(report: &Report) -> Option<String> {
         Problem::Flash { ruffle: None, .. } => Some(format!("This is a Flash game; it plays in Ruffle, which isn't installed. Install Ruffle from Discover (it's on Flathub), {then}")),
         Problem::Tic { tic80: None, .. } => Some(format!("This is a TIC-80 game; it plays in TIC-80, which isn't installed. Install TIC-80 from Discover (it's on Flathub), {then}")),
         Problem::Mono { mono: None, .. } => Some(format!("This is a .NET game built for Mono, and Mono isn't installed: {}, {then}", crate::distro::how_to_install(&crate::distro::MONO, "it"))),
-        Problem::Rom { mgba: None, console, .. } => Some(format!("This is a {console} game; it plays in mGBA, which isn't installed. Install mGBA from Discover (it's on Flathub), {then}")),
+        Problem::Rom { emulator: None, console, .. } => Some(match crate::system::emulator_for(console) {
+            Some(e) => format!("This is {} {console} game; it plays in {}, which isn't installed. Install {} from Discover (it's on Flathub), {then}", crate::system::article(console), e.name, e.name),
+            None => format!("This is {} {console} game; its emulators need the console's BIOS, which can't be downloaded legally (see gamefix check).", crate::system::article(console)),
+        }),
+        Problem::ScummVm { scummvm: None, .. } => Some(format!("This is a game ScummVM plays, and ScummVM isn't installed. Install ScummVM from Discover (it's on Flathub), {then}")),
         Problem::RpgMaker { easyrpg: None, .. } => Some(format!("This is an RPG Maker 2000/2003 game; it plays in EasyRPG Player, which isn't installed. Install EasyRPG Player from Discover (it's on Flathub), {then}")),
         Problem::Dos { dosbox: None, .. } => Some(format!("This is a DOS game; it runs in DOSBox Staging, which isn't installed. Install DOSBox Staging from Discover (it's on Flathub), {then}")),
         Problem::Python { v2: true, .. } => Some("This is a Python 2 game; Python 2 is gone from current systems (see gamefix check).".into()),
