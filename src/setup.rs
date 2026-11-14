@@ -1470,6 +1470,15 @@ fn program_path(name: &str) -> Option<PathBuf> {
     std::env::split_paths(&path).map(|d| d.join(name)).find(|p| p.is_file())
 }
 
+/// The name of the folder an install's Wine prefix gets: the game's, when the game is in it;
+/// "<game> (Windows setup)" when the installer put the game elsewhere, often beside it under
+/// the game's own name (Mycopunk's repack: the game in E:\Mycopunk, its prefix "Mycopunk 2",
+/// which read like a second copy).
+fn setup_folder_name(name: &str, game_inside: bool) -> String {
+    let base = folder_name(name);
+    if game_inside { base } else { format!("{base} (Windows setup)") }
+}
+
 /// What a Windows game is installed from.
 enum Installer {
     /// A disc image and the installer's path on it.
@@ -1756,7 +1765,7 @@ fn setup_install(game: &Game, installer: Installer, targets: &Targets) -> Result
                 }
             };
             // Named after the game now that its name is known (Bookworm Deluxe, not the download's).
-            let named = free(&folder_name(&name));
+            let named = free(&setup_folder_name(&name, exe.starts_with(&prefix)));
             let renamed = fs::rename(&prefix, &named).is_ok();
             let exe = match exe.strip_prefix(&prefix) {
                 Ok(rel) if renamed => named.join(rel),
@@ -2715,6 +2724,13 @@ fn refresh_menu() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn setup_folder_names() {
+        assert_eq!(setup_folder_name("Bookworm Deluxe", true), "Bookworm Deluxe");
+        assert_eq!(setup_folder_name("Mycopunk", false), "Mycopunk (Windows setup)");
+        assert_eq!(setup_folder_name("A/B", false), "A B (Windows setup)");
+    }
 
     #[test]
     fn repoints_whole_paths_only() {
