@@ -211,12 +211,28 @@ pub fn scan(path: &Path) -> Option<Game> {
         Some(i) if matches!(files[i].binary, Binary::RpgMaker) => Some(Engine { name: "RPG Maker 2000/2003", version: None, guess: None }),
         _ => program.and_then(|i| engine(&root, &files[i].path, &files)),
     };
-    let name = program
-        .and_then(|i| unity_product(&root, &files[i].path))
-        .or_else(|| chosen.as_ref().filter(|_| among_others).map(|c| file_title(&root, c)))
+    let unity = program.and_then(|i| unity_product(&root, &files[i].path));
+    let lone = chosen.as_ref().filter(|_| among_others).map(|c| file_title(&root, c));
+    // The title the game's own files give (NW.js, RPG Maker MV/MZ): a folder named "mz-kh4"
+    // or "Game49-Win64/Windows" says little. Not for a file among other downloads.
+    let program_dir = program.or(portable).map(|i| root.join(files[i].path.parent().unwrap_or(Path::new(""))));
+    let own = if among_others { None } else { program_dir.as_deref().and_then(own_title).or_else(|| own_title(&root)) };
+    let name = unity
+        .clone()
+        .or_else(|| lone.clone())
+        .or(own)
         .or_else(|| chosen.as_ref().and_then(|_| folder_title(&root)))
+        .or_else(|| platform_title(&root))
         .or_else(|| root.file_name().map(|n| n.to_string_lossy().into_owned()))
         .unwrap_or_else(|| root.display().to_string());
+    // A game set up under the name it had before these rules keeps that name: its record, menu
+    // entry and Windows prefix (settings, saves) go by it.
+    let earlier = unity
+        .or(lone)
+        .or_else(|| chosen.as_ref().and_then(|_| earlier_folder_title(&root)))
+        .or_else(|| root.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| root.display().to_string());
+    let name = if earlier != name && crate::setup::set_up_as(&earlier) && !crate::setup::set_up_as(&name) { earlier } else { name };
     let alone = chosen.filter(|c| among_others || files.iter().any(|f| &f.path == c && matches!(f.binary, Binary::Archive | Binary::Disc)));
     Some(Game { root, name, files, main, windows, portable, cd_installer, linux_installer, packed, disc, archive, engine, alone })
 }
@@ -264,9 +280,49 @@ fn generic(name: &str) -> bool {
 }
 
 /// The name of the folder a file is in, or of the nearest folder above with a name that isn't
-/// generic (Harry Potter's CD: `HARRY_POTTER/setup/Setup.exe`).
+/// generic (Harry Potter's CD: `HARRY_POTTER/setup/Setup.exe`), or above a platform folder.
 fn folder_title(dir: &Path) -> Option<String> {
+    dir.ancestors().find_map(|d| platform_title(d).or_else(|| d.file_name().map(|n| n.to_string_lossy().into_owned()).filter(|n| !generic(n) && !platform_folder(n))))
+}
+
+/// folder_title before platform folders were known: what games set up then were named.
+fn earlier_folder_title(dir: &Path) -> Option<String> {
     dir.ancestors().filter_map(|d| d.file_name()).map(|n| n.to_string_lossy().into_owned()).find(|n| !generic(n))
+}
+
+/// A folder a packaged game's files sit in for one system (Unreal's Windows, WindowsNoEditor,
+/// Linux ...): what it's for, not the game's name.
+fn platform_folder(name: &str) -> bool {
+    ["windows", "windowsnoeditor", "windowsclient", "win64", "win32", "linux", "linuxnoeditor", "linux64", "linuxarm64"].contains(&name.to_lowercase().as_str())
+}
+
+/// For a platform folder, the name of the folder above it without its own platform ending
+/// and build type ("Game49-Win64/Windows", "Game49-Linux-Dev/Linux" → "Game49"): a packaged
+/// Unreal game was named "windows".
+fn platform_title(dir: &Path) -> Option<String> {
+    if !platform_folder(&dir.file_name()?.to_string_lossy()) {
+        return None;
+    }
+    let name = dir.parent()?.file_name()?.to_string_lossy().into_owned();
+    let mut words: Vec<&str> = name.split(['-', '_', ' ']).collect();
+    while words.len() > 1 && words.last().is_some_and(|w| platform_folder(w) || ["x64", "x86", "shipping", "dev", "development", "debuggame"].contains(&w.to_lowercase().as_str())) {
+        words.pop();
+    }
+    let title = words.join(" ").trim().to_string();
+    (!title.is_empty() && !platform_folder(&title) && !generic(&title)).then_some(title)
+}
+
+/// The game's title from its own files: NW.js's package.json (`window.title`, else
+/// `productName`), RPG Maker MV/MZ's `data/System.json` (`gameTitle`). MZ names its package
+/// "rmmz-game" and MV's says "rmmv": skipped.
+fn own_title(dir: &Path) -> Option<String> {
+    use crate::gog::Json;
+    let json = |f: &str| fs::read_to_string(dir.join(f)).ok().and_then(|t| Json::parse(t.trim_start_matches('\u{feff}')));
+    let text = |v: Option<&Json>| v.and_then(Json::str).map(str::trim).filter(|t| !t.is_empty() && !t.to_lowercase().starts_with("rmm") && !t.contains(['\n', '\r', '\t'])).map(String::from);
+    let package = json("package.json");
+    text(package.as_ref().and_then(|p| p.get("window")?.get("title")))
+        .or_else(|| text(package.as_ref().and_then(|p| p.get("productName"))))
+        .or_else(|| ["data/System.json", "www/data/System.json"].iter().find_map(|f| text(json(f).as_ref().and_then(|s| s.get("gameTitle")))))
 }
 
 /// A file's name as the game's, with its folder's before a generic one ("Downloads setup").
@@ -907,7 +963,7 @@ fn unity_product(root: &Path, main: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{file_title, folder_title, love_guess_code};
+    use super::{file_title, folder_title, love_guess_code, own_title, platform_title};
     use std::path::Path;
 
     #[test]
@@ -916,6 +972,29 @@ mod tests {
         assert_eq!(folder_title(Path::new("/d/HARRY_POTTER/setup")).as_deref(), Some("HARRY_POTTER"));
         assert_eq!(file_title(Path::new("/home/u/Downloads"), Path::new("setup.exe")), "Downloads setup");
         assert_eq!(file_title(Path::new("/home/u/Downloads"), Path::new("xmoon.exe")), "xmoon");
+        // A packaged Unreal game: the folder above its platform folder, without "-Win64".
+        assert_eq!(platform_title(Path::new("/b/Game49-Win64/Windows")).as_deref(), Some("Game49"));
+        assert_eq!(platform_title(Path::new("/b/My Game/LinuxNoEditor")).as_deref(), Some("My Game"));
+        assert_eq!(platform_title(Path::new("/b/Game49-Linux-Dev/Linux")).as_deref(), Some("Game49"));
+        assert_eq!(platform_title(Path::new("/b/Game49-Win64")), None);
+        assert_eq!(platform_title(Path::new("/b/game/Windows")), None);
+        assert_eq!(folder_title(Path::new("/b/Game49-Win64/Windows")).as_deref(), Some("Game49"));
+    }
+
+    #[test]
+    fn titles_from_the_games_files() {
+        let dir = std::env::temp_dir().join(format!("gamefix-title-test-{}", std::process::id()));
+        let mz = dir.join("mz-kh4/game");
+        std::fs::create_dir_all(mz.join("data")).unwrap();
+        // RPG Maker MZ: its package says "rmmz-game", System.json has the title.
+        std::fs::write(mz.join("package.json"), "{\"name\": \"rmmz-game\", \"window\": {\"title\": \"\", \"width\": 816}}").unwrap();
+        std::fs::write(mz.join("data/System.json"), "\u{feff}{\"advanced\": {}, \"gameTitle\": \"Knight's Hollow\"}").unwrap();
+        assert_eq!(own_title(&mz).as_deref(), Some("Knight's Hollow"));
+        // NW.js: the window's title first.
+        std::fs::write(mz.join("package.json"), "{\"productName\": \"kh\", \"window\": {\"title\": \"Knight's Hollow Deluxe\"}}").unwrap();
+        assert_eq!(own_title(&mz).as_deref(), Some("Knight's Hollow Deluxe"));
+        assert_eq!(own_title(&dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

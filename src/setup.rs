@@ -68,7 +68,16 @@ pub fn slug(name: &str) -> String {
 }
 
 pub fn record_path(game: &Game) -> PathBuf {
-    data_home().join("gamefix/games").join(format!("{}.log", slug(&game.name)))
+    record_for(&game.name)
+}
+
+fn record_for(name: &str) -> PathBuf {
+    data_home().join("gamefix/games").join(format!("{}.log", slug(name)))
+}
+
+/// Whether a game named this has been set up (has a record).
+pub fn set_up_as(name: &str) -> bool {
+    record_for(name).exists()
 }
 
 /// The wrapper a game's record names (`wrapper\t<word>\t<word>...`), if any.
@@ -1396,6 +1405,37 @@ fn remove_links(link: &Path) {
 /// In a folder setup_install installed a game into: what from, the program, its name.
 const INSTALL_NOTE: &str = "gamefix-install.txt";
 
+/// The top folder an install made around its program: from the program's folder up while each
+/// was created at or after `since` (Unix time), stopping below a drive's top, the prefix,
+/// Windows' own folders (Program Files, users ...) and a Games folder (C:\Games\Harry Potter).
+/// None when the program's own folder is older or the drive doesn't keep creation times
+/// (ntfs-3g): an older folder could hold other games, and a launcher may delete what this names.
+fn install_folder(exe: &Path, prefix: &Path, drives: &[PathBuf], since: i64) -> Option<PathBuf> {
+    let new = |dir: &Path| {
+        fs::metadata(dir).and_then(|m| m.created()).ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).is_some_and(|t| t.as_secs() as i64 >= since)
+    };
+    let windows_own = ["drive_c", "pfx", "program files", "program files (x86)", "programdata", "users", "windows", "appdata", "local", "locallow", "roaming", "documents", "my documents", "desktop", "saved games", "games"];
+    let stop = |dir: &Path| {
+        dir == prefix
+            || dir.parent().is_none()
+            || drives.iter().any(|d| d == dir)
+            || dir.file_name().is_some_and(|n| windows_own.contains(&n.to_string_lossy().to_lowercase().as_str()))
+    };
+    let mut folder = exe.parent()?;
+    if stop(folder) || !new(folder) {
+        return None;
+    }
+    while let Some(up) = folder.parent().filter(|up| !stop(up) && new(up)) {
+        folder = up;
+    }
+    Some(folder.to_path_buf())
+}
+
+/// The install note's `folder` line: from the prefix when inside it, like `program`.
+fn folder_line(folder: &Path, prefix: &Path) -> String {
+    format!("folder\t{}\n", folder.strip_prefix(prefix).unwrap_or(folder).display())
+}
+
 /// A Windows game that has to be installed first (a disc image, an installer): runs the
 /// installer once with Proton (umu-run, with the Proton Steam will use) in a prefix of its own
 /// in ~/Games, then adds the installed program to Steam, with launch options pointing Steam at
@@ -1453,7 +1493,18 @@ fn setup_install(game: &Game, installer: Installer, targets: &Targets) -> Result
         }
     };
     let (prefix, exe, name) = match earlier {
-        Some(found) => found,
+        Some((prefix, exe, name)) => {
+            // Installed before notes named the game's folder: found now, the prefix having been
+            // made at the install's start.
+            let note = prefix.join(INSTALL_NOTE);
+            if let Ok(text) = fs::read_to_string(&note) {
+                let since = fs::metadata(&prefix).and_then(|m| m.created()).ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|t| t.as_secs() as i64);
+                if let Some(folder) = since.filter(|_| !text.lines().any(|l| l.starts_with("folder\t"))).and_then(|since| install_folder(&exe, &prefix, &[], since)) {
+                    let _ = fs::write(&note, format!("{}{}", text, folder_line(&folder, &prefix)));
+                }
+            }
+            (prefix, exe, name)
+        }
         None => {
             let umu = program_path("umu-run").ok_or("umu-run (umu-launcher) is needed to run the installer with Proton.")?;
             let free = |base: &str| (1..).map(|n| games.join(if n == 1 { base.to_string() } else { format!("{base} {n}") })).find(|d| !d.exists()).unwrap();
@@ -1596,7 +1647,10 @@ fn setup_install(game: &Game, installer: Installer, targets: &Targets) -> Result
                     done.push(format!("Checked the {} files the repack's fitgirl.md5 lists: all there and matching.", checked.listed));
                 }
             }
-            let note = format!("source\t{}\nprogram\t{}\nname\t{name}\n", source.display(), program.display());
+            // The game's whole folder, for a launcher that moves, sandboxes or removes it: the
+            // top folder the installer made around the program, inside the prefix or out.
+            let folder = install_folder(&exe, &prefix, &roots, started).map(|f| folder_line(&f, &prefix));
+            let note = format!("source\t{}\nprogram\t{}\nname\t{name}\n{}", source.display(), program.display(), folder.unwrap_or_default());
             fs::write(prefix.join(INSTALL_NOTE), note).map_err(|e| e.to_string())?;
             done.push(if exe.starts_with(&prefix) {
                 format!("Installed it with {tool} into {}.", prefix.display())

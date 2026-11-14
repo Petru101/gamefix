@@ -93,9 +93,9 @@ fn split_args(line: &str) -> Vec<String> {
     out
 }
 
-/// Just enough JSON for GOG's .info files.
+/// Just enough JSON for GOG's .info files (and games' package.json, RPG Maker's System.json).
 #[derive(Debug, PartialEq)]
-enum Json {
+pub(crate) enum Json {
     Null,
     Bool(bool),
     Num(String),
@@ -105,21 +105,21 @@ enum Json {
 }
 
 impl Json {
-    fn parse(text: &str) -> Option<Json> {
+    pub(crate) fn parse(text: &str) -> Option<Json> {
         let mut chars = text.chars().peekable();
         let value = Self::value(&mut chars)?;
         Self::space(&mut chars);
         chars.peek().is_none().then_some(value)
     }
 
-    fn get(&self, key: &str) -> Option<&Json> {
+    pub(crate) fn get(&self, key: &str) -> Option<&Json> {
         match self {
             Json::Object(fields) => fields.iter().find(|(k, _)| k == key).map(|(_, v)| v),
             _ => None,
         }
     }
 
-    fn str(&self) -> Option<&str> {
+    pub(crate) fn str(&self) -> Option<&str> {
         match self {
             Json::Str(s) => Some(s),
             _ => None,
