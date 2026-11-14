@@ -931,8 +931,16 @@ fn engine(root: &Path, main: &Path, files: &[Found]) -> Option<Engine> {
     if found {
         return Some(Engine { name, version: None, guess: None });
     }
-    // Flash Player's own Linux player with the game's .swf built in (a "projector": Ending).
-    binary::contains(&dir.join(main.file_name()?), b"__flash__toXML").then_some(Engine { name: "Flash Player projector", version: None, guess: None })
+    // Flash Player's own Linux player with the game's .swf built in (a "projector": Ending), and
+    // Bevy (Rust), named all through its programs; its version from the path of bevy_app's
+    // source, which a build from Bevy's git (The Cleanup) doesn't have.
+    let program = dir.join(main.file_name()?);
+    let found = binary::find_groups(&program, &[&[b"__flash__toXML"], &[b"bevy_ecs::"]]);
+    if found[1] {
+        let version = binary::find_after(&program, b"bevy_app-", 12).map(|v| String::from_utf8_lossy(&v).chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect::<String>().trim_end_matches('.').to_string()).filter(|v| v.contains('.'));
+        return Some(Engine { name: "Bevy", version, guess: None });
+    }
+    found[0].then_some(Engine { name: "Flash Player projector", version: None, guess: None })
 }
 
 /// Godot can embed its data in the program; such files end with "GDPC".

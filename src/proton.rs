@@ -190,6 +190,29 @@ fn wine_builtins() -> Option<Vec<String>> {
     (!names.is_empty()).then_some(names)
 }
 
+/// The version of gilrs-core a Windows program reads controllers with, when it's one that
+/// crashes under Wine as soon as a controller is connected: its Windows.Gaming.Input backend
+/// (gilrs-core 0.5 to 0.6.7) unwraps RawGameController.NonRoamableId, which Wine answers with
+/// E_NOTIMPL. tinywar (Bevy 0.18, gilrs-core 0.6.7) quit with code 101 five seconds in, with an
+/// 8BitDo pad plugged in; 0.6.8 copes. Bevy 0.10 and later use it, as do other Rust games.
+/// Builds on the older XInput backend don't name RawGameController and are fine; a build
+/// whose paths were stripped (no version text) isn't flagged.
+pub fn gilrs_crash(program: &Path) -> Option<String> {
+    let wgi16: Vec<u8> = "Windows.Gaming.Input.RawGameController".encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let found = crate::binary::find_groups(program, &[&[b"Windows.Gaming.Input.RawGameController", &wgi16], &[b"gilrs-core-"]]);
+    if !found.iter().all(|&f| f) {
+        return None;
+    }
+    let version = crate::binary::find_after(program, b"gilrs-core-", 12)?;
+    let version: String = String::from_utf8_lossy(&version).chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+    let parts: Vec<u32> = version.trim_end_matches('.').split('.').filter_map(|p| p.parse().ok()).collect();
+    match parts[..] {
+        [0, 5, _] => Some(version.trim_end_matches('.').to_string()),
+        [0, 6, patch] if patch <= 7 => Some(version.trim_end_matches('.').to_string()),
+        _ => None,
+    }
+}
+
 /// DLLs next to a Windows program that Windows would load from there but Wine ignores: it uses
 /// its own copy of any DLL it has built in unless told otherwise. Games bring such a copy when
 /// it's a replacement (Empire Earth's GOG release: a ddraw.dll drawing its DirectDraw/Direct3D 7
@@ -314,6 +337,10 @@ fn files_below(dir: &Path, depth: usize) -> Vec<String> {
 }
 
 /// A WINEDLLOVERRIDES value making Wine use the game's own copies first.
+/// Wine's Windows.Gaming.Input turned off: games whose controller code crashes on Wine's
+/// (`gilrs_crash`) start without controllers instead.
+pub const NO_GAMEPAD: &str = "windows.gaming.input=d";
+
 pub fn overrides(dlls: &[String]) -> String {
     dlls.iter().map(|d| format!("{d}=n,b")).collect::<Vec<_>>().join(";")
 }

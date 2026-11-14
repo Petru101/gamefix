@@ -17,6 +17,9 @@ pub enum Problem {
     /// Windows parts the game's program needs that neither the game brings nor Proton's Wine
     /// has (MFC, the Visual Basic runtime, XNA, ...), and what provides each.
     MissingWindowsParts(Vec<(String, crate::proton::Provider)>),
+    /// A Windows program reading controllers through a gilrs that crashes under Wine once a
+    /// controller is connected (its gilrs-core version): `proton::gilrs_crash`.
+    GamepadCrash(String),
     /// Nothing built, but a project's source files (the marker file and what it's for):
     /// A-Maze-Batz's download is its CMake project, dodge_the_creeps a Godot project.
     Source(PathBuf, &'static str),
@@ -662,6 +665,9 @@ fn check_files(game: &Game, system: &System) -> Report {
             let ini = game.full(&game.files[i]).with_file_name("Game.ini");
             if let Some((kind, true)) = crate::rpgmaker::rgss(&ini) {
                 problems.push(Problem::RgssRtp(kind));
+            }
+            if let Some(version) = crate::proton::gilrs_crash(&game.full(&game.files[i])) {
+                problems.push(Problem::GamepadCrash(version));
             }
             let parts = crate::proton::missing_parts(&game.full(&game.files[i]));
             if !parts.is_empty() {
@@ -1713,6 +1719,13 @@ impl Report {
                         let _ = writeln!(out, "✗ It needs {unknown}, which neither the game brings nor Proton has, and no known");
                         let _ = writeln!(out, "  package provides: the download probably left it out.");
                     }
+                }
+                Problem::GamepadCrash(version) => {
+                    let _ = writeln!(out, "✗ It reads controllers with gilrs {version}, which crashes under Wine/Proton as soon as a");
+                    let _ = writeln!(out, "  controller is connected: Wine doesn't give controllers the id it asks for (gilrs 0.6.8");
+                    let _ = writeln!(out, "  copes with that).");
+                    let _ = writeln!(out, "    Fix (at launch): WINEDLLOVERRIDES={}: the game then sees no", crate::proton::NO_GAMEPAD);
+                    let _ = writeln!(out, "    controller, keyboard and mouse work; gamefix setup adds it.");
                 }
                 Problem::OwnWindowsDlls(dlls) => {
                     let files: Vec<String> = dlls.iter().map(|d| format!("{d}.dll")).collect();

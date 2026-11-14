@@ -722,7 +722,7 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
             Problem::Alsa32(None) => not_fixed.push("Its 32-bit ALSA sound: needs Steam's runtime (install Steam), which has a plugin that works.".into()),
             Problem::KickFiles(files) => not_fixed.push(format!("Its missing Mono files ({}): only the developer can add them; the .exe with Proton works.", files.join(", "))),
             Problem::FnaLibs(libs) => not_fixed.push(format!("Its missing native libraries ({}): get FNA's fnalibs, or use the Windows download with Proton.", libs.join(", "))),
-            Problem::NoLinuxBuild | Problem::UnityDataMissing(_) | Problem::LinuxInstaller(_) | Problem::UdkInstaller(_) | Problem::Unfinished(_) | Problem::OwnWindowsDlls(_) | Problem::MissingWindowsParts(_) | Problem::Source(..) | Problem::Web(_) | Problem::UnityWeb(_) | Problem::Damaged(_) | Problem::Package(..) | Problem::Flash { .. } | Problem::Tic { .. } | Problem::Rom { .. } | Problem::Mono { .. } | Problem::Dotnet { .. } | Problem::RpgMaker { .. } | Problem::RpgMakerPacked { .. } | Problem::RgssRtp(_) | Problem::Dos { .. } | Problem::Disc { .. } | Problem::CdFiles { .. } | Problem::Protected { .. } | Problem::Archive(_) | Problem::WrongMachine(_) | Problem::Love { .. } | Problem::Python { .. } | Problem::Java { .. } => {}
+            Problem::NoLinuxBuild | Problem::UnityDataMissing(_) | Problem::LinuxInstaller(_) | Problem::UdkInstaller(_) | Problem::Unfinished(_) | Problem::OwnWindowsDlls(_) | Problem::GamepadCrash(_) | Problem::MissingWindowsParts(_) | Problem::Source(..) | Problem::Web(_) | Problem::UnityWeb(_) | Problem::Damaged(_) | Problem::Package(..) | Problem::Flash { .. } | Problem::Tic { .. } | Problem::Rom { .. } | Problem::Mono { .. } | Problem::Dotnet { .. } | Problem::RpgMaker { .. } | Problem::RpgMakerPacked { .. } | Problem::RgssRtp(_) | Problem::Dos { .. } | Problem::Disc { .. } | Problem::CdFiles { .. } | Problem::Protected { .. } | Problem::Archive(_) | Problem::WrongMachine(_) | Problem::Love { .. } | Problem::Python { .. } | Problem::Java { .. } => {}
         }
     }
     if !preload.is_empty() {
@@ -1680,6 +1680,7 @@ fn setup_install(game: &Game, installer: Installer, targets: &Targets) -> Result
         env.extend(umu.env());
     }
     add_overrides(&mut env, &own);
+    add_no_gamepad(&mut env, proton::gilrs_crash(&exe).as_deref(), &mut done);
     // The installed game's folder: the one up to three above the program that holds the
     // installer's uninstaller or a repack's _Redist (Mycopunk's steam_emu.ini is three
     // folders below its program), else the program's own.
@@ -1864,6 +1865,7 @@ fn setup_windows(game: &Game, report: &Report, exe: &crate::scan::Found, targets
         return Err("It's a Steam game: start it from Steam, or set it up in Steam (add --steam).".into());
     }
     let own: Vec<String> = report.problems.iter().find_map(|p| if let Problem::OwnWindowsDlls(d) = p { Some(d.clone()) } else { None }).unwrap_or_default();
+    let gilrs: Option<String> = report.problems.iter().find_map(|p| if let Problem::GamepadCrash(v) = p { Some(v.clone()) } else { None });
     let mut components: Vec<&str> = report.problems.iter().flat_map(|p| match p {
         Problem::MissingWindowsParts(parts) => parts.iter().filter_map(|(_, p)| if let proton::Provider::Component(c) = p { Some(*c) } else { None }).collect(),
         _ => Vec::new(),
@@ -1922,6 +1924,8 @@ fn setup_windows(game: &Game, report: &Report, exe: &crate::scan::Found, targets
         }
         let mut env: Vec<(&str, String)> = options.iter().flat_map(|o| o.env.iter().map(|(k, v)| (k.as_str(), v.clone()))).collect();
         add_overrides(&mut env, &own);
+        let mut gamepad = Vec::new();
+        add_no_gamepad(&mut env, gilrs.as_deref(), &mut gamepad);
         let args = options.as_ref().map(|o| o.args.clone()).unwrap_or_default();
         let file = steam.localconfig();
         let previous = steam::launch_options(&file, appid)?;
@@ -1939,6 +1943,7 @@ fn setup_windows(game: &Game, report: &Report, exe: &crate::scan::Found, targets
             if !own.is_empty() {
                 done.push(format!("  WINEDLLOVERRIDES={}: Wine uses the game's own {} instead of its built-in copy, as Windows would.", proton::overrides(&own), dll_files(&own)));
             }
+            done.extend(gamepad.into_iter().map(|g| format!("  {g}")));
         }
         install_components(&steam, game, appid, &components, &mut done, &mut not_fixed, &mut record);
         if record.is_empty() {
@@ -2019,6 +2024,7 @@ fn setup_windows(game: &Game, report: &Report, exe: &crate::scan::Found, targets
         own_prefix = Some(dir);
     }
     add_overrides(&mut env, &own);
+    add_no_gamepad(&mut env, gilrs.as_deref(), &mut done);
     if rune_emulator(&game.root, 0) {
         add_rune(&mut env, &own, &mut done);
     }
@@ -2364,7 +2370,10 @@ fn add_overrides(env: &mut Vec<(&str, String)>, dlls: &[String]) {
     if dlls.is_empty() {
         return;
     }
-    let value = proton::overrides(dlls);
+    add_override(env, proton::overrides(dlls));
+}
+
+fn add_override(env: &mut Vec<(&str, String)>, value: String) {
     match env.iter_mut().find(|(k, _)| *k == "WINEDLLOVERRIDES") {
         Some((_, v)) => *v = format!("{v};{value}"),
         None => env.push(("WINEDLLOVERRIDES", value)),
@@ -2394,6 +2403,14 @@ fn add_rune(env: &mut Vec<(&str, String)>, own: &[String], done: &mut Vec<String
     add_overrides(env, &dlls);
     env.push(("PROTON_DISABLE_LSTEAMCLIENT", "1".into()));
     done.push("It's cracked with RUNE's Steam emulator: set Wine to load the game's version.dll and steamclient64.dll (WINEDLLOVERRIDES) and kept Proton's Steam client out (PROTON_DISABLE_LSTEAMCLIENT=1).".into());
+}
+
+/// A game whose controller code crashes on Wine's (`proton::gilrs_crash`): Wine's controller
+/// service turned off, so it starts without controllers.
+fn add_no_gamepad(env: &mut Vec<(&str, String)>, gilrs: Option<&str>, done: &mut Vec<String>) {
+    let Some(version) = gilrs else { return };
+    add_override(env, proton::NO_GAMEPAD.into());
+    done.push(format!("Its controller code (gilrs {version}) crashes under Wine once a controller is connected: turned Wine's controller service off for it ({}), so it plays with keyboard and mouse.", proton::NO_GAMEPAD));
 }
 
 fn dll_files(dlls: &[String]) -> String {
