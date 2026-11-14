@@ -623,12 +623,24 @@ fn hands_off(game: &Game) -> Option<String> {
     Some(said.join("\n"))
 }
 
+/// Whether a file sits inside the resources of an app built on Chromium (Electron, NW.js): a
+/// `resources` folder (or app.asar.unpacked in one) next to `resources.pak`.
+fn in_chromium_app(root: &Path, file: &Path) -> bool {
+    file.ancestors().skip(1).any(|d| d.file_name().is_some_and(|n| n.eq_ignore_ascii_case("resources")) && root.join(d.parent().unwrap_or(Path::new(""))).join("resources.pak").is_file())
+}
+
 fn check_files(game: &Game, system: &System) -> Report {
     let mut windows = Vec::new();
     let mut installers = Vec::new();
     for f in &game.files {
         if let Binary::Pe(pe) = &f.binary {
             match pe.installer {
+                // Not one an app built on Chromium (Electron, NW.js) carries among its own files:
+                // Cookie Clicker ships NVDA's installer in resources/app/src/img.
+                Some(_) if in_chromium_app(&game.root, &f.path) => {}
+                // An installed game's uninstaller (Inno's unins000.exe, NSIS's Uninstall.exe) is
+                // built like an installer but installs nothing: set up, it would be run as one.
+                Some(_) if f.path.file_name().is_some_and(|n| n.to_string_lossy().to_lowercase().starts_with("unins")) => {}
                 Some(kind) => installers.push((f.path.clone(), kind)),
                 // Ren'Py keeps its Windows Python and helpers in lib/windows-* (8: lib/py3-windows-*):
                 // not a Windows build.

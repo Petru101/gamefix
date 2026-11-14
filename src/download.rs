@@ -72,10 +72,15 @@ fn compressed(file: &Path) -> bool {
     }
 }
 
+/// An installer in the same folder; not an uninstaller (unins000.exe, Uninstall.exe), which an
+/// installed game's folder has: Sky Realm Idle's Electron snapshot_blob.bin, long runs of
+/// zeros by nature, read as a download not finished beside its unins000.exe.
 fn beside_installer(file: &Path) -> bool {
     let Some(dir) = file.parent() else { return false };
     fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.path()).any(|p| {
-        p.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe")) && matches!(crate::binary::identify(&p), Some(crate::binary::Binary::Pe(pe)) if pe.installer.is_some())
+        p.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe"))
+            && !lower_name(&p).starts_with("unins")
+            && matches!(crate::binary::identify(&p), Some(crate::binary::Binary::Pe(pe)) if pe.installer.is_some())
     })
 }
 
