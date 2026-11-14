@@ -193,6 +193,17 @@ fn repoint(text: &str, from: &Path, to: &Path, words: bool) -> String {
     out
 }
 
+/// Steam, or for app-menu entries alone on a system without it, umu's folder of compatibility
+/// tools in its place (`Steam::umu_only`): umu-run runs Windows games without Steam, with the
+/// GE-Proton gamefix downloads there.
+fn steam_or_umu(targets: &Targets) -> Result<Steam, String> {
+    match Steam::find() {
+        Some(steam) => Ok(steam),
+        None if !targets.steam => Ok(Steam::umu_only(&data_home())),
+        None => Err("Steam isn't installed, or nobody has logged in to it yet. Without Steam, set it up for the app menu (without --steam).".into()),
+    }
+}
+
 /// The wrapper a game's record names (`wrapper\t<word>\t<word>...`), if any.
 fn recorded_wrapper(record: &Path) -> Option<Vec<String>> {
     let text = fs::read_to_string(record).ok()?;
@@ -1559,8 +1570,8 @@ fn folder_line(folder: &Path, prefix: &Path) -> String {
 /// in ~/Games, then adds the installed program to Steam, with launch options pointing Steam at
 /// that prefix (its registry and saves are there). Undo leaves the installed game.
 fn setup_install(game: &Game, installer: Installer, targets: &Targets) -> Result<Outcome, String> {
-    // Steam's Protons install it and run it from the app menu too, so Steam is needed either way.
-    let steam = Steam::find().ok_or("Steam isn't installed, or nobody has logged in to it yet.")?;
+    // Steam's Protons install it and run it from the app menu too; without Steam, umu's folder.
+    let steam = steam_or_umu(targets)?;
     if targets.steam && steam.running() {
         return Err(STEAM_OPEN.into());
     }
@@ -1979,8 +1990,8 @@ pub fn switch_proton(game: &Game, report: &Report, tool: &str) -> Result<Vec<Str
 /// reports say runs it (Steam's own choice stays when there's none); a download becomes a
 /// non-Steam shortcut with GE-Proton (`game_proton`). Games whose anti-cheat stops them are left alone.
 fn setup_windows(game: &Game, report: &Report, exe: &crate::scan::Found, targets: &Targets) -> Result<Outcome, String> {
-    // Steam's Protons are used for app-menu entries too, so Steam is needed either way.
-    let steam = Steam::find().ok_or("Steam isn't installed, or nobody has logged in to it yet.")?;
+    // Steam's Protons are used for app-menu entries too; without Steam, umu's folder.
+    let steam = steam_or_umu(targets)?;
     if targets.steam && steam.running() {
         return Err(STEAM_OPEN.into());
     }
@@ -2447,10 +2458,17 @@ fn game_proton(steam: &Steam, prefix: Option<&Path>, done: &mut Vec<String>, not
     }
     match proton::fetch_ge(steam) {
         Ok(ge) => {
-            done.push(format!("Downloaded {ge} into Steam's compatibility tools (undo leaves it: other games can use it). Games that aren't Steam's run with it: Valve's Protons can't play most game videos outside Steam."));
+            done.push(if steam.stands_in() {
+                format!("Downloaded {ge} into {} (undo leaves it: other games can use it). Without Steam, Windows games run with it through umu-run.", steam.root.join("compatibilitytools.d").display())
+            } else {
+                format!("Downloaded {ge} into Steam's compatibility tools (undo leaves it: other games can use it). Games that aren't Steam's run with it: Valve's Protons can't play most game videos outside Steam.")
+            });
             Ok(ge)
         }
         Err(e) => {
+            if steam.stands_in() {
+                return Err(format!("{e} Without Steam, Windows games need GE-Proton: set it up again once the download can go through."));
+            }
             let valve = steam.proton().ok_or(format!("{e} No other Proton is installed in Steam either: install Proton Experimental (Library → Tools), or GE-Proton with ProtonUp-Qt (Flathub), then set it up again."))?;
             not_fixed.push(format!("{e} It runs with {valve} for now, which can't play most game videos outside Steam; ProtonUp-Qt (Flathub) can install GE-Proton."));
             Ok(valve)
@@ -2464,7 +2482,7 @@ fn game_proton(steam: &Steam, prefix: Option<&Path>, done: &mut Vec<String>, not
 pub fn missing_ge(game: &Game, report: &Report) -> bool {
     let with_proton = game.main().is_none() && (game.windows.is_some() || game.cd_installer.is_some() || !report.installers.is_empty() || report.problems.iter().any(|p| matches!(p, Problem::Disc { installer: Some(_), .. })));
     let valve_prefix = fs::read_to_string(data_home().join("gamefix/prefixes").join(slug(&game.name)).join("version")).is_ok_and(|v| !v.trim().starts_with("GE-Proton"));
-    with_proton && !valve_prefix && steam::installed_app(&game.root).is_none() && Steam::find().is_some_and(|s| s.newest_ge().is_none())
+    with_proton && !valve_prefix && steam::installed_app(&game.root).is_none() && Steam::find().unwrap_or_else(|| Steam::umu_only(&data_home())).newest_ge().is_none()
 }
 
 /// A Proton whose protonfixes has a fix for this game: the newest GE-Proton installed, else

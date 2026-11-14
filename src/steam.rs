@@ -23,6 +23,20 @@ impl Steam {
         Some(Steam { root, user })
     }
 
+    /// For a system without Steam: umu's own folder of compatibility tools (`<data>/Steam`, whose
+    /// compatibilitytools.d is where umu-run looks a Proton up by name and keeps the GE-Proton it
+    /// fetches) standing in for Steam's, so GE-Proton is found and downloaded there. No user,
+    /// no libraries, no Valve Protons: only for app-menu entries, never for shortcuts.
+    pub fn umu_only(data_home: &Path) -> Steam {
+        let root = data_home.join("Steam");
+        Steam { user: root.join("userdata/0"), root }
+    }
+
+    /// Whether this is umu's folder standing in for a Steam that isn't installed.
+    pub fn stands_in(&self) -> bool {
+        !self.user.is_dir()
+    }
+
     /// Flathub's Steam (found only when there's no other): its shortcuts start programs inside
     /// its sandbox, which doesn't see umu-run, runners or most of the home folder.
     pub fn is_flatpak(&self) -> bool {

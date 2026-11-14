@@ -107,7 +107,8 @@ gamefix allow-umu                                         # Ubuntu: see below
 On Ubuntu 24.04 (and other systems where AppArmor restricts sandboxes), Windows games can't
 start from the app menu until umu-run is allowed: `gamefix check` says so, and `gamefix
 allow-umu` adds the rule once (it asks for your password). Steam shortcuts don't need it.
-Steam installed from Flathub can't run gamefix's shortcuts (its sandbox can't reach what the
+Without Steam, Windows games still get app-menu entries: they run with GE-Proton through
+umu-run, both downloaded the first time. Steam installed from Flathub can't run gamefix's shortcuts (its sandbox can't reach what the
 fixes use), so gamefix sets games up for the app menu there.
 
 Moved a game you set up to another folder or drive? Move it first, then run `gamefix moved`
