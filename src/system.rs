@@ -25,10 +25,22 @@ pub struct OldRuntime {
 }
 
 impl OldRuntime {
-    fn find() -> Option<OldRuntime> {
+    pub(crate) fn find() -> Option<OldRuntime> {
         let home = PathBuf::from(std::env::var_os("HOME")?);
-        // Not the Flatpak Steam's: its runtime only works inside its sandbox.
-        let dir = [".local/share/Steam", ".steam/steam"].iter().map(|p| home.join(p).join("ubuntu12_32/steam-runtime")).find(|d| d.join("run.sh").is_file())?;
+        // Not the Flatpak Steam's: its runtime only works inside its sandbox. Steam's own copy
+        // first, if it's still the real runtime: in November 2026 Steam replaced it with a stub
+        // (run.sh -> ../legacy-run-stub.sh, "Running ... on the host, not in the legacy
+        // runtime"), pointing to steamapps/common/LegacySteamRuntime. Else that, else the scout
+        // container tool's own copy (SteamLinuxRuntime/steam-runtime: run.sh, lib/, usr/lib/),
+        // in whichever Steam library holds it.
+        let real = |d: &Path| d.join("run.sh").is_file() && (d.join("usr/lib/x86_64-linux-gnu").is_dir() || d.join("lib/x86_64-linux-gnu").is_dir());
+        let mut candidates: Vec<PathBuf> = [".local/share/Steam", ".steam/steam"].iter().map(|p| home.join(p).join("ubuntu12_32/steam-runtime")).collect();
+        let steam = crate::steam::Steam::find().filter(|s| !s.is_flatpak());
+        for library in steam.map(|s| s.libraries()).unwrap_or_default() {
+            let common = library.join("steamapps/common");
+            candidates.extend([common.join("LegacySteamRuntime"), common.join("LegacySteamRuntime/steam-runtime"), common.join("SteamLinuxRuntime/steam-runtime")]);
+        }
+        let dir = candidates.into_iter().find(|d| real(d))?;
         let mut libs = HashMap::new();
         for (sub, bit) in [("lib/i386-linux-gnu", 1), ("usr/lib/i386-linux-gnu", 1), ("lib/x86_64-linux-gnu", 2), ("usr/lib/x86_64-linux-gnu", 2)] {
             for entry in std::fs::read_dir(dir.join(sub)).into_iter().flatten().flatten() {

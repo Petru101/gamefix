@@ -960,14 +960,16 @@ fn check_files(game: &Game, system: &System) -> Report {
     // needs it) is also what the system's libraries loaded alongside get. If one of those needs
     // a function only the system's newer copy has, it fails to load (Darkness Looming's old
     // libgmodule vs the system's libgio: g_module_open_full).
-    let mut first: Vec<(&String, &PathBuf)> = by_name
+    let mut first: Vec<(String, &PathBuf)> = by_name
         .iter()
         .filter_map(|(n, (p, _))| {
             let name = n.to_str()?;
             let needed_from = same.iter().any(|(q, e)| e.needed.iter().any(|l| l == name) && (launcher_path || search(q, e).iter().any(|d| d.join(name).is_file())));
-            (system.has(name, elf.bits) && !glibc_part(name) && needed_from).then(|| (same.iter().find_map(|(_, e)| e.needed.iter().find(|l| *l == name)), *p))
+            // A launcher's LD_LIBRARY_PATH puts the game's copy first for the system's libraries
+            // too, whether or not a file of the game names it: Darkness Looming's old libsystemd,
+            // which only the system's libmount (by way of libgio) asks for.
+            (system.has(name, elf.bits) && !glibc_part(name) && (needed_from || launcher_path)).then(|| (name.to_string(), *p))
         })
-        .filter_map(|(n, p)| n.map(|n| (n, p)))
         .collect();
     // In name order: the report came out differently from run to run (Because).
     first.sort();
@@ -975,6 +977,18 @@ fn check_files(game: &Game, system: &System) -> Report {
         let mut users: BTreeSet<String> = BTreeSet::new();
         for (_, e) in &same {
             users.extend(e.needed.iter().filter(|l| !by_name.contains_key(OsStr::new(l.as_str())) && system.has(l, elf.bits) && !glibc_part(l)).cloned());
+        }
+        // And what those load in turn, as ld.so does, down to the game's own copies: libgio
+        // brings libmount, which needs libsystemd (LIBSYSTEMD_251 on Fedora 44, which Darkness
+        // Looming's bundled copy predates; the VM's older system didn't need it).
+        let mut queue: Vec<String> = users.iter().cloned().collect();
+        while let Some(lib) = queue.pop() {
+            let Some(Binary::Elf(e)) = system.path(&lib, elf.bits).and_then(|p| binary::identify(Path::new(p))) else { continue };
+            for l in e.needed.iter().filter(|l| !glibc_part(l) && !by_name.contains_key(OsStr::new(l.as_str())) && system.has(l, elf.bits)) {
+                if users.insert(l.clone()) {
+                    queue.push(l.clone());
+                }
+            }
         }
         // And system libraries the game loads by way of others, which the walk can't see: the
         // sound server's client loaded by the game's SDL or OpenAL brings libsndfile, which then

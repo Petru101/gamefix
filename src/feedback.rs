@@ -169,7 +169,7 @@ fn system() -> String {
         .collect();
     gpus.sort();
     gpus.dedup();
-    let runtime = if home().join(".local/share/Steam/ubuntu12_32/steam-runtime/run.sh").is_file() { "yes" } else { "no" };
+    let runtime = if crate::system::OldRuntime::find().is_some() { "yes" } else { "no" };
     format!("{os}; graphics: {}; Steam's old runtime: {runtime}", if gpus.is_empty() { "unknown".into() } else { gpus.join(", ") })
 }
 
