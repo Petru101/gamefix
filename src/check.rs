@@ -274,8 +274,54 @@ impl Problem {
     }
 }
 
+/// What a failed start printed that reading the game's files didn't show: a library the game
+/// loads by name later (dlopen) or through a launcher, a DLL Wine couldn't find.
+#[derive(Clone, Debug, PartialEq)]
+pub enum StartHint {
+    /// A Linux library ("libssl.so.1.1").
+    Library(String),
+    /// A Windows DLL Wine looked for ("mfc42.dll", lower case).
+    WindowsFile(String),
+}
+
+impl StartHint {
+    pub fn name(&self) -> &str {
+        match self {
+            StartHint::Library(n) | StartHint::WindowsFile(n) => n,
+        }
+    }
+}
+
+/// The missing library or DLL a start's output names, the last one in it winning (Wine warns
+/// all along): ld.so's and dlopen's "<lib>: cannot open shared object file" (ld.so's comes as
+/// "error while loading shared libraries: <lib>: ...", a game's own after its own words), and
+/// Wine's "err:module:import_dll Library <dll> (which is needed by ...) not found". The same
+/// signs Lobby reads to say why a start failed.
+pub fn start_hint(log: &str) -> Option<StartHint> {
+    let lines: Vec<&str> = log.lines().collect();
+    for line in lines[lines.len().saturating_sub(400)..].iter().rev() {
+        if let Some(rest) = line.split("err:module:import_dll Library ").nth(1) {
+            let dll = rest.split_whitespace().next().unwrap_or_default().to_lowercase();
+            if dll.ends_with(".dll") && !dll.contains(['/', '\\']) {
+                return Some(StartHint::WindowsFile(dll));
+            }
+        }
+        if let Some(before) = line.split(": cannot open shared object file").next().filter(|_| line.contains(": cannot open shared object file")) {
+            let word = before.rsplit([' ', ':', '\'', '"']).next().unwrap_or_default();
+            let lib = word.rsplit('/').next().unwrap_or_default();
+            if lib.starts_with("lib") && lib.contains(".so") {
+                return Some(StartHint::Library(lib.to_string()));
+            }
+        }
+    }
+    None
+}
+
 pub struct Report {
     pub problems: Vec<Problem>,
+    /// What a failed start's output showed that the files alone didn't (`with_start_log`); kept
+    /// so setting the game up again, which checks it afresh, still knows it.
+    pub hint: Option<StartHint>,
     /// Why gamefix changes nothing about how this game starts (`hands_off`).
     pub hands_off: Option<String>,
     pub libs_checked: usize,
@@ -544,7 +590,7 @@ fn check_files(game: &Game, system: &System) -> Report {
         }
     }
     let mut problems = Vec::new();
-    let mut report = Report { problems: Vec::new(), hands_off: None, libs_checked: 0, windows, installers, glibc: system.glibc, packed: false, pyinstaller: false, launcher_libs: Vec::new(), appimage: None, inside_appimage: false, old_runtime: system.old_runtime.as_ref().map(|r| r.run.clone()), harmless: Vec::new() };
+    let mut report = Report { problems: Vec::new(), hint: None, hands_off: None, libs_checked: 0, windows, installers, glibc: system.glibc, packed: false, pyinstaller: false, launcher_libs: Vec::new(), appimage: None, inside_appimage: false, old_runtime: system.old_runtime.as_ref().map(|r| r.run.clone()), harmless: Vec::new() };
 
     let Some((main, elf)) = game.main() else {
         match game.portable.map(|i| &game.files[i]) {
@@ -1583,6 +1629,60 @@ impl Report {
         }
     }
 
+    /// Adds what a failed start's output (`log`) says is missing and the files didn't show: a
+    /// library becomes a missing one setup gets (from Steam's runtime or a distribution's
+    /// packages), a DLL a missing Windows part (its winetricks component, if one is known). Lobby
+    /// passes a game's last log after a failed start. Returns what was learnt, None when the log
+    /// names nothing or nothing new (already reported, or the system has it).
+    pub fn with_start_log(&mut self, game: &Game, system: &System, log: &str) -> Option<StartHint> {
+        let hint = start_hint(log)?;
+        self.apply_hint(game, system, &hint).then(|| {
+            self.hint = Some(hint.clone());
+            hint
+        })
+    }
+
+    pub(crate) fn apply_hint(&mut self, game: &Game, system: &System, hint: &StartHint) -> bool {
+        match hint {
+            StartHint::Library(lib) => {
+                let Some((main, elf)) = game.main() else { return false };
+                let known = self.problems.iter().any(|p| matches!(p, Problem::MissingLibs { libs, later, .. } if libs.contains_key(lib) || later.contains_key(lib)));
+                if known || system.has(lib, elf.bits) {
+                    return false;
+                }
+                let in_runtime = system.old_runtime.as_ref().is_some_and(|r| r.has(lib, elf.bits));
+                match self.problems.iter_mut().find(|p| matches!(p, Problem::MissingLibs { .. })) {
+                    Some(Problem::MissingLibs { libs, in_old_runtime, .. }) => {
+                        libs.insert(lib.clone(), vec![main.path.clone()]);
+                        if in_runtime {
+                            in_old_runtime.insert(lib.clone());
+                        }
+                    }
+                    _ => self.problems.push(Problem::MissingLibs {
+                        bits: elf.bits,
+                        libs: BTreeMap::from([(lib.clone(), vec![main.path.clone()])]),
+                        later: BTreeMap::new(),
+                        in_old_runtime: if in_runtime { BTreeSet::from([lib.clone()]) } else { BTreeSet::new() },
+                        misplaced: BTreeMap::new(),
+                    }),
+                }
+                true
+            }
+            StartHint::WindowsFile(dll) => {
+                if game.windows.is_none() && game.cd_installer.is_none() {
+                    return false;
+                }
+                let part = (dll.clone(), crate::proton::provider(dll));
+                match self.problems.iter_mut().find(|p| matches!(p, Problem::MissingWindowsParts(_))) {
+                    Some(Problem::MissingWindowsParts(parts)) if parts.iter().any(|(d, _)| d.eq_ignore_ascii_case(dll)) => return false,
+                    Some(Problem::MissingWindowsParts(parts)) => parts.push(part),
+                    _ => self.problems.push(Problem::MissingWindowsParts(vec![part])),
+                }
+                true
+            }
+        }
+    }
+
     pub fn render(&self, game: &Game) -> String {
         let mut out = String::new();
         let _ = writeln!(out, "{}  ({})", game.name, game.root.display());
@@ -1635,6 +1735,9 @@ impl Report {
             let _ = writeln!(out, "  Installer ({kind}): {}", p.display());
         }
         let _ = writeln!(out);
+        if let Some(hint) = &self.hint {
+            let _ = writeln!(out, "• Its last start stopped on {}, which its files alone didn't show: counted below.", hint.name());
+        }
         for (what, libs) in &self.harmless {
             let _ = writeln!(out, "• Harmless: {} missing, but only {what} needs it; the game starts without it.", libs.join(", "));
         }
@@ -2512,7 +2615,7 @@ mod for_app_tests {
     }
 
     fn report(problems: Vec<Problem>) -> Report {
-        Report { problems, hands_off: None, libs_checked: 3, windows: Vec::new(), installers: Vec::new(), glibc: None, packed: false, pyinstaller: false, launcher_libs: Vec::new(), appimage: None, inside_appimage: false, old_runtime: None, harmless: Vec::new() }
+        Report { problems, hint: None, hands_off: None, libs_checked: 3, windows: Vec::new(), installers: Vec::new(), glibc: None, packed: false, pyinstaller: false, launcher_libs: Vec::new(), appimage: None, inside_appimage: false, old_runtime: None, harmless: Vec::new() }
     }
 
     #[test]
@@ -2537,6 +2640,19 @@ mod for_app_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn start_hints() {
+        use super::{start_hint, StartHint};
+        let ld = "./game: error while loading shared libraries: libssl.so.1.1: cannot open shared object file: No such file or directory\n";
+        assert_eq!(start_hint(ld), Some(StartHint::Library("libssl.so.1.1".into())));
+        // A game's own dlopen message, with a path; the last one wins.
+        let own = "Failed to load libbass.so: libbass.so: cannot open shared object file\nFMOD: dlopen /opt/x/libfmod.so.13: cannot open shared object file: No such file\n";
+        assert_eq!(start_hint(own), Some(StartHint::Library("libfmod.so.13".into())));
+        let wine = "0024:fixme:x\n0024:err:module:import_dll Library MFC42.DLL (which is needed by L\"Z:\\\\g\\\\game.exe\") not found\n0024:err:module:loader_init Importing dlls for L\"Z:\\\\g\\\\game.exe\" failed\n";
+        assert_eq!(start_hint(wine), Some(StartHint::WindowsFile("mfc42.dll".into())));
+        assert_eq!(start_hint("all fine\n"), None);
+    }
 
     #[test]
     fn folders_a_config_names() {

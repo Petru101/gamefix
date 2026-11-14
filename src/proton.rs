@@ -251,7 +251,7 @@ pub enum Provider {
 /// The winetricks component providing a DLL Wine lacks, from what old games use: MFC, the
 /// Visual Basic runtimes, OpenAL, PhysX's loader, an MP3 codec, Games for Windows Live (gone
 /// since 2014; xliveless stands in for it, as protonfixes does for Dirt 2 and Fable III).
-fn provider(dll: &str) -> Provider {
+pub(crate) fn provider(dll: &str) -> Provider {
     let stem = dll.trim_end_matches(".dll");
     let stem = stem.strip_suffix('u').filter(|s| s.starts_with("mfc")).unwrap_or(stem);
     const MFC: [&str; 10] = ["mfc40", "mfc42", "mfc70", "mfc71", "mfc80", "mfc90", "mfc100", "mfc110", "mfc120", "mfc140"];

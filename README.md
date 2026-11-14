@@ -95,8 +95,8 @@ submenu has these items:
 The same from a terminal:
 
 ```sh
-gamefix check <game folder or file>
-gamefix setup <game folder or file> [--menu] [--steam]   # --menu if neither is given
+gamefix check <game folder or file> [--log <file>]
+gamefix setup <game folder or file> [--menu] [--steam] [--log <file>]   # --menu if neither is given
 gamefix undo <game folder or file>
 gamefix proton <Steam game's folder> [<name>]             # its Protons to try, or switch to one
 gamefix feedback [<game folder or file>]
@@ -110,6 +110,9 @@ allow-umu` adds the rule once (it asks for your password). Steam shortcuts don't
 Without Steam, Windows games still get app-menu entries: they run with GE-Proton through
 umu-run, both downloaded the first time. Steam installed from Flathub can't run gamefix's shortcuts (its sandbox can't reach what the
 fixes use), so gamefix sets games up for the app menu there.
+
+A game that fails to start may say why in what it prints: save that to a file and pass it with
+`--log`. A library or Windows file it names as missing is then fixed like any other.
 
 Moved a game you set up to another folder or drive? Move it first, then run `gamefix moved`
 with both places: its app-menu entry, Steam shortcut and gamefix's records follow it.

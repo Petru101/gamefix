@@ -344,7 +344,15 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
         // converted launcher and case links, which this setup must then redo (Brownie Cove, set
         // up twice, got "Permission denied"). And before anything new is made: a runner's
         // setup undoing later removed the Python environment it had just installed.
-        let outcome = setup(game, &crate::check::check(game, &crate::system::System::load()), targets)?;
+        let system = crate::system::System::load();
+        let mut fresh = crate::check::check(game, &system);
+        // What a failed start showed (Lobby's log) holds for the fresh look too.
+        if let Some(hint) = &report.hint {
+            if fresh.apply_hint(game, &system, hint) {
+                fresh.hint = Some(hint.clone());
+            }
+        }
+        let outcome = setup(game, &fresh, targets)?;
         if let Some(words) = wrapper {
             set_wrapper(&record_path(game), Some(&words))?;
         }

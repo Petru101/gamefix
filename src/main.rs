@@ -3,8 +3,8 @@ use std::io::{BufRead, IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 
-const USAGE: &str = "usage: gamefix check <game>
-       gamefix setup <game> [--menu] [--steam]   (default: --menu)
+const USAGE: &str = "usage: gamefix check <game> [--log <file>]
+       gamefix setup <game> [--menu] [--steam] [--log <file>]   (default: --menu)
        gamefix undo <game>
        gamefix proton <game> [<name>]            a Steam game's Protons, or switch to one
        gamefix right-click [on|off]              Dolphin's right-click menu
@@ -12,7 +12,8 @@ const USAGE: &str = "usage: gamefix check <game>
        gamefix moved <old folder> <new folder>   after moving a game: point its setup there
        gamefix allow-umu                         Ubuntu: let Windows games start from the app menu
        gamefix feedback [<game>]                 report a problem to gamefix's developer
-<game> is the game's folder or its program; --dialog shows the result in a window";
+<game> is the game's folder or its program; --dialog shows the result in a window;
+--log: what the game printed when it failed to start (a missing library or Windows file in it counts)";
 
 /// What a command has to say, and whether it went well.
 struct Said {
@@ -79,6 +80,26 @@ fn main() -> ExitCode {
             }
         },
         [command @ ("check" | "setup" | "undo"), rest @ ..] => {
+            // A failed start's output (--log <file>): what it names missing counts too.
+            let mut rest = rest.to_vec();
+            let log = match rest.iter().position(|a| *a == "--log") {
+                Some(i) if i + 1 < rest.len() && *command != "undo" => {
+                    let file = rest.remove(i + 1);
+                    rest.remove(i);
+                    match std::fs::read(file) {
+                        Ok(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
+                        Err(e) => {
+                            eprintln!("{file}: {e}");
+                            return ExitCode::from(2);
+                        }
+                    }
+                }
+                Some(_) => {
+                    eprintln!("{USAGE}");
+                    return ExitCode::from(2);
+                }
+                None => None,
+            };
             // Dolphin passes the path last, after the flags.
             let (flags, paths): (Vec<&str>, Vec<&str>) = rest.iter().partition(|a| a.starts_with("--"));
             let (menu, steam) = (flags.contains(&"--menu"), flags.contains(&"--steam"));
@@ -90,7 +111,7 @@ fn main() -> ExitCode {
             match scan::scan(&path) {
                 None => said("gamefix", Err(format!("{}: not a folder or a file that can be read", path.display()))),
                 Some(game) => {
-                    let said = run(command, &game, &setup::Targets { menu: menu || !steam, steam }, dialog);
+                    let said = run(command, &game, &setup::Targets { menu: menu || !steam, steam }, dialog, log.as_deref());
                     if *command != "check" {
                         feedback::remember(&game.name, command, &said.text);
                     }
@@ -114,9 +135,17 @@ fn main() -> ExitCode {
     if result.ok { ExitCode::SUCCESS } else { ExitCode::FAILURE }
 }
 
-fn run(command: &str, game: &scan::Game, targets: &setup::Targets, dialog: bool) -> Said {
+fn run(command: &str, game: &scan::Game, targets: &setup::Targets, dialog: bool, log: Option<&str>) -> Said {
     let title = format!("gamefix: {}", game.name);
-    let mut report = check::check(game, &system::System::load());
+    let look = || {
+        let system = system::System::load();
+        let mut report = check::check(game, &system);
+        if let Some(log) = log {
+            report.with_start_log(game, &system, log);
+        }
+        report
+    };
+    let mut report = look();
     if command == "check" {
         return Said { ok: true, title, text: report.render(game) };
     }
@@ -135,7 +164,7 @@ fn run(command: &str, game: &scan::Game, targets: &setup::Targets, dialog: bool)
                 if let Err(e) = setup::install_flatpak(runner.app) {
                     return said(&title, Err(format!("{} couldn't be installed: {e}", runner.name)));
                 }
-                report = check::check(game, &system::System::load());
+                report = look();
                 installed = Some(format!("Installed {} from Flathub (it stays after undo: other games can use it).", runner.name));
             }
         }
@@ -152,7 +181,7 @@ fn run(command: &str, game: &scan::Game, targets: &setup::Targets, dialog: bool)
                 if let Err(e) = java::install(major) {
                     return said(&title, Err(e));
                 }
-                report = check::check(game, &system::System::load());
+                report = look();
                 installed = Some(format!("Downloaded Java {major} (Eclipse Temurin) into ~/.local/share/gamefix/java (it stays after undo: other games can use it)."));
             }
         }
