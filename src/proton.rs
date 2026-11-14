@@ -391,6 +391,119 @@ pub fn fetch_ge(steam: &Steam) -> Result<String, String> {
     result
 }
 
+/// umu-launcher's own release, for systems that don't install umu-run (Ubuntu, Fedora, Arch:
+/// only Bazzite and umu's own packages do): one Python file, pinned and checked by its SHA-256,
+/// the release Lobby uses.
+const UMU_VERSION: &str = "1.4.4";
+const UMU_URL: &str = "https://github.com/Open-Wine-Components/umu-launcher/releases/download/1.4.4/umu-launcher-1.4.4-zipapp.tar";
+const UMU_SHA256: &str = "eb590691841f7fad3fc3ad8fd5db4ccb87849fe7948e62b28ece7a4ee48cc851";
+
+fn on_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    std::env::split_paths(&path).map(|d| d.join(name)).find(|p| p.is_file())
+}
+
+/// umu-run if it's here: the system's, gamefix's own download, or Lobby's.
+pub fn umu_run_found() -> Option<PathBuf> {
+    let data = crate::setup::data_home();
+    on_path("umu-run").or_else(|| [data.join(format!("gamefix/tools/umu-run-{UMU_VERSION}")), data.join("lobby/tools/bin/umu-run")].into_iter().find(|p| p.is_file()))
+}
+
+/// Where umu-run is, or where gamefix would download it.
+pub fn umu_run_path() -> PathBuf {
+    umu_run_found().unwrap_or_else(|| crate::setup::data_home().join(format!("gamefix/tools/umu-run-{UMU_VERSION}")))
+}
+
+/// Whether AppArmor stops umu-run's sandbox here: Ubuntu 23.10 and later let only programs with
+/// a rule make the user namespaces bubblewrap needs, and Proton runs inside pressure-vessel's
+/// bubblewrap. Ubuntu 26.04 brings a rule for /usr/bin/bwrap that lets it through; 24.04 has
+/// none ("bwrap: setting up uid map: Permission denied"). Steam has its own rule, so its
+/// shortcuts start either way. `allow_umu` adds a rule for umu-run.
+pub fn umu_blocked() -> bool {
+    if fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns").map(|v| v.trim() != "1").unwrap_or(true) {
+        return false;
+    }
+    let umu = umu_run_path();
+    let named = format!("\"{}\"", fs::canonicalize(&umu).unwrap_or(umu).display());
+    let has_rule = fs::read_dir("/etc/apparmor.d").into_iter().flatten().flatten().any(|e| fs::read_to_string(e.path()).is_ok_and(|t| t.contains(&named)));
+    let bwrap_works = Command::new("bwrap").args(["--unshare-user", "--ro-bind", "/", "/", "true"]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success());
+    !has_rule && !bwrap_works
+}
+
+/// Adds an AppArmor rule letting umu-run (downloaded first if there's none) make user
+/// namespaces, as Steam's own rule does for Steam: /etc/apparmor.d/gamefix-umu, through sudo
+/// in a terminal, else pkexec (asks for the password in a window). The rule names a file in
+/// the home folder, which anything running as the user could replace: it opens user namespaces
+/// to that one path, nothing more (Lobby's rule makes the same trade).
+pub fn allow_umu() -> Result<Vec<String>, String> {
+    let mut done = Vec::new();
+    let umu = umu_run(&mut done)?;
+    let umu = fs::canonicalize(&umu).unwrap_or(umu);
+    if umu.to_string_lossy().contains(['"', '\n', '\\']) {
+        return Err(format!("umu-run's path has a character an AppArmor rule can't hold: {}", umu.display()));
+    }
+    if fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns").map(|v| v.trim() != "1").unwrap_or(true) {
+        done.push("This system doesn't restrict Proton's sandbox: nothing to allow.".into());
+        return Ok(done);
+    }
+    let rule = format!("# Written by gamefix: lets umu-run, which starts Windows games with Proton outside Steam,\n# make the user namespaces Proton's sandbox needs. Remove this file to take it back.\nabi <abi/4.0>,\ninclude <tunables/global>\n\nprofile gamefix-umu \"{}\" flags=(unconfined) {{\n  userns,\n\n  include if exists <local/gamefix-umu>\n}}\n", umu.display());
+    let tmp = std::env::temp_dir().join(format!("gamefix-umu-{}", std::process::id()));
+    fs::write(&tmp, rule).map_err(|e| e.to_string())?;
+    let script = "install -m 644 \"$1\" /etc/apparmor.d/gamefix-umu && apparmor_parser -r /etc/apparmor.d/gamefix-umu";
+    let terminal = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    let mut command = Command::new(if terminal { "sudo" } else { "pkexec" });
+    command.args(["sh", "-c", script, "sh"]).arg(&tmp);
+    let status = command.status();
+    let _ = fs::remove_file(&tmp);
+    match status {
+        Ok(s) if s.success() => {
+            done.push(format!("Added an AppArmor rule for {} (/etc/apparmor.d/gamefix-umu): Windows games now start from the app menu. Remove that file to take it back.", umu.display()));
+            Ok(done)
+        }
+        Ok(_) => Err("The rule wasn't added (the password was refused or the window was closed). Nothing changed.".into()),
+        Err(e) => Err(format!("Couldn't ask for the password ({}): {e}", if terminal { "sudo" } else { "pkexec" })),
+    }
+}
+
+/// umu-run, downloading umu's release into ~/.local/share/gamefix/tools when there's none
+/// (it then runs with the system's python3). What was downloaded goes into `done`. Shared by
+/// every game and kept on undo, like GE-Proton.
+pub fn umu_run(done: &mut Vec<String>) -> Result<PathBuf, String> {
+    if let Some(found) = umu_run_found() {
+        return Ok(found);
+    }
+    let failed = |what: &str| format!("umu-run (umu-launcher) starts Windows games outside Steam, and this system has none; gamefix couldn't download it: {what}.");
+    if on_path("python3").is_none() {
+        return Err(format!("umu-run (umu-launcher) starts Windows games outside Steam, and it needs Python: {}.", crate::distro::how_to_install(&crate::distro::PYTHON, "it")));
+    }
+    let cache = PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".cache/gamefix");
+    fs::create_dir_all(&cache).map_err(|e| failed(&e.to_string()))?;
+    let tarball = cache.join(format!("umu-launcher-{UMU_VERSION}-zipapp.tar"));
+    let downloaded = Command::new("curl").args(["-sfL", "--retry", "3", "--max-time", "600", "-o"]).arg(&tarball).arg(UMU_URL).status().is_ok_and(|s| s.success());
+    let result = (|| {
+        if !downloaded {
+            return Err(failed("the download failed (no network?)"));
+        }
+        let sum = Command::new("sha256sum").arg(&tarball).output().map_err(|e| failed(&e.to_string()))?;
+        if String::from_utf8_lossy(&sum.stdout).split_whitespace().next() != Some(UMU_SHA256) {
+            return Err(failed("the download doesn't match its checksum"));
+        }
+        let out = Command::new("tar").arg("-xOf").arg(&tarball).arg("umu/umu-run").stderr(Stdio::null()).output().map_err(|e| failed(&e.to_string()))?;
+        if !out.status.success() || out.stdout.is_empty() {
+            return Err(failed("it couldn't be unpacked"));
+        }
+        let program = crate::setup::data_home().join(format!("gamefix/tools/umu-run-{UMU_VERSION}"));
+        fs::create_dir_all(program.parent().unwrap()).map_err(|e| failed(&e.to_string()))?;
+        let part = program.with_extension("part");
+        use std::os::unix::fs::PermissionsExt;
+        fs::write(&part, &out.stdout).and_then(|()| fs::set_permissions(&part, fs::Permissions::from_mode(0o755))).and_then(|()| fs::rename(&part, &program)).map_err(|e| failed(&e.to_string()))?;
+        done.push(format!("Downloaded umu-launcher {UMU_VERSION} (umu-run, which starts Windows games with Proton outside Steam) into {}; undo leaves it, other games use it too.", program.display()));
+        Ok(program)
+    })();
+    let _ = fs::remove_file(&tarball);
+    result
+}
+
 /// The x86_64 tarball among a GitHub release's downloads (older releases have no arch in the name).
 fn tarball_url(release: &str) -> Option<String> {
     release

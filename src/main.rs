@@ -10,6 +10,7 @@ const USAGE: &str = "usage: gamefix check <game>
        gamefix right-click [on|off]              Dolphin's right-click menu
        gamefix games-folder [<folder>]           where installed Windows games go
        gamefix moved <old folder> <new folder>   after moving a game: point its setup there
+       gamefix allow-umu                         Ubuntu: let Windows games start from the app menu
        gamefix feedback [<game>]                 report a problem to gamefix's developer
 <game> is the game's folder or its program; --dialog shows the result in a window";
 
@@ -42,6 +43,7 @@ fn main() -> ExitCode {
         ["right-click"] => said("gamefix", Ok(vec![format!("The right-click menu is {}.", if rightclick::enabled() { "on" } else { "off" })])),
         ["games-folder"] => said("gamefix", Ok(vec![format!("Windows games gamefix installs go into {}.", setup::games_folder().display())])),
         ["games-folder", path] => said("gamefix", setup::set_games_folder(std::path::Path::new(path))),
+        ["allow-umu"] => said("gamefix", gamefix::proton::allow_umu()),
         ["moved", from, to] => {
             let (from, to) = (std::path::Path::new(from), std::path::Path::new(to));
             // The old place is gone by now: made absolute by hand, the new one by the system.

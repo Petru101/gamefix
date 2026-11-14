@@ -4,6 +4,7 @@ pub mod appinfo;
 pub mod binary;
 pub mod check;
 pub mod disc;
+pub mod distro;
 pub mod dotnet;
 pub mod download;
 pub mod drives;

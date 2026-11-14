@@ -17,6 +17,9 @@ pub enum Problem {
     /// Windows parts the game's program needs that neither the game brings nor Proton's Wine
     /// has (MFC, the Visual Basic runtime, XNA, ...), and what provides each.
     MissingWindowsParts(Vec<(String, crate::proton::Provider)>),
+    /// AppArmor stops Proton's sandbox for umu-run here (Ubuntu 23.10+ without a rule for it):
+    /// a Windows game's app-menu entry can't start until `gamefix allow-umu`.
+    UmuBlocked,
     /// A Windows program reading controllers through a gilrs that crashes under Wine once a
     /// controller is connected (its gilrs-core version): `proton::gilrs_crash`.
     GamepadCrash(String),
@@ -665,6 +668,9 @@ fn check_files(game: &Game, system: &System) -> Report {
             let ini = game.full(&game.files[i]).with_file_name("Game.ini");
             if let Some((kind, true)) = crate::rpgmaker::rgss(&ini) {
                 problems.push(Problem::RgssRtp(kind));
+            }
+            if crate::steam::installed_app(&game.root).is_none() && crate::proton::umu_blocked() {
+                problems.push(Problem::UmuBlocked);
             }
             if let Some(version) = crate::proton::gilrs_crash(&game.full(&game.files[i])) {
                 problems.push(Problem::GamepadCrash(version));
@@ -1720,6 +1726,12 @@ impl Report {
                         let _ = writeln!(out, "  package provides: the download probably left it out.");
                     }
                 }
+                Problem::UmuBlocked => {
+                    let _ = writeln!(out, "✗ This system's AppArmor (Ubuntu) stops the sandbox Proton runs in for programs it has");
+                    let _ = writeln!(out, "  no rule for, so a Windows game can't start from the app menu (Steam shortcuts can:");
+                    let _ = writeln!(out, "  Steam brings its own rule).");
+                    let _ = writeln!(out, "    Fix: run \"gamefix allow-umu\" once: it adds a rule for umu-run (asks for your password).");
+                }
                 Problem::GamepadCrash(version) => {
                     let _ = writeln!(out, "✗ It reads controllers with gilrs {version}, which crashes under Wine/Proton as soon as a");
                     let _ = writeln!(out, "  controller is connected: Wine doesn't give controllers the id it asks for (gilrs 0.6.8");
@@ -1846,7 +1858,7 @@ impl Report {
                         }
                         None => {
                             let _ = writeln!(out, "✗ This is a .NET game built to run with Mono on Linux ({}), and Mono isn't installed.", file.display());
-                            let _ = writeln!(out, "    Fix: on Bazzite, run \"brew install mono\" in a terminal; then gamefix setup adds it to the app menu.");
+                            let _ = writeln!(out, "    Fix: {}; then gamefix setup adds it to the app menu.", crate::distro::how_to_install(&crate::distro::MONO, "Mono"));
                         }
                     }
                     if !libs.is_empty() {
@@ -1888,6 +1900,7 @@ impl Report {
                 }
                 Problem::Disc { file, files: None, .. } => {
                     let _ = writeln!(out, "✗ This is a disc image ({}), and 7-Zip (7z) is needed to look inside it.", file.display());
+                    let _ = writeln!(out, "    Fix: {}, then check it again.", crate::distro::how_to_install(&crate::distro::SEVEN_ZIP, "7-Zip"));
                 }
                 Problem::Disc { file, files: Some(0), .. } => {
                     let _ = writeln!(out, "✗ This disc image ({}) holds no Windows programs: it may be for another machine", file.display());
@@ -1910,20 +1923,32 @@ impl Report {
                     let _ = writeln!(out, "✗ This download is an Android app ({}), not a game for PCs.", file.display());
                     let _ = writeln!(out, "    Fix: get the Linux or Windows download from the game's page instead.");
                 }
-                Problem::Package(file, "deb") => {
-                    let _ = writeln!(out, "✗ This download is a Debian/Ubuntu package ({}). Bazzite can't install those,", file.display());
-                    let _ = writeln!(out, "  and the game inside expects to be installed into the system's folders.");
-                    let _ = writeln!(out, "    Fix: look on the game's page for a .tar.gz, .zip, AppImage or Flatpak download instead.");
-                }
-                Problem::Package(file, "snap") => {
-                    let _ = writeln!(out, "✗ This download is a Snap package ({}). Bazzite has no Snap support, and the", file.display());
-                    let _ = writeln!(out, "  game inside expects Snap's own runtime around it.");
-                    let _ = writeln!(out, "    Fix: look on the game's page for a .tar.gz, .zip, AppImage or Flatpak download instead.");
-                }
-                Problem::Package(file, _) => {
-                    let _ = writeln!(out, "✗ This download is a Fedora-style package ({}). On Bazzite installing one means", file.display());
-                    let _ = writeln!(out, "  layering it into the system (rpm-ostree install, then a restart).");
-                    let _ = writeln!(out, "    Fix: a .tar.gz, .zip, AppImage or Flatpak download from the game's page is simpler.");
+                // Installable as it is where the system's own package manager takes it.
+                Problem::Package(file, kind) => {
+                    use crate::distro::Family;
+                    let family = crate::distro::family();
+                    let what = match *kind { "deb" => "a Debian/Ubuntu package", "snap" => "a Snap package", _ => "a Fedora-style package" };
+                    let install = match (*kind, family) {
+                        ("deb", Family::Debian) => Some(format!("sudo apt install ./{}", file.file_name().unwrap_or_default().to_string_lossy())),
+                        ("snap", Family::Debian) if Path::new("/usr/bin/snap").exists() => Some(format!("sudo snap install --dangerous ./{}", file.file_name().unwrap_or_default().to_string_lossy())),
+                        ("rpm", Family::Fedora) => Some(format!("sudo dnf install ./{}", file.file_name().unwrap_or_default().to_string_lossy())),
+                        ("rpm", Family::Suse) => Some(format!("sudo zypper install ./{}", file.file_name().unwrap_or_default().to_string_lossy())),
+                        _ => None,
+                    };
+                    let _ = writeln!(out, "✗ This download is {what} ({}): the game installs into the system.", file.display());
+                    match install {
+                        Some(command) => {
+                            let _ = writeln!(out, "    Fix: install it from its folder with: {command}");
+                        }
+                        None if *kind == "rpm" && family == Family::Atomic => {
+                            let _ = writeln!(out, "  On this system that means layering it into the system image (rpm-ostree install, then a restart).");
+                            let _ = writeln!(out, "    Fix: a .tar.gz, .zip, AppImage or Flatpak download from the game's page is simpler.");
+                        }
+                        None => {
+                            let _ = writeln!(out, "  This system can't install that kind of package.");
+                            let _ = writeln!(out, "    Fix: look on the game's page for a .tar.gz, .zip, AppImage or Flatpak download instead.");
+                        }
+                    }
                 }
                 Problem::LinuxInstaller(file) => {
                     let _ = writeln!(out, "• {} is an installer (MojoSetup) with the game packed inside it.", file.display());

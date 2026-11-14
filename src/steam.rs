@@ -23,6 +23,12 @@ impl Steam {
         Some(Steam { root, user })
     }
 
+    /// Flathub's Steam (found only when there's no other): its shortcuts start programs inside
+    /// its sandbox, which doesn't see umu-run, runners or most of the home folder.
+    pub fn is_flatpak(&self) -> bool {
+        self.root.components().any(|c| c.as_os_str() == "com.valvesoftware.Steam")
+    }
+
     pub fn shortcuts(&self) -> PathBuf {
         self.user.join("config/shortcuts.vdf")
     }

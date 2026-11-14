@@ -101,7 +101,14 @@ gamefix undo <game folder or file>
 gamefix proton <Steam game's folder> [<name>]             # its Protons to try, or switch to one
 gamefix feedback [<game folder or file>]
 gamefix moved <old folder> <new folder>                   # after moving a game's folder
+gamefix allow-umu                                         # Ubuntu: see below
 ```
+
+On Ubuntu 24.04 (and other systems where AppArmor restricts sandboxes), Windows games can't
+start from the app menu until umu-run is allowed: `gamefix check` says so, and `gamefix
+allow-umu` adds the rule once (it asks for your password). Steam shortcuts don't need it.
+Steam installed from Flathub can't run gamefix's shortcuts (its sandbox can't reach what the
+fixes use), so gamefix sets games up for the app menu there.
 
 Moved a game you set up to another folder or drive? Move it first, then run `gamefix moved`
 with both places: its app-menu entry, Steam shortcut and gamefix's records follow it.
@@ -142,7 +149,7 @@ and Flathub apps.
 
 gamefix never runs a game's files to find out what's wrong; it only reads them. It downloads
 only what a fix needs: distribution packages, LÖVE's own builds, Microsoft's .NET, Python
-builds, GE-Proton, RPG Maker's runtime package and Java (Eclipse Temurin, from adoptium.net).
+builds, GE-Proton, umu-launcher (when the system has no umu-run), RPG Maker's runtime package and Java (Eclipse Temurin, from adoptium.net).
 Before installing an app from Flathub or downloading Java, it asks.
 
 ## Reporting problems

@@ -53,7 +53,7 @@ fn game_libs(game: &Game, record: &mut Vec<String>) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
-fn data_home() -> PathBuf {
+pub(crate) fn data_home() -> PathBuf {
     std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/share"))
@@ -305,6 +305,11 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
     // Before anything changes: setting a game up again undoes the last setup first.
     if let Some(Problem::Unfinished(files)) = report.problems.iter().find(|p| matches!(p, Problem::Unfinished(_))) {
         return Err(format!("This download isn't finished: {} isn't all there yet. Let it finish, then set it up again.", files[0].strip_prefix(&game.root).unwrap_or(&files[0]).display()));
+    }
+    // A shortcut in Flathub's Steam would start the game inside Steam's sandbox, without the
+    // host's umu-run, runners and libraries the fixes use. Steam's own games still get theirs.
+    if targets.steam && steam::installed_app(&game.root).is_none() && Steam::find().is_some_and(|s| s.is_flatpak()) {
+        return Err("The only Steam here is the Flatpak one (from Flathub). A shortcut there starts the game inside Steam's sandbox, which can't reach what gamefix's fixes use (umu-run, runners, the game's libraries), so gamefix doesn't add shortcuts to it. Set it up for the app menu instead (without --steam).".into());
     }
     // A fix made before gamefix knew better goes; nothing new is made.
     if let Some(why) = &report.hands_off {
@@ -835,7 +840,7 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
             Problem::Alsa32(None) => not_fixed.push("Its 32-bit ALSA sound: needs Steam's runtime (install Steam), which has a plugin that works.".into()),
             Problem::KickFiles(files) => not_fixed.push(format!("Its missing Mono files ({}): only the developer can add them; the .exe with Proton works.", files.join(", "))),
             Problem::FnaLibs(libs) => not_fixed.push(format!("Its missing native libraries ({}): get FNA's fnalibs, or use the Windows download with Proton.", libs.join(", "))),
-            Problem::NoLinuxBuild | Problem::UnityDataMissing(_) | Problem::LinuxInstaller(_) | Problem::UdkInstaller(_) | Problem::Unfinished(_) | Problem::OwnWindowsDlls(_) | Problem::GamepadCrash(_) | Problem::MissingWindowsParts(_) | Problem::Source(..) | Problem::Web(_) | Problem::UnityWeb(_) | Problem::Damaged(_) | Problem::Package(..) | Problem::Flash { .. } | Problem::Tic { .. } | Problem::Rom { .. } | Problem::Mono { .. } | Problem::Dotnet { .. } | Problem::RpgMaker { .. } | Problem::RpgMakerPacked { .. } | Problem::RgssRtp(_) | Problem::Dos { .. } | Problem::Disc { .. } | Problem::CdFiles { .. } | Problem::Protected { .. } | Problem::Archive(_) | Problem::WrongMachine(_) | Problem::Love { .. } | Problem::Python { .. } | Problem::Java { .. } => {}
+            Problem::NoLinuxBuild | Problem::UnityDataMissing(_) | Problem::LinuxInstaller(_) | Problem::UdkInstaller(_) | Problem::Unfinished(_) | Problem::OwnWindowsDlls(_) | Problem::GamepadCrash(_) | Problem::UmuBlocked | Problem::MissingWindowsParts(_) | Problem::Source(..) | Problem::Web(_) | Problem::UnityWeb(_) | Problem::Damaged(_) | Problem::Package(..) | Problem::Flash { .. } | Problem::Tic { .. } | Problem::Rom { .. } | Problem::Mono { .. } | Problem::Dotnet { .. } | Problem::RpgMaker { .. } | Problem::RpgMakerPacked { .. } | Problem::RgssRtp(_) | Problem::Dos { .. } | Problem::Disc { .. } | Problem::CdFiles { .. } | Problem::Protected { .. } | Problem::Archive(_) | Problem::WrongMachine(_) | Problem::Love { .. } | Problem::Python { .. } | Problem::Java { .. } => {}
         }
     }
     if !preload.is_empty() {
@@ -1021,7 +1026,7 @@ fn runner_needed(report: &Report) -> Option<String> {
         Problem::Love { love: None, version, .. } if !crate::check::old_love(version.as_deref()) => Some(format!("This is a LÖVE game, and LÖVE isn't installed. Install LÖVE from Discover (it's on Flathub), {then}")),
         Problem::Flash { ruffle: None, .. } => Some(format!("This is a Flash game; it plays in Ruffle, which isn't installed. Install Ruffle from Discover (it's on Flathub), {then}")),
         Problem::Tic { tic80: None, .. } => Some(format!("This is a TIC-80 game; it plays in TIC-80, which isn't installed. Install TIC-80 from Discover (it's on Flathub), {then}")),
-        Problem::Mono { mono: None, .. } => Some(format!("This is a .NET game built for Mono, and Mono isn't installed. On Bazzite, run \"brew install mono\" in a terminal, {then}")),
+        Problem::Mono { mono: None, .. } => Some(format!("This is a .NET game built for Mono, and Mono isn't installed: {}, {then}", crate::distro::how_to_install(&crate::distro::MONO, "it"))),
         Problem::Rom { mgba: None, console, .. } => Some(format!("This is a {console} game; it plays in mGBA, which isn't installed. Install mGBA from Discover (it's on Flathub), {then}")),
         Problem::RpgMaker { easyrpg: None, .. } => Some(format!("This is an RPG Maker 2000/2003 game; it plays in EasyRPG Player, which isn't installed. Install EasyRPG Player from Discover (it's on Flathub), {then}")),
         Problem::Dos { dosbox: None, .. } => Some(format!("This is a DOS game; it runs in DOSBox Staging, which isn't installed. Install DOSBox Staging from Discover (it's on Flathub), {then}")),
@@ -1619,7 +1624,10 @@ fn setup_install(game: &Game, installer: Installer, targets: &Targets) -> Result
             (prefix, exe, name)
         }
         None => {
-            let umu = program_path("umu-run").ok_or("umu-run (umu-launcher) is needed to run the installer with Proton.")?;
+            if proton::umu_blocked() {
+                return Err("This system's AppArmor (Ubuntu) stops the sandbox Proton runs in for programs it has no rule for, so the installer can't run. Run \"gamefix allow-umu\" once (it asks for your password), then set it up again.".into());
+            }
+            let umu = proton::umu_run(&mut done)?;
             let free = |base: &str| (1..).map(|n| games.join(if n == 1 { base.to_string() } else { format!("{base} {n}") })).find(|d| !d.exists()).unwrap();
             let prefix = games.join(format!(".gamefix-installing-{}", std::process::id()));
             fs::create_dir_all(&prefix).map_err(|e| format!("Couldn't make {}: {e}", prefix.display()))?;
@@ -1806,12 +1814,15 @@ fn setup_install(game: &Game, installer: Installer, targets: &Targets) -> Result
     let fixed = fixes_tool.is_some();
     let tool = fixes_tool.unwrap_or(tool);
     if targets.menu {
-        let umu_run = program_path("umu-run").ok_or("umu-run (umu-launcher) is needed to start Windows games from the app menu; Bazzite has it, other systems have an umu-launcher package.")?;
+        let umu_run = proton::umu_run(&mut done)?;
         let exec = umu_command(&umu_run, steam.tool_dir(&tool).as_deref(), &env, &exe, &[]);
         let entry = write_entry_as(game, &name, &exec.iter().map(|a| exec_arg(a)).collect::<Vec<_>>(), workdir, &icon, false)?;
         // Undo goes backwards: the entry first in the file is removed last.
         record.insert(0, format!("created\t{}", entry.display()));
         done.push(format!("Added \"{name}\" to the app menu, under Games, run with {tool} in that folder's Wine prefix."));
+        if proton::umu_blocked() {
+            not_fixed.push("This system's AppArmor (Ubuntu) stops the sandbox Proton runs in, so the app-menu entry can't start the game yet: run \"gamefix allow-umu\" once (it asks for your password). A Steam shortcut (--steam) works without it.".into());
+        }
     }
     if targets.steam {
         let line = launch_options(&env, &[], "");
@@ -2104,7 +2115,7 @@ fn setup_windows(game: &Game, report: &Report, exe: &crate::scan::Found, targets
     // RPG Maker XP's runtime package, in a prefix of gamefix's own that Steam is pointed to.
     match report.problems.iter().find_map(|p| if let Problem::RgssRtp(kind) = p { Some(*kind) } else { None }) {
         Some("XP") => {
-            let umu = program_path("umu-run").ok_or("umu-run (umu-launcher) is needed to install RPG Maker XP's runtime package with Proton.")?;
+            let umu = proton::umu_run(&mut done)?;
             let tool_dir = steam.tool_dir(&proton).ok_or(format!("Couldn't find where {proton} is installed."))?;
             let (prefix, notes, problem) = crate::rpgmaker::xp_prefix(&umu, &tool_dir, &proton)?;
             done.extend(notes);
@@ -2147,12 +2158,15 @@ fn setup_windows(game: &Game, report: &Report, exe: &crate::scan::Found, targets
     }
     let icon = windows_icon(game, &shown, &mut record);
     if targets.menu {
-        let umu_run = program_path("umu-run").ok_or("umu-run (umu-launcher) is needed to start Windows games from the app menu; Bazzite has it, other systems have an umu-launcher package.")?;
+        let umu_run = proton::umu_run(&mut done)?;
         let exec = umu_command(&umu_run, steam.tool_dir(&proton).as_deref(), &env, &program, &args);
         let entry = write_entry(game, &exec.iter().map(|a| exec_arg(a)).collect::<Vec<_>>(), &workdir, &icon, false)?;
         // Undo goes backwards: the entry first in the file is removed last.
         record.insert(0, format!("created\t{}", entry.display()));
         done.push(format!("Added \"{}\" to the app menu, under Games (run with {proton} through umu-run).", game.name));
+        if proton::umu_blocked() {
+            not_fixed.push("This system's AppArmor (Ubuntu) stops the sandbox Proton runs in, so the app-menu entry can't start the game yet: run \"gamefix allow-umu\" once (it asks for your password). A Steam shortcut (--steam) works without it.".into());
+        }
     }
     let mut shortcut_id = None;
     if targets.steam {
@@ -2216,7 +2230,8 @@ fn gog_prefix(steam: &Steam, tool: &str, game: &Game, gog: &crate::gog::Info, he
     if fs::read_to_string(dir.join("gog-helper")).is_ok_and(|t| t.trim() == name) {
         return Ok((dir, format!("Its Steam shortcut uses the game's own Wine prefix, {shown}, where GOG's first-run helper ran before.")));
     }
-    let umu = program_path("umu-run").ok_or_else(|| failed("umu-run (umu-launcher) isn't installed"))?;
+    let mut fetched = Vec::new();
+    let umu = proton::umu_run(&mut fetched).map_err(|e| failed(&e))?;
     let tool_dir = steam.tool_dir(tool).ok_or_else(|| failed(&format!("{tool} wasn't found")))?;
     let game_dir = format!("Z:{}", gog.dir.display()).replace('/', "\\");
     let status = Command::new(&umu)
@@ -2240,7 +2255,7 @@ fn gog_prefix(steam: &Steam, tool: &str, game: &Game, gog: &crate::gog::Info, he
         Err(e) => return Err(failed(&format!("umu-run: {e}"))),
     }
     fs::write(dir.join("gog-helper"), format!("{name}\n")).map_err(|e| failed(&e.to_string()))?;
-    Ok((dir, format!("Ran GOG's first-run helper ({name}) with {tool} into a Wine prefix of the game's own, {shown}, which its Steam shortcut uses (undo leaves it: the game's settings and saves are there).")))
+    Ok((dir, fetched.into_iter().map(|f| f + " ").collect::<String>() + &format!("Ran GOG's first-run helper ({name}) with {tool} into a Wine prefix of the game's own, {shown}, which its Steam shortcut uses (undo leaves it: the game's settings and saves are there).")))
 }
 
 /// Windows components (winetricks) for a game run in a prefix of gamefix's own, which
@@ -2250,7 +2265,7 @@ fn winetricks_into(steam: &Steam, tool: &str, prefix: &Path, components: &[&str]
         return;
     }
     let list = components.join(" ");
-    let installed = program_path("umu-run").zip(steam.tool_dir(tool)).is_some_and(|(umu, tool_dir)| {
+    let installed = proton::umu_run(done).ok().zip(steam.tool_dir(tool)).is_some_and(|(umu, tool_dir)| {
         let status = Command::new(umu).arg("winetricks").arg("-q").args(components).env("WINEPREFIX", prefix).env("PROTONPATH", tool_dir).env("GAMEID", "umu-0").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
         crate::disc::wait_for_prefix(prefix);
         status.is_ok_and(|s| s.success())

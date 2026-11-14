@@ -109,7 +109,7 @@ pub fn volume_id(iso: &Path) -> Option<String> {
 
 /// Unpacks a disc image into `dir`.
 pub fn unpack(iso: &Path, dir: &Path) -> Result<(), String> {
-    let seven = seven_zip().ok_or("7-Zip (7z) is needed to unpack the disc image.")?;
+    let seven = seven_zip().ok_or_else(|| format!("7-Zip (7z) is needed to unpack the disc image: {}.", crate::distro::how_to_install(&crate::distro::SEVEN_ZIP, "it")))?;
     let out = Command::new(seven).arg("x").arg("-y").arg(format!("-o{}", dir.display())).arg(iso).output().map_err(|e| e.to_string())?;
     if !out.status.success() {
         return Err(format!("7-Zip couldn't unpack {}: {}", iso.display(), String::from_utf8_lossy(&out.stderr).trim()));
