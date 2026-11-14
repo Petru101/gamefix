@@ -36,6 +36,8 @@ fn main() -> ExitCode {
     args.retain(|a| *a != "--dialog");
     // Entries whose Proton moved with a Steam library point at it again.
     setup::repair_protons();
+    // And entries that start games through Steam's old runtime, which Steam moved.
+    setup::repair_runtime();
 
     let result = match args.as_slice() {
         ["right-click", "on"] => said("gamefix", rightclick::enable()),

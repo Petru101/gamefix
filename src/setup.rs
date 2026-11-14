@@ -2306,6 +2306,119 @@ fn umu_tools() -> PathBuf {
     data_home().join("Steam/compatibilitytools.d")
 }
 
+/// Words of a command line with where each starts and ends and its value unquoted: double
+/// quotes (menu entries' Exec, with backslash escapes) and single quotes (Steam's launch options,
+/// which sh reads).
+fn command_words(text: &str) -> Vec<(usize, usize, String)> {
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let mut words = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i].1.is_whitespace() {
+            i += 1;
+            continue;
+        }
+        let start = chars[i].0;
+        let mut value = String::new();
+        let mut quote: Option<char> = None;
+        while i < chars.len() && (quote.is_some() || !chars[i].1.is_whitespace()) {
+            let c = chars[i].1;
+            match (quote, c) {
+                (None, '"' | '\'') => quote = Some(c),
+                (Some(q), _) if c == q => quote = None,
+                (q, '\\') if q != Some('\'') && i + 1 < chars.len() => {
+                    i += 1;
+                    value.push(chars[i].1);
+                }
+                _ => value.push(c),
+            }
+            i += 1;
+        }
+        let end = chars.get(i).map_or(text.len(), |c| c.0);
+        words.push((start, end, value));
+    }
+    words
+}
+
+/// `text` with every word naming the old runtime's run.sh somewhere it no longer is (a Steam
+/// library that moved, or Steam's stub since November 2026) replaced by `new`, quoted by
+/// `quote`; None when there's none.
+fn repoint_runtime(text: &str, new: &str, quote: fn(&str) -> String) -> Option<String> {
+    let stale = |p: &str| p != new && crate::system::runtime_run(p) && !Path::new(p).parent().is_some_and(crate::system::real_runtime);
+    let mut out = String::new();
+    let mut last = 0;
+    for (start, end, value) in command_words(text) {
+        if stale(&value) {
+            out.push_str(&text[last..start]);
+            out.push_str(&quote(new));
+            last = end;
+        }
+    }
+    (last > 0).then(|| out + &text[last..])
+}
+
+/// Points what gamefix wrote that starts games through Steam's old runtime at where the runtime
+/// is now: app-menu entries always; the Steam shortcuts and Steam games' launch options gamefix
+/// set, while Steam is closed (else at a later start). Steam's update of 2026-11-14 left a stub
+/// in ubuntu12_32/steam-runtime, whose run.sh starts games without the runtime's libraries, and
+/// the scout tool's copy moves with its Steam library. Runs whenever gamefix does; a launcher
+/// can call it at start. Says what changed.
+pub fn repair_runtime() -> Vec<String> {
+    let Some(runtime) = crate::system::OldRuntime::find() else { return Vec::new() };
+    let new = runtime.run.display().to_string();
+    let mut changed = Vec::new();
+    for entry in fs::read_dir(data_home().join("applications")).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if !entry.file_name().to_string_lossy().starts_with("gamefix-") {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(&path) else { continue };
+        let mut any = false;
+        let rewritten: String = text
+            .lines()
+            .map(|line| {
+                let fixed = line.strip_prefix("Exec=").and_then(|exec| repoint_runtime(exec, &new, exec_arg)).map(|e| format!("Exec={e}"));
+                any |= fixed.is_some();
+                fixed.unwrap_or_else(|| line.to_string()) + "\n"
+            })
+            .collect();
+        if any && fs::write(&path, rewritten).is_ok() {
+            changed.push(path.display().to_string());
+        }
+    }
+    if Steam::find().is_some_and(|s| !s.running()) {
+        let records = fs::read_dir(data_home().join("gamefix/games")).into_iter().flatten().flatten().filter_map(|e| fs::read_to_string(e.path()).ok());
+        for record in records {
+            for line in record.lines() {
+                let fields: Vec<&str> = line.split('\t').collect();
+                let (Some(kind), Some(Ok(appid)), Some(file)) = (fields.first(), fields.get(1).map(|a| a.parse::<u32>()), fields.get(2)) else { continue };
+                let file = Path::new(file);
+                match *kind {
+                    "steam-shortcut" => {
+                        let change = |s: &str| repoint_runtime(s, &new, sh_word).unwrap_or_else(|| s.to_string());
+                        if steam::edit_shortcut(file, appid, &change, true).unwrap_or(false) {
+                            changed.push(format!("{} (shortcut {appid})", file.display()));
+                        }
+                    }
+                    "steam-launch" => {
+                        let Ok(Some(options)) = steam::launch_options(file, appid) else { continue };
+                        if let Some(fixed) = repoint_runtime(&options, &new, sh_word) {
+                            if steam::set_launch_options(file, appid, Some(&fixed)).is_ok() {
+                                changed.push(format!("{} (app {appid})", file.display()));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    if changed.iter().any(|c| c.ends_with(".desktop")) {
+        refresh_menu();
+    }
+    changed
+}
+
 /// A Proton as an entry names it for umu-run: by its folder's name when it's in umu's tools
 /// folder (GE-Proton: that folder stays where it is when a Steam library moves), else by its path.
 fn entry_proton(tool_dir: &Path) -> String {
@@ -2724,6 +2837,19 @@ fn refresh_menu() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_words() {
+        let words = command_words(r#"env A=1 "/run/media/u/New Volume/ubuntu12_32/steam-runtime/run.sh" 'x y' /g/game"#);
+        assert_eq!(words.iter().map(|w| w.2.as_str()).collect::<Vec<_>>(), ["env", "A=1", "/run/media/u/New Volume/ubuntu12_32/steam-runtime/run.sh", "x y", "/g/game"]);
+        // A run.sh that isn't there any more is pointed at the new one, quoted as the file needs.
+        let new = "/s/lib/steamapps/common/SteamLinuxRuntime/steam-runtime/run.sh";
+        assert_eq!(repoint_runtime("env X=1 /nowhere/ubuntu12_32/steam-runtime/run.sh /g/game", new, exec_arg).as_deref(), Some("env X=1 /s/lib/steamapps/common/SteamLinuxRuntime/steam-runtime/run.sh /g/game"));
+        assert_eq!(repoint_runtime("'/old lib/steamapps/common/SteamLinuxRuntime/steam-runtime/run.sh' %command%", "/new lib/x/steam-runtime/run.sh", sh_word).as_deref(), Some("'/new lib/x/steam-runtime/run.sh' %command%"));
+        // Nothing else is touched.
+        assert_eq!(repoint_runtime("env X=1 /g/run.sh %command%", new, sh_word), None);
+        assert_eq!(repoint_runtime(&format!("{new} %command%"), new, sh_word), None);
+    }
 
     #[test]
     fn setup_folder_names() {

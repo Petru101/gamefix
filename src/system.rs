@@ -24,6 +24,17 @@ pub struct OldRuntime {
     libs: HashMap<String, u8>,
 }
 
+/// Whether a folder is Steam's old runtime with its libraries, not Steam's stub (run.sh only).
+pub fn real_runtime(dir: &Path) -> bool {
+    dir.join("run.sh").is_file() && (dir.join("usr/lib/x86_64-linux-gnu").is_dir() || dir.join("lib/x86_64-linux-gnu").is_dir())
+}
+
+/// Whether a path names the old runtime's run.sh, wherever Steam keeps it.
+pub fn runtime_run(path: &str) -> bool {
+    let path = Path::new(path);
+    path.file_name().is_some_and(|n| n == "run.sh") && path.parent().and_then(Path::file_name).is_some_and(|d| d == "steam-runtime" || d == "LegacySteamRuntime")
+}
+
 impl OldRuntime {
     pub(crate) fn find() -> Option<OldRuntime> {
         let home = PathBuf::from(std::env::var_os("HOME")?);
@@ -33,7 +44,7 @@ impl OldRuntime {
         // runtime"), pointing to steamapps/common/LegacySteamRuntime. Else that, else the scout
         // container tool's own copy (SteamLinuxRuntime/steam-runtime: run.sh, lib/, usr/lib/),
         // in whichever Steam library holds it.
-        let real = |d: &Path| d.join("run.sh").is_file() && (d.join("usr/lib/x86_64-linux-gnu").is_dir() || d.join("lib/x86_64-linux-gnu").is_dir());
+        let real = |d: &Path| real_runtime(d);
         let mut candidates: Vec<PathBuf> = [".local/share/Steam", ".steam/steam"].iter().map(|p| home.join(p).join("ubuntu12_32/steam-runtime")).collect();
         let steam = crate::steam::Steam::find().filter(|s| !s.is_flatpak());
         for library in steam.map(|s| s.libraries()).unwrap_or_default() {
