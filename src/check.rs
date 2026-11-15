@@ -18,7 +18,7 @@ pub enum Problem {
     /// has (MFC, the Visual Basic runtime, XNA, ...), and what provides each.
     MissingWindowsParts(Vec<(String, crate::proton::Provider)>),
     /// AppArmor stops Proton's sandbox for umu-run here (Ubuntu 23.10+ without a rule for it):
-    /// a Windows game's app-menu entry can't start until `gamefix allow-umu`.
+    /// a Windows game's app-menu entry can't start until `gamefix allow-sandbox`.
     UmuBlocked,
     /// A Windows program reading controllers through a gilrs that crashes under Wine once a
     /// controller is connected (its gilrs-core version): `proton::gilrs_crash`.
@@ -1923,7 +1923,7 @@ impl Report {
                     let _ = writeln!(out, "✗ This system's AppArmor (Ubuntu) stops the sandbox Proton runs in for programs it has");
                     let _ = writeln!(out, "  no rule for, so a Windows game can't start from the app menu (Steam shortcuts can:");
                     let _ = writeln!(out, "  Steam brings its own rule).");
-                    let _ = writeln!(out, "    Fix: run \"gamefix allow-umu\" once: it adds a rule for umu-run (asks for your password).");
+                    let _ = writeln!(out, "    Fix: run \"gamefix allow-sandbox\" once: it adds a rule for umu-run (asks for your password).");
                 }
                 Problem::GamepadCrash(version) => {
                     let _ = writeln!(out, "✗ It reads controllers with gilrs {version}, which crashes under Wine/Proton as soon as a");

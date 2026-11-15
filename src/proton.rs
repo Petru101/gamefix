@@ -552,7 +552,7 @@ pub fn umu_run_path() -> PathBuf {
 /// a rule make the user namespaces bubblewrap needs, and Proton runs inside pressure-vessel's
 /// bubblewrap. Ubuntu 26.04 brings a rule for /usr/bin/bwrap that lets it through; 24.04 has
 /// none ("bwrap: setting up uid map: Permission denied"). Steam has its own rule, so its
-/// shortcuts start either way. `allow_umu` adds a rule for umu-run.
+/// shortcuts start either way. `allow_sandbox` adds a rule for umu-run.
 pub fn umu_blocked() -> bool {
     if fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns").map(|v| v.trim() != "1").unwrap_or(true) {
         return false;
@@ -564,23 +564,76 @@ pub fn umu_blocked() -> bool {
     !has_rule && !bwrap_works
 }
 
-/// Adds an AppArmor rule letting umu-run (downloaded first if there's none) make user
-/// namespaces, as Steam's own rule does for Steam: /etc/apparmor.d/gamefix-umu, through sudo
-/// in a terminal, else pkexec (asks for the password in a window). The rule names a file in
-/// the home folder, which anything running as the user could replace: it opens user namespaces
-/// to that one path, nothing more (Lobby's rule makes the same trade).
-pub fn allow_umu() -> Result<Vec<String>, String> {
-    let mut done = Vec::new();
-    let umu = umu_run(&mut done)?;
-    let umu = fs::canonicalize(&umu).unwrap_or(umu);
-    if umu.to_string_lossy().contains(['"', '\n', '\\']) {
-        return Err(format!("umu-run's path has a character an AppArmor rule can't hold: {}", umu.display()));
+/// The bwrap app-menu entries start (gamefix's fixes for old Unity games): the system's where
+/// it can make a sandbox; where AppArmor stops it (Ubuntu 24.04 has no rule for it: "setting
+/// up uid map: Permission denied"), gamefix's copy once `allow_sandbox` gave it a rule; else
+/// none. Steam's shortcuts don't need this: Ubuntu's rule for Steam carries over to what Steam
+/// starts.
+pub fn menu_bwrap() -> Option<PathBuf> {
+    let system = Path::new(SYSTEM_BWRAP);
+    if sandbox_works(system) {
+        return Some(system.to_path_buf());
     }
+    if !own_bwrap_path().exists() {
+        return None;
+    }
+    own_bwrap().filter(|b| sandbox_works(b))
+}
+
+const SYSTEM_BWRAP: &str = "/usr/bin/bwrap";
+
+fn sandbox_works(bwrap: &Path) -> bool {
+    Command::new(bwrap).args(["--dev-bind", "/", "/", "true"]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success())
+}
+
+fn own_bwrap_path() -> PathBuf {
+    crate::setup::data_home().join("gamefix/tools/bwrap")
+}
+
+/// gamefix's copy of the system's bwrap (~/.local/share/gamefix/tools/bwrap), made again when
+/// the system's changes, so the rule `allow_sandbox` adds can name it without opening
+/// /usr/bin/bwrap to everything (Lobby does the same).
+fn own_bwrap() -> Option<PathBuf> {
+    let copy = own_bwrap_path();
+    let source = fs::metadata(SYSTEM_BWRAP).ok()?;
+    let same = fs::metadata(&copy).is_ok_and(|c| c.len() == source.len() && c.modified().ok() == source.modified().ok());
+    if !same {
+        let part = copy.with_extension("part");
+        fs::create_dir_all(copy.parent()?).ok()?;
+        fs::copy(SYSTEM_BWRAP, &part).ok()?;
+        if let Ok(time) = source.modified() {
+            let _ = fs::File::options().write(true).open(&part).and_then(|f| f.set_modified(time));
+        }
+        fs::rename(&part, &copy).ok()?;
+    }
+    Some(copy)
+}
+
+/// Adds AppArmor rules letting umu-run (downloaded first if there's none) and gamefix's copy of
+/// bwrap make user namespaces, as Steam's own rule does for Steam: /etc/apparmor.d/gamefix-umu,
+/// through sudo in a terminal, else pkexec (asks for the password in a window). The rules name
+/// files in the home folder, which anything running as the user could replace: they open user
+/// namespaces to those paths, nothing more (Lobby's rule makes the same trade).
+pub fn allow_sandbox() -> Result<Vec<String>, String> {
+    let mut done = Vec::new();
     if fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns").map(|v| v.trim() != "1").unwrap_or(true) {
-        done.push("This system doesn't restrict Proton's sandbox: nothing to allow.".into());
+        done.push("This system doesn't restrict sandboxes: nothing to allow.".into());
         return Ok(done);
     }
-    let rule = format!("# Written by gamefix: lets umu-run, which starts Windows games with Proton outside Steam,\n# make the user namespaces Proton's sandbox needs. Remove this file to take it back.\nabi <abi/4.0>,\ninclude <tunables/global>\n\nprofile gamefix-umu \"{}\" flags=(unconfined) {{\n  userns,\n\n  include if exists <local/gamefix-umu>\n}}\n", umu.display());
+    let umu = umu_run(&mut done)?;
+    let umu = fs::canonicalize(&umu).unwrap_or(umu);
+    let bwrap = own_bwrap().map(|b| fs::canonicalize(&b).unwrap_or(b));
+    for path in std::iter::once(&umu).chain(bwrap.as_ref()) {
+        if path.to_string_lossy().contains(['"', '\n', '\\']) {
+            return Err(format!("This path has a character an AppArmor rule can't hold: {}", path.display()));
+        }
+    }
+    let profile = |name: &str, path: &Path| format!("profile {name} \"{}\" flags=(unconfined) {{\n  userns,\n\n  include if exists <local/{name}>\n}}\n", path.display());
+    let mut rule = format!("# Written by gamefix: lets umu-run, which starts Windows games with Proton outside Steam,\n# and gamefix's copy of bwrap (fixes for old Unity games) make the user namespaces their\n# sandboxes need. Remove this file to take it back.\nabi <abi/4.0>,\ninclude <tunables/global>\n\n{}", profile("gamefix-umu", &umu));
+    if let Some(b) = &bwrap {
+        rule.push('\n');
+        rule.push_str(&profile("gamefix-bwrap", b));
+    }
     let tmp = std::env::temp_dir().join(format!("gamefix-umu-{}", std::process::id()));
     fs::write(&tmp, rule).map_err(|e| e.to_string())?;
     let script = "install -m 644 \"$1\" /etc/apparmor.d/gamefix-umu && apparmor_parser -r /etc/apparmor.d/gamefix-umu";
@@ -591,7 +644,8 @@ pub fn allow_umu() -> Result<Vec<String>, String> {
     let _ = fs::remove_file(&tmp);
     match status {
         Ok(s) if s.success() => {
-            done.push(format!("Added an AppArmor rule for {} (/etc/apparmor.d/gamefix-umu): Windows games now start from the app menu. Remove that file to take it back.", umu.display()));
+            let what = if bwrap.is_some() { format!("{} and {}", umu.display(), bwrap.as_ref().unwrap().display()) } else { umu.display().to_string() };
+            done.push(format!("Added an AppArmor rule for {what} (/etc/apparmor.d/gamefix-umu): Windows games and the fixes for old Unity games now work from the app menu (set those games up again). Remove that file to take it back."));
             Ok(done)
         }
         Ok(_) => Err("The rule wasn't added (the password was refused or the window was closed). Nothing changed.".into()),

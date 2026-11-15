@@ -31,12 +31,21 @@ const BWRAP: &str = "/usr/bin/bwrap";
 /// too, so Steamworks games hung and Steam lost track of them. The helpers' numbers change, so
 /// they are looked up at each launch, by one grep: Steam preloads its overlay into everything
 /// a launch starts, and running a program or two per process took 30-40 s.
-const HIDE_HELPERS: &str = "set -- \"$@\" /usr/bin/bwrap --dev-bind / /; for f in $(grep -lzx /proc/self/exe /proc/[0-9]*/cmdline 2>/dev/null); do set -- \"$@\" --ro-bind /dev/null $f; done;";
+/// The pattern is written so grep doesn't match its own command line (it holds the pattern as
+/// an argument, and is gone by the time bwrap starts: Ubuntu 24.04's bwrap 0.9 then stopped with
+/// "Can't mkdir parents for /proc/<pid>/cmdline"); a helper gone meanwhile is skipped too.
+/// `bwrap` is the bwrap to start (`menu_bwrap`, BWRAP for Steam); `extra` is shell code adding
+/// more bwrap arguments after the root's.
+fn hide_helpers(bwrap: &Path, extra: &str) -> String {
+    format!("set -- \"$@\" {} --dev-bind / /;{extra} for f in $(grep -lzx '/proc/self/[e]xe' /proc/[0-9]*/cmdline 2>/dev/null); do [ -e $f ] && set -- \"$@\" --ro-bind /dev/null $f; done;", sh_word(&bwrap.display().to_string()))
+}
 
-/// HIDE_HELPERS with more bwrap arguments (shell-quoted here) after the root's.
-fn hide_helpers_with(extra: &[String]) -> String {
-    let quoted: Vec<String> = extra.iter().map(|a| format!("'{}'", a.replace('\'', "'\\''"))).collect();
-    HIDE_HELPERS.replacen("--dev-bind / /;", &format!("--dev-bind / / {};", quoted.join(" ")), 1).replace(" / / ;", " / /;")
+/// Shell code for `hide_helpers` showing the game `fonts` as /usr/share/fonts/gamefix-arial: an
+/// empty /usr/share/fonts with the real one's contents bound back in at launch (bwrap takes the
+/// sources from the real root) and the folder beside them. Works with any bwrap; overlays
+/// would need 0.10, and Ubuntu 24.04 has 0.9.
+fn font_folder(fonts: &Path) -> String {
+    format!(" set -- \"$@\" --tmpfs /usr/share/fonts; for f in /usr/share/fonts/*; do set -- \"$@\" --ro-bind \"$f\" \"$f\"; done; set -- \"$@\" --ro-bind {} /usr/share/fonts/gamefix-arial;", sh_word(&fonts.display().to_string()))
 }
 
 const STEAM_OPEN: &str = "Steam is open. Close it first (Steam → Exit): it rewrites its game list when it quits, which would undo the change.";
@@ -575,9 +584,11 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
     let program = game.full(main);
     // Launch-time settings, as (name, value).
     let mut env: Vec<(&str, String)> = Vec::new();
-    // Whether to start it through HIDE_HELPERS, and what else bwrap does then.
-    let mut hide_helpers = false;
-    let mut bwrap_extra: Vec<String> = Vec::new();
+    // Whether to start it through hide_helpers, and what else bwrap does then.
+    let mut use_bwrap = false;
+    let mut bwrap_extra = String::new();
+    // What those bwrap fixes said they do, taken back if the app menu can't have them.
+    let mut bwrap_done: Vec<String> = Vec::new();
     // Steam's runtime for older games: Steam itself doesn't pass its libraries on to games.
     let mut old_runtime = None;
     // Libraries to load first, joined into one LD_PRELOAD.
@@ -838,22 +849,21 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
             }
             Problem::UnitySingleInstance => {
                 if Path::new(BWRAP).is_file() {
-                    hide_helpers = true;
-                    done.push("Hides the browser helpers it would mistake for itself (at launch).".into());
+                    use_bwrap = true;
+                    bwrap_done.push("Hides the browser helpers it would mistake for itself (at launch).".into());
                 } else {
                     not_fixed.push("Old Unity \"Player is already running\": needs bwrap, which isn't installed. If it happens, close Steam before starting.".into());
                 }
             }
             Problem::UnityShaders(n) => done.push(format!("Nothing to change for its first start, which stays black for a while (maybe minutes) while the graphics driver compiles its {n} shaders; the driver keeps them, so later starts are quick.")),
-            Problem::UnityFont(_) => match (bwrap_overlays(), arial_fonts()) {
-                (true, Ok(dir)) => {
-                    hide_helpers = true;
-                    bwrap_extra.extend(["--overlay-src", "/usr/share/fonts", "--tmp-overlay", "/usr/share/fonts", "--ro-bind"].map(String::from));
-                    bwrap_extra.extend([dir.display().to_string(), "/usr/share/fonts/gamefix-arial".into()]);
-                    done.push("Shows it a copy of Liberation Sans named Arial in /usr/share/fonts, so its text appears (at launch).".into());
+            Problem::UnityFont(_) => match arial_fonts() {
+                Ok(_) if !Path::new(BWRAP).is_file() => not_fixed.push("Its text: the fix needs bwrap, which isn't installed.".into()),
+                Ok(dir) => {
+                    use_bwrap = true;
+                    bwrap_extra.push_str(&font_folder(&dir));
+                    bwrap_done.push("Shows it a copy of Liberation Sans named Arial in /usr/share/fonts, so its text appears (at launch).".into());
                 }
-                (false, _) => not_fixed.push("Its text: the fix needs bwrap 0.10 or newer (overlays), which isn't installed.".into()),
-                (_, Err(e)) => not_fixed.push(format!("Its text: {e}")),
+                Err(e) => not_fixed.push(format!("Its text: {e}")),
             },
             // The entry's Terminal=true is handled above.
             Problem::Terminal { old_curses } => {
@@ -941,7 +951,25 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
     let workdir = exodus_top.or(launcher_dir.as_deref()).or(start.parent()).unwrap_or(&game.root);
     let icon = icon(game, &main.path);
 
-    let wrap = hide_helpers.then(|| hide_helpers_with(&bwrap_extra));
+    // Steam's shortcuts get the system's bwrap: Ubuntu's rule for Steam carries over to what
+    // Steam starts. The app menu's may be blocked there (`proton::menu_bwrap`).
+    let wrap = use_bwrap.then(|| hide_helpers(Path::new(BWRAP), &bwrap_extra));
+    let menu_wrap = match use_bwrap && targets.menu {
+        true => match crate::proton::menu_bwrap() {
+            Some(bwrap) => Some(hide_helpers(&bwrap, &bwrap_extra)),
+            None => {
+                let what: Vec<&str> = bwrap_done.iter().map(|d| if d.starts_with("Hides") { "The fix for old Unity's \"Player is already running\"" } else { "The fix for its text" }).collect();
+                let steam = if targets.steam { " (the Steam shortcut has it: Steam's rule covers it)" } else { "" };
+                not_fixed.push(format!("{} can't work from the app menu{steam}: {} bwrap, which this system's AppArmor (Ubuntu) stops. Run \"gamefix allow-sandbox\" once (it asks for your password), then set the game up again. Until then the menu entry starts it without.", what.join(" and ").replacen(" and The", " and the", 1), if what.len() > 1 { "they use" } else { "it uses" }));
+                if !targets.steam {
+                    bwrap_done.clear();
+                }
+                None
+            }
+        },
+        false => None,
+    };
+    done.extend(bwrap_done);
     if targets.menu {
         let mut exec = Vec::new();
         if !env.is_empty() {
@@ -951,7 +979,7 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
         if let Some(run) = &old_runtime {
             exec.push(exec_arg(&run.display().to_string()));
         }
-        if let Some(wrap) = &wrap {
+        if let Some(wrap) = &menu_wrap {
             exec.extend(["sh", "-c", &format!("{wrap} exec \"$@\" \"$0\"")].map(exec_arg));
         }
         exec.push(exec_arg(&start.display().to_string()));
@@ -1149,14 +1177,6 @@ fn alsa_pulse32(pcm: &Path, ctl: &Path) -> Result<String, String> {
     );
     fs::write(&file, text).map_err(|e| e.to_string())?;
     Ok(file.display().to_string())
-}
-
-/// Whether the installed bwrap can lay an overlay over a folder (0.10 and newer).
-fn bwrap_overlays() -> bool {
-    let Ok(out) = Command::new(BWRAP).arg("--version").stdin(Stdio::null()).output() else { return false };
-    let text = String::from_utf8_lossy(&out.stdout);
-    let mut v = text.split_whitespace().last().unwrap_or("").split('.').map(|n| n.parse::<u32>().unwrap_or(0));
-    (v.next().unwrap_or(0), v.next().unwrap_or(0)) >= (0, 10)
 }
 
 /// Copies of the system's Liberation Sans named Arial (`~/.local/share/gamefix/fonts/arial`,
@@ -1685,7 +1705,7 @@ fn setup_install(game: &Game, installer: Installer, targets: &Targets) -> Result
         }
         None => {
             if proton::umu_blocked() {
-                return Err("This system's AppArmor (Ubuntu) stops the sandbox Proton runs in for programs it has no rule for, so the installer can't run. Run \"gamefix allow-umu\" once (it asks for your password), then set it up again.".into());
+                return Err("This system's AppArmor (Ubuntu) stops the sandbox Proton runs in for programs it has no rule for, so the installer can't run. Run \"gamefix allow-sandbox\" once (it asks for your password), then set it up again.".into());
             }
             let umu = proton::umu_run(&mut done)?;
             let free = |base: &str| (1..).map(|n| games.join(if n == 1 { base.to_string() } else { format!("{base} {n}") })).find(|d| !d.exists()).unwrap();
@@ -1881,7 +1901,7 @@ fn setup_install(game: &Game, installer: Installer, targets: &Targets) -> Result
         record.insert(0, format!("created\t{}", entry.display()));
         done.push(format!("Added \"{name}\" to the app menu, under Games, run with {tool} in that folder's Wine prefix."));
         if proton::umu_blocked() {
-            not_fixed.push("This system's AppArmor (Ubuntu) stops the sandbox Proton runs in, so the app-menu entry can't start the game yet: run \"gamefix allow-umu\" once (it asks for your password). A Steam shortcut (--steam) works without it.".into());
+            not_fixed.push("This system's AppArmor (Ubuntu) stops the sandbox Proton runs in, so the app-menu entry can't start the game yet: run \"gamefix allow-sandbox\" once (it asks for your password). A Steam shortcut (--steam) works without it.".into());
         }
     }
     if targets.steam {
@@ -2225,7 +2245,7 @@ fn setup_windows(game: &Game, report: &Report, exe: &crate::scan::Found, targets
         record.insert(0, format!("created\t{}", entry.display()));
         done.push(format!("Added \"{}\" to the app menu, under Games (run with {proton} through umu-run).", game.name));
         if proton::umu_blocked() {
-            not_fixed.push("This system's AppArmor (Ubuntu) stops the sandbox Proton runs in, so the app-menu entry can't start the game yet: run \"gamefix allow-umu\" once (it asks for your password). A Steam shortcut (--steam) works without it.".into());
+            not_fixed.push("This system's AppArmor (Ubuntu) stops the sandbox Proton runs in, so the app-menu entry can't start the game yet: run \"gamefix allow-sandbox\" once (it asks for your password). A Steam shortcut (--steam) works without it.".into());
         }
     }
     let mut shortcut_id = None;
@@ -3031,10 +3051,11 @@ mod tests {
 
     #[test]
     fn launch_options_fit_around_existing_ones() {
+        let hh = hide_helpers(Path::new(BWRAP), "");
         let env = [("GLIBC_TUNABLES", "glibc.rtld.execstack=2".to_string())];
         let native = |fixes: &str, rest: &str| format!("[ -n \"$STEAM_COMPAT_PROTON\" ] || {{ {fixes} }}; {rest}");
         assert_eq!(native_options(&env, None, None, ""), native("export GLIBC_TUNABLES=glibc.rtld.execstack=2;", "%command%"));
-        assert_eq!(native_options(&[], None, Some(HIDE_HELPERS), "STEAM_COMPAT_LAUNCHER_SERVICE=proton %command%"), native(HIDE_HELPERS, "STEAM_COMPAT_LAUNCHER_SERVICE=proton \"$@\" %command%"));
+        assert_eq!(native_options(&[], None, Some(hh.as_str()), "STEAM_COMPAT_LAUNCHER_SERVICE=proton %command%"), native(&hh, "STEAM_COMPAT_LAUNCHER_SERVICE=proton \"$@\" %command%"));
         assert_eq!(native_options(&env, None, None, "-insecure"), native("export GLIBC_TUNABLES=glibc.rtld.execstack=2;", "%command% -insecure"));
         assert_eq!(native_options(&[], None, None, "-insecure"), "-insecure");
         assert_eq!(native_options(&env, None, None, "GLIBC_TUNABLES=x %command%"), "GLIBC_TUNABLES=x %command%");
@@ -3048,7 +3069,7 @@ mod tests {
         let run = Path::new("/home/a b/.local/share/Steam/ubuntu12_32/steam-runtime/run.sh");
         let libs = [("LD_LIBRARY_PATH", "/x/libs".to_string())];
         assert_eq!(native_options(&libs, Some(run), None, ""), native(&format!("export LD_LIBRARY_PATH=\"${{LD_LIBRARY_PATH:+$LD_LIBRARY_PATH:}}\"/x/libs; set -- '{}';", run.display()), "\"$@\" %command%"));
-        assert_eq!(native_options(&[], Some(run), Some(HIDE_HELPERS), "gamemoderun %command%"), native(&format!("set -- '{}'; {HIDE_HELPERS}", run.display()), "gamemoderun \"$@\" %command%"));
+        assert_eq!(native_options(&[], Some(run), Some(hh.as_str()), "gamemoderun %command%"), native(&format!("set -- '{}'; {hh}", run.display()), "gamemoderun \"$@\" %command%"));
         assert_eq!(native_options(&[], Some(run), None, "'/home/a b/.local/share/Steam/ubuntu12_32/steam-runtime/run.sh' %command%"), "'/home/a b/.local/share/Steam/ubuntu12_32/steam-runtime/run.sh' %command%");
     }
 
@@ -3056,8 +3077,9 @@ mod tests {
     #[test]
     fn native_options_step_aside_for_proton() {
         let run = Path::new("/a b/run.sh");
+        let hh = hide_helpers(Path::new(BWRAP), "");
         let env = [("LD_PRELOAD", "/x.so".to_string())];
-        let line = native_options(&env, Some(run), Some(HIDE_HELPERS), "gamemoderun %command% -insecure").replace("gamemoderun", "printf '%s|' \"$LD_PRELOAD\"").replace("%command%", "game");
+        let line = native_options(&env, Some(run), Some(hh.as_str()), "gamemoderun %command% -insecure").replace("gamemoderun", "printf '%s|' \"$LD_PRELOAD\"").replace("%command%", "game");
         let out = |proton: bool| {
             let mut sh = std::process::Command::new("sh");
             sh.arg("-c").arg(&line).env_remove("LD_PRELOAD").env_remove("STEAM_COMPAT_PROTON");
@@ -3110,14 +3132,20 @@ mod tests {
     fn hide_helpers_runs_the_command() {
         use std::os::unix::process::CommandExt;
         let mut helper = std::process::Command::new("sleep").arg0("/proc/self/exe").arg("5").spawn().unwrap();
-        let out = std::process::Command::new("sh").arg("-c").arg(format!("{HIDE_HELPERS} printf '%s ' \"$@\"")).output().unwrap();
+        let hh = hide_helpers(Path::new(BWRAP), "");
+        let out = std::process::Command::new("sh").arg("-c").arg(format!("{hh} printf '%s ' \"$@\"")).output().unwrap();
         helper.kill().ok();
         let out = String::from_utf8_lossy(&out.stdout);
         assert!(out.starts_with("/usr/bin/bwrap --dev-bind / / "));
         assert!(out.contains(&format!(" --ro-bind /dev/null /proc/{}/cmdline ", helper.id())), "{out}");
-        let extra = ["--ro-bind".to_string(), "/a b's".to_string(), "/x".to_string()];
-        let out = std::process::Command::new("sh").arg("-c").arg(format!("{} printf '%s|' \"$@\"", hide_helpers_with(&extra))).output().unwrap();
-        assert!(String::from_utf8_lossy(&out.stdout).starts_with("/usr/bin/bwrap|--dev-bind|/|/|--ro-bind|/a b's|/x|"));
-        assert_eq!(hide_helpers_with(&[]), HIDE_HELPERS);
+        // The font folder: an empty /usr/share/fonts, the real one's entries bound back, ours.
+        let out = std::process::Command::new("sh").arg("-c").arg(format!("{} printf '%s|' \"$@\"", hide_helpers(Path::new("/b w/bwrap"), &font_folder(Path::new("/a b's"))))).output().unwrap();
+        let out = String::from_utf8_lossy(&out.stdout);
+        assert!(out.starts_with("/b w/bwrap|--dev-bind|/|/|--tmpfs|/usr/share/fonts|"), "{out}");
+        assert!(out.contains("|--ro-bind|/a b's|/usr/share/fonts/gamefix-arial|"), "{out}");
+        if let Some(first) = fs::read_dir("/usr/share/fonts").into_iter().flatten().flatten().next() {
+            let p = first.path().display().to_string();
+            assert!(out.contains(&format!("|--ro-bind|{p}|{p}|")), "{out}");
+        }
     }
 }
