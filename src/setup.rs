@@ -2058,6 +2058,44 @@ pub fn switch_proton(game: &Game, report: &Report, tool: &str) -> Result<Vec<Str
 /// Steam Play compatibility tool" in its properties. A Steam game gets the Proton ProtonDB's
 /// reports say runs it (Steam's own choice stays when there's none); a download becomes a
 /// non-Steam shortcut with GE-Proton (`game_proton`). Games whose anti-cheat stops them are left alone.
+/// ClickOnce's files carry ".deploy" (`scan::clickonce`) until Windows' ClickOnce service
+/// installs them under their real names; Wine has no such service and setup.exe only
+/// downloads prerequisites from links Microsoft took down. So the program's folder is mirrored
+/// in ~/.local/share/gamefix/clickonce/<slug> as links named without ".deploy" (the game's
+/// files stay as they are; what it writes beside itself lands there, and undo keeps a folder
+/// that isn't empty). ClickOnce's own manifests are left out: Wine would read
+/// `<name>.exe.manifest` as the program's side-by-side manifest. The folder; each link and
+/// folder is recorded.
+fn clickonce_links(game: &Game, program: &Path, record: &mut Vec<String>) -> Result<PathBuf, String> {
+    let source = program.parent().ok_or("ClickOnce program without a folder")?;
+    let farm = data_home().join("gamefix/clickonce").join(slug(&game.name));
+    let mut todo = vec![PathBuf::new()];
+    while let Some(rel) = todo.pop() {
+        let dir = farm.join(&rel);
+        if !dir.is_dir() {
+            fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+            record.push(format!("created-dir\t{}", dir.display()));
+        }
+        for entry in fs::read_dir(source.join(&rel)).map_err(|e| e.to_string())?.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                todo.push(rel.join(&name));
+                continue;
+            }
+            let lower = name.to_lowercase();
+            if lower.ends_with(".manifest") || lower.ends_with(".application") {
+                continue;
+            }
+            let link = dir.join(name.strip_suffix(".deploy").unwrap_or(&name));
+            if link.symlink_metadata().is_err() {
+                std::os::unix::fs::symlink(entry.path(), &link).map_err(|e| format!("{}: {e}", link.display()))?;
+                record.push(format!("created\t{}", link.display()));
+            }
+        }
+    }
+    Ok(farm)
+}
+
 fn setup_windows(game: &Game, report: &Report, exe: &crate::scan::Found, targets: &Targets) -> Result<Outcome, String> {
     // Steam's Protons are used for app-menu entries too; without Steam, umu's folder.
     let steam = steam_or_umu(targets)?;
@@ -2075,9 +2113,16 @@ fn setup_windows(game: &Game, report: &Report, exe: &crate::scan::Found, targets
         _ => Vec::new(),
     }).collect();
     components.dedup();
+    let old_xna = report.problems.iter().find_map(|p| match p {
+        Problem::MissingWindowsParts(parts) => parts.iter().find_map(|(_, p)| if let proton::Provider::OldXna(v) = p { Some(*v) } else { None }),
+        _ => None,
+    });
     let hint = appid.and_then(proton::hint);
     let mut done = Vec::new();
     let mut not_fixed = Vec::new();
+    if let Some(version) = old_xna {
+        not_fixed.push(format!("XNA {version}, which it's made with: nothing installs it any more (Microsoft took it down; winetricks has 3.1 and 4.0), so it won't start until a copy of xnafx{}_redist.msi is installed into its prefix.", version.replace('.', "")));
+    }
     if let Some(hint) = hint.as_ref().filter(|h| h.advice == Advice::AntiCheat) {
         not_fixed.push(format!("Its anti-cheat stops it under Proton ({}). Nothing on this side gets past that, so nothing was changed.", hint.reason()));
         return Ok(Outcome { done, not_fixed });
@@ -2186,6 +2231,16 @@ fn setup_windows(game: &Game, report: &Report, exe: &crate::scan::Found, targets
         }
         None => (program, workdir, args),
     };
+    // A ClickOnce program runs from links named without ".deploy" (`clickonce_links`).
+    let mut links_record = Vec::new();
+    let (program, workdir) = if program.to_string_lossy().to_lowercase().ends_with(".exe.deploy") {
+        let farm = clickonce_links(game, &program, &mut links_record)?;
+        done.push(format!("Runs its ClickOnce package from ~/.local/share/gamefix/clickonce/{}, links to its files under the names they'd have once installed (without \".deploy\"); Windows' ClickOnce installer doesn't work under Wine.", slug(&game.name)));
+        let name = program.file_name().unwrap_or_default().to_string_lossy();
+        (farm.join(&name[..name.len() - ".deploy".len()]), farm)
+    } else {
+        (program, workdir)
+    };
     let file = steam.shortcuts();
     let mut env = Vec::new();
     if let (Some(umu), Some(_)) = (&umu, &fixes_tool) {
@@ -2232,7 +2287,7 @@ fn setup_windows(game: &Game, report: &Report, exe: &crate::scan::Found, targets
     if rune_emulator(&game.root, 0) {
         add_rune(&mut env, &own, &mut done);
     }
-    let mut record = Vec::new();
+    let mut record = links_record;
     if let Some(prefix) = &own_prefix {
         record.push(format!("game-prefix\t{}", prefix.display()));
     }
@@ -2262,7 +2317,7 @@ fn setup_windows(game: &Game, report: &Report, exe: &crate::scan::Found, targets
         shortcut_id = Some(appid);
     }
     match (&own_prefix, shortcut_id) {
-        (Some(prefix), _) => winetricks_into(&steam, &proton, prefix, &components, &mut done, &mut not_fixed),
+        (Some(prefix), _) => winetricks_into(&steam, &proton, prefix, &components, &game.root, &mut done, &mut not_fixed),
         (None, Some(appid)) => install_components(&steam, game, appid, &components, &mut done, &mut not_fixed, &mut record),
         (None, None) => {}
     }
@@ -2340,13 +2395,23 @@ fn gog_prefix(steam: &Steam, tool: &str, game: &Game, gog: &crate::gog::Info, he
 
 /// Windows components (winetricks) for a game run in a prefix of gamefix's own, which
 /// protontricks doesn't know: umu-run's winetricks into that prefix.
-fn winetricks_into(steam: &Steam, tool: &str, prefix: &Path, components: &[&str], done: &mut Vec<String>, not_fixed: &mut Vec<String>) {
+fn winetricks_into(steam: &Steam, tool: &str, prefix: &Path, components: &[&str], game_root: &Path, done: &mut Vec<String>, not_fixed: &mut Vec<String>) {
+    // XNA goes in by its own installer: winetricks' recipes install Microsoft's .NET first
+    // (dotnet20sp2 for 3.1, dotnet40 for 4.0), which hung in GE-Proton's prefix with nothing
+    // running, and XNA doesn't need it: on Wine Mono ColorLogic (XNA 3.1) plays.
+    let (xna, components): (Vec<&str>, Vec<&str>) = components.iter().partition(|c| matches!(**c, "xna31" | "xna40"));
+    for component in xna {
+        match proton::umu_run(done).map_err(|e| e.to_string()).and_then(|umu| install_xna(&umu, steam.tool_dir(tool).as_deref(), prefix, component, game_root)) {
+            Ok(note) => done.push(note),
+            Err(e) => not_fixed.push(e),
+        }
+    }
     if components.is_empty() {
         return;
     }
     let list = components.join(" ");
     let installed = proton::umu_run(done).ok().zip(steam.tool_dir(tool)).is_some_and(|(umu, tool_dir)| {
-        let status = Command::new(umu).arg("winetricks").arg("-q").args(proton::winetricks_args(Some(&tool_dir), components)).env("WINEPREFIX", prefix).env("PROTONPATH", tool_dir).env("GAMEID", "umu-0").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
+        let status = Command::new(umu).arg("winetricks").arg("-q").args(proton::winetricks_args(Some(&tool_dir), &components)).env("WINEPREFIX", prefix).env("PROTONPATH", tool_dir).env("GAMEID", "umu-0").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
         crate::disc::wait_for_prefix(prefix);
         status.is_ok_and(|s| s.success())
     });
@@ -2354,6 +2419,62 @@ fn winetricks_into(steam: &Steam, tool: &str, prefix: &Path, components: &[&str]
         done.push(format!("Installed {list} into its Wine prefix (winetricks; undo leaves them, they're harmless)."));
     } else {
         not_fixed.push(format!("Installing {list} with winetricks failed; `WINEPREFIX={} umu-run winetricks {list}` in a terminal shows why.", prefix.display()));
+    }
+}
+
+/// Microsoft's XNA redistributable (`component`: xna31 or xna40) into `prefix` with msiexec,
+/// quietly: the copy the game ships (ColorLogic's Setup/xnafx31_redist.msi) when there is one,
+/// else the one winetricks downloads (its link and SHA-256, `proton::xna_download`), kept in
+/// ~/.cache/gamefix. What was done, or why not.
+fn install_xna(umu: &Path, tool_dir: Option<&Path>, prefix: &Path, component: &str, game_root: &Path) -> Result<String, String> {
+    let version = if component == "xna31" { "3.1" } else { "4.0" };
+    let file = format!("xnafx{}_redist.msi", version.replace('.', ""));
+    let failed = |why: &str| format!("Installing XNA {version} (Microsoft's {file}) failed: {why}.");
+    let mut todo = vec![(game_root.to_path_buf(), 0)];
+    let mut shipped = None;
+    while let Some((dir, depth)) = todo.pop() {
+        for entry in fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() && depth < 3 {
+                todo.push((path, depth + 1));
+            } else if entry.file_name().to_string_lossy().eq_ignore_ascii_case(&file) {
+                shipped = Some(path);
+            }
+        }
+    }
+    let (msi, source) = match shipped {
+        Some(msi) => (msi, "the copy the game brings"),
+        None => {
+            let (url, sha) = proton::xna_download(component).ok_or_else(|| failed("winetricks, which says where to get it, wasn't found"))?;
+            let cache = PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".cache/gamefix");
+            let msi = cache.join(&file);
+            let matches = |p: &Path| Command::new("sha256sum").arg(p).output().is_ok_and(|o| String::from_utf8_lossy(&o.stdout).split_whitespace().next() == Some(sha.as_str()));
+            if !matches(&msi) {
+                fs::create_dir_all(&cache).map_err(|e| failed(&e.to_string()))?;
+                let part = msi.with_extension("part");
+                let ok = Command::new("curl").args(["-sfL", "--retry", "3", "--max-time", "600", "-o"]).arg(&part).arg(&url).status().is_ok_and(|s| s.success());
+                if !ok || !matches(&part) {
+                    let _ = fs::remove_file(&part);
+                    return Err(failed(if ok { "the download doesn't match its checksum" } else { "the download failed (no network?)" }));
+                }
+                fs::rename(&part, &msi).map_err(|e| failed(&e.to_string()))?;
+            }
+            (msi, "downloaded from Microsoft's archived page, as winetricks does")
+        }
+    };
+    let mut command = Command::new(umu);
+    command.args(["msiexec", "/i"]).arg(msi.file_name().unwrap_or_default()).arg("/quiet").current_dir(msi.parent().unwrap_or(Path::new("/"))).env("WINEPREFIX", prefix).env("GAMEID", "umu-0");
+    if let Some(dir) = tool_dir {
+        command.env("PROTONPATH", dir);
+    }
+    let status = command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
+    crate::disc::wait_for_prefix(prefix);
+    let native = prefix.join(format!("pfx/drive_c/Program Files (x86)/Common Files/Microsoft Shared/XNA/Framework/v{version}/XnaNative.dll"));
+    match status {
+        Ok(s) if s.success() && native.is_file() => Ok(format!("Installed XNA {version} into its Wine prefix ({source}; undo leaves it).")),
+        Ok(s) if s.success() => Err(failed("the installer ended without putting XnaNative.dll in place")),
+        Ok(s) => Err(failed(&format!("the installer ended with {s}"))),
+        Err(e) => Err(failed(&format!("umu-run: {e}"))),
     }
 }
 

@@ -370,7 +370,8 @@ fn walk(root: &Path, rel: &Path, depth: usize, out: &mut Vec<Found>) {
                 walk(root, &path, depth + 1, out);
             }
         } else if let Some(binary) = binary::identify(&root.join(&path)) {
-            let is_exe = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe"));
+            // ClickOnce keeps its program as <name>.exe.deploy (`clickonce`).
+            let is_exe = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe")) || path.to_string_lossy().to_lowercase().ends_with(".exe.deploy");
             // Windows DLLs aren't interesting, and scripts only near the top, where launchers live.
             let keep = match &binary {
                 // A .NET program built for any system is a .dll with its runtimeconfig.json.
@@ -523,7 +524,33 @@ pub fn net_standard(dir: &Path) -> Vec<String> {
 }
 
 /// The Windows game program: not an installer, helper or .NET part of a Linux build.
+/// A ClickOnce publish folder (Visual Studio's Publish, common for XNA games: MazeSnake,
+/// Skully): `setup.exe` (a bootstrapper that installs .NET and XNA from Microsoft's long-gone
+/// links, then hands over to Windows' ClickOnce service) beside `<name>.application`, whose
+/// dependency names `Application Files\<name>_<version>\<name>.exe.manifest`; the program is
+/// that path without ".manifest", with ".deploy" added to every file's name when the
+/// deployment says mapFileExtensions="true". The program, relative to `root`, if it's there.
+pub fn clickonce(root: &Path) -> Option<PathBuf> {
+    fs::read_dir(root).ok()?.flatten().find_map(|e| {
+        let path = e.path();
+        if !path.extension().is_some_and(|x| x.eq_ignore_ascii_case("application")) {
+            return None;
+        }
+        let text = fs::read_to_string(&path).ok()?;
+        let codebase = text.split("codebase=\"").skip(1).map(|c| c.split('"').next().unwrap_or("")).find(|c| c.to_lowercase().ends_with(".exe.manifest"))?;
+        let mapped = text.contains("mapFileExtensions=\"true\"");
+        let program = codebase.strip_suffix(".manifest")?.replace('\\', "/");
+        let program = PathBuf::from(if mapped { format!("{program}.deploy") } else { program });
+        (!program.is_absolute() && !program.components().any(|c| c == std::path::Component::ParentDir) && root.join(&program).is_file()).then_some(program)
+    })
+}
+
 fn pick_windows(root: &Path, files: &[Found]) -> Option<usize> {
+    if let Some(program) = clickonce(root) {
+        if let Some(i) = files.iter().position(|f| f.path == program && matches!(&f.binary, Binary::Pe(_))) {
+            return Some(i);
+        }
+    }
     // GOG's own pick from its .info (Beyond Good and Evil: CheckApplication.exe, not BGE.exe),
     // unless it's an emulator GOG wraps an old game in (Tyrian 2000's DOSBox).
     if let Some(info) = crate::gog::read(root) {

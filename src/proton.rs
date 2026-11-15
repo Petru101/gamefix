@@ -246,6 +246,9 @@ pub enum Provider {
     /// Microsoft's debug C++ runtime: only on developers' machines, never redistributable.
     DebugBuild,
     Unknown,
+    /// XNA 1.0 to 3.0: Microsoft no longer offers them and winetricks has only 3.1 and 4.0 (the
+    /// version, from the game's content files).
+    OldXna(&'static str),
 }
 
 /// The winetricks component providing a DLL Wine lacks: Microsoft's debug runtimes are a
@@ -300,6 +303,39 @@ pub fn winetricks_args(tool_dir: Option<&Path>, components: &[&str]) -> Vec<Stri
         .iter()
         .map(|c| dirs.iter().map(|d| d.join("protonfixes/verbs").join(format!("{c}.verb"))).find(|v| v.is_file()).map_or(c.to_string(), |v| v.display().to_string()))
         .collect()
+}
+
+/// Where winetricks downloads XNA's redistributable for `component` (xna31, xna40) and its
+/// SHA-256: the `w_download <url> <sha256>` line of its recipe, `load_<component>()`.
+pub fn xna_download(component: &str) -> Option<(String, String)> {
+    let text = fs::read_to_string(winetricks_script()?).ok()?;
+    let body = text.split(&format!("\nload_{component}()")).nth(1)?.split("\n}").next()?;
+    let line = body.lines().map(str::trim).find(|l| l.starts_with("w_download "))?;
+    let mut words = line.split_whitespace().skip(1);
+    let (url, sha) = (words.next()?.to_string(), words.next()?.to_string());
+    (url.starts_with("https://") && sha.len() == 64).then_some((url, sha))
+}
+
+/// The format version of the first XNA content file (`.xnb`, or ClickOnce's `.xnb.deploy`)
+/// within three folders of `dir`: the byte after "XNBw" (or another platform letter) is 1 for
+/// XNA 1.0, 2 for 2.0, 3 for 3.0, 4 for 3.1, 5 for 4.0.
+fn xnb_version(dir: &Path) -> Option<u8> {
+    let mut todo = vec![(dir.to_path_buf(), 0)];
+    while let Some((d, depth)) = todo.pop() {
+        for entry in fs::read_dir(&d).into_iter().flatten().flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_lowercase();
+            if path.is_dir() && depth < 3 {
+                todo.push((path, depth + 1));
+            } else if name.ends_with(".xnb") || name.ends_with(".xnb.deploy") {
+                let mut head = [0u8; 5];
+                if fs::File::open(&path).and_then(|mut f| std::io::Read::read_exact(&mut f, &mut head)).is_ok() && head.starts_with(b"XNB") {
+                    return Some(head[4]);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// The winetricks that installs components: the newest GE-Proton's own (umu-run's `winetricks`
@@ -412,21 +448,39 @@ fn winetricks_map(script: &str) -> std::collections::HashMap<String, &'static st
 /// Proton to compare with, or when the program is packed (its real imports are compressed).
 pub fn missing_parts(program: &Path) -> Vec<(String, Provider)> {
     let mut missing = Vec::new();
-    let Some(builtins) = wine_builtins() else { return missing };
     let shipped: std::collections::HashMap<String, PathBuf> = fs::read_dir(program.parent().unwrap_or(Path::new(".")))
         .into_iter()
         .flatten()
         .flatten()
-        .map(|e| (e.file_name().to_string_lossy().to_lowercase(), e.path()))
+        // A ClickOnce folder's files end in ".deploy" (`scan::clickonce`).
+        .map(|e| (e.file_name().to_string_lossy().to_lowercase().trim_end_matches(".deploy").to_string(), e.path()))
         .collect();
     let Some(first) = crate::binary::imports(program) else { return missing };
     // A reference to Microsoft's XNA assemblies carries their public key token; MonoGame and FNA
-    // keep XNA's namespaces but not its signature (Picross for a Cause, MonoGame).
-    const XNA_TOKEN: &[u8] = b"\x84\x2c\xf8\xbe\x1d\xe5\x05\x53";
-    if first.dotnet && crate::binary::contains(program, XNA_TOKEN) && !shipped.contains_key("microsoft.xna.framework.dll") {
-        let v2 = crate::binary::dotnet_runtime(program).is_some_and(|v| v.starts_with("v2."));
-        missing.push(("Microsoft.Xna.Framework.dll".into(), Provider::Component(if v2 { "xna31" } else { "xna40" })));
+    // keep XNA's namespaces but not its signature (Picross for a Cause, MonoGame). XNA 4.0 signs
+    // with 842cf8be1de50553, XNA 1.0 to 3.1 with 6d5c3888ef60e27d (ColorLogic and Skully, XNA
+    // 3.1; ColorLogic ships xnafx31_redist.msi). Winetricks has 3.1 and 4.0 only. Wine has none,
+    // so this doesn't wait for Proton's list of built-in DLLs.
+    const XNA4: &[u8] = b"\x84\x2c\xf8\xbe\x1d\xe5\x05\x53";
+    const XNA3: &[u8] = b"\x6d\x5c\x38\x88\xef\x60\xe2\x7d";
+    if first.dotnet && !shipped.contains_key("microsoft.xna.framework.dll") {
+        let found = crate::binary::find_groups(program, &[&[XNA4], &[XNA3]]);
+        if found[0] {
+            missing.push(("Microsoft.Xna.Framework.dll".into(), Provider::Component("xna40")));
+        } else if found[1] {
+            // 1.0 to 3.1 share the signature; the content files say which (`xnb_version`).
+            // Skully's are 3.0's, which XNA 3.1 refuses ("compiled using the wrong version of
+            // the XNA Framework"), so redirecting the game to 3.1 doesn't help.
+            let provider = match xnb_version(program.parent().unwrap_or(Path::new("."))) {
+                Some(1) => Provider::OldXna("1.0"),
+                Some(2) => Provider::OldXna("2.0"),
+                Some(3) => Provider::OldXna("3.0"),
+                _ => Provider::Component("xna31"),
+            };
+            missing.push(("Microsoft.Xna.Framework.dll".into(), provider));
+        }
     }
+    let Some(builtins) = wine_builtins() else { return missing };
     let mut seen = std::collections::HashSet::new();
     let mut todo = vec![first];
     while let Some(file) = todo.pop() {

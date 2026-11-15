@@ -1905,13 +1905,19 @@ impl Report {
                     let components: Vec<&str> = parts.iter().filter_map(|(_, p)| if let Provider::Component(c) = p { Some(*c) } else { None }).collect();
                     if !components.is_empty() {
                         let _ = writeln!(out, "✗ It needs parts of Windows that neither the game brings nor Proton has: {}.", names(|p| matches!(p, Provider::Component(_))));
-                        let _ = writeln!(out, "    Fix: install {} into its Wine prefix (winetricks); gamefix setup does that (for a", components.join(" "));
+                        let how = if components.iter().any(|c| c.starts_with("xna")) { "winetricks' names; XNA goes in with Microsoft's own installer" } else { "winetricks" };
+                        let _ = writeln!(out, "    Fix: install {} into its Wine prefix ({how}); gamefix setup does that (for a", components.join(" "));
                         let _ = writeln!(out, "    game in Steam, with --steam, once it has been started from Steam once).");
                     }
                     let debug = names(|p| *p == Provider::DebugBuild);
                     if !debug.is_empty() {
                         let _ = writeln!(out, "✗ It needs {debug}: Microsoft's debug C++ runtime, which only developers' machines have.");
                         let _ = writeln!(out, "  The developer shipped a debug build; only they can fix that (a release build).");
+                    }
+                    if let Some(version) = parts.iter().find_map(|(_, p)| if let Provider::OldXna(v) = p { Some(*v) } else { None }) {
+                        let _ = writeln!(out, "✗ It's made with XNA {version}, which Wine doesn't have and nothing installs any more: Microsoft");
+                        let _ = writeln!(out, "  took its download down, winetricks has only 3.1 and 4.0, and 3.1 refuses {version}'s content files.");
+                        let _ = writeln!(out, "  It won't start without it; a copy of xnafx{}_redist.msi from elsewhere would do.", version.replace('.', ""));
                     }
                     let unknown = names(|p| *p == Provider::Unknown);
                     if !unknown.is_empty() {
