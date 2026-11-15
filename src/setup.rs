@@ -1802,8 +1802,19 @@ fn setup_install(game: &Game, installer: Installer, targets: &Targets) -> Result
                 .env("PROTON_SET_GAME_DRIVE", "0")
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
-                .status();
-            crate::disc::wait_for_prefix(&prefix);
+                .spawn();
+            // Watched while it runs: umu-run only returns once the installer and what it
+            // started have ended, and a hung .NET setup would keep it from returning.
+            let (status, stopped_dotnet) = match status {
+                Ok(mut child) => {
+                    let stopped = crate::disc::wait_for_installer(&prefix, &mut child);
+                    (child.wait(), stopped)
+                }
+                Err(e) => (Err(e), false),
+            };
+            if stopped_dotnet {
+                done.push("Stopped Microsoft's .NET setup that the installer started: it hangs under Proton, and Wine Mono stands in for .NET.".into());
+            }
             drives.finish();
             remove_links(&link);
             let finished = fs::read(prefix.join("drive_c/gamefix-install.log")).ok().map(|log| String::from_utf8_lossy(&log).contains("Installation process succeeded"));
@@ -1882,6 +1893,15 @@ fn setup_install(game: &Game, installer: Installer, targets: &Targets) -> Result
     }
     add_overrides(&mut env, &own);
     add_no_gamepad(&mut env, proton::gilrs_crash(&exe).as_deref(), &mut done);
+    // Windows parts the installed program needs that Proton lacks (an XNA game whose installer
+    // only got as far as .NET: Clean'em Up), into the install's prefix.
+    let parts = proton::missing_parts(&exe);
+    if let Some(version) = parts.iter().find_map(|(_, p)| if let proton::Provider::OldXna(v) = p { Some(*v) } else { None }) {
+        not_fixed.push(format!("XNA {version}, which it's made with: nothing installs it any more (Microsoft took it down; winetricks has 3.1 and 4.0), so it won't start until a copy of xnafx{}_redist.msi is installed into its prefix.", version.replace('.', "")));
+    }
+    let mut components: Vec<&str> = parts.iter().filter_map(|(_, p)| if let proton::Provider::Component(c) = p { Some(*c) } else { None }).collect();
+    components.dedup();
+    winetricks_into(steam.tool_dir(&tool).as_deref(), &prefix, &components, exe.parent().unwrap_or(&prefix), &mut done, &mut not_fixed);
     // The installed game's folder: the one up to three above the program that holds the
     // installer's uninstaller or a repack's _Redist (Mycopunk's steam_emu.ini is three
     // folders below its program), else the program's own.
@@ -2446,6 +2466,10 @@ fn install_xna(umu: &Path, tool_dir: Option<&Path>, prefix: &Path, component: &s
     let version = if component == "xna31" { "3.1" } else { "4.0" };
     let file = format!("xnafx{}_redist.msi", version.replace('.', ""));
     let failed = |why: &str| format!("Installing XNA {version} (Microsoft's {file}) failed: {why}.");
+    let native = prefix.join(format!("pfx/drive_c/Program Files (x86)/Common Files/Microsoft Shared/XNA/Framework/v{version}/XnaNative.dll"));
+    if native.is_file() {
+        return Ok(format!("XNA {version} is already in its Wine prefix."));
+    }
     let mut todo = vec![(game_root.to_path_buf(), 0)];
     let mut shipped = None;
     while let Some((dir, depth)) = todo.pop() {
@@ -2478,6 +2502,22 @@ fn install_xna(umu: &Path, tool_dir: Option<&Path>, prefix: &Path, component: &s
             (msi, "downloaded from Microsoft's archived page, as winetricks does")
         }
     };
+    let wine = |args: &[&str]| {
+        let mut command = Command::new(umu);
+        command.args(args).current_dir(msi.parent().unwrap_or(Path::new("/"))).env("WINEPREFIX", prefix).env("GAMEID", "umu-0");
+        if let Some(dir) = tool_dir {
+            command.env("PROTONPATH", dir);
+        }
+        command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status()
+    };
+    // XNA 4.0's installer quits at its launch check (NotWinFx4ClientAction) unless the registry
+    // says .NET 4's client profile is there; Wine Mono doesn't say so, but runs XNA 4.0 games
+    // (Clean'em Up). Passing NETFRAMEWORK4CLIENT=1 to msiexec didn't get past it.
+    if component == "xna40" {
+        let key = r"HKLM\Software\Microsoft\NET Framework Setup\NDP\v4\Client";
+        let _ = wine(&["reg", "add", key, "/v", "Install", "/t", "REG_DWORD", "/d", "1", "/f", "/reg:32"]);
+        let _ = wine(&["reg", "add", key, "/v", "Version", "/t", "REG_SZ", "/d", "4.0.30319", "/f", "/reg:32"]);
+    }
     let mut command = Command::new(umu);
     command.args(["msiexec", "/i"]).arg(msi.file_name().unwrap_or_default()).arg("/quiet").current_dir(msi.parent().unwrap_or(Path::new("/"))).env("WINEPREFIX", prefix).env("GAMEID", "umu-0");
     if let Some(dir) = tool_dir {
@@ -2485,7 +2525,6 @@ fn install_xna(umu: &Path, tool_dir: Option<&Path>, prefix: &Path, component: &s
     }
     let status = command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
     crate::disc::wait_for_prefix(prefix);
-    let native = prefix.join(format!("pfx/drive_c/Program Files (x86)/Common Files/Microsoft Shared/XNA/Framework/v{version}/XnaNative.dll"));
     match status {
         Ok(s) if s.success() && native.is_file() => Ok(format!("Installed XNA {version} into its Wine prefix ({source}; undo leaves it).")),
         Ok(s) if s.success() => Err(failed("the installer ended without putting XnaNative.dll in place")),

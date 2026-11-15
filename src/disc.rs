@@ -134,6 +134,47 @@ pub fn wait_for_prefix(prefix: &Path) {
     }
 }
 
+/// `wait_for_prefix` for an installer, stopping Microsoft's .NET Framework setup when the
+/// installer starts one (XNA games' installers run dotNetFx40_Full_setup.exe, which extracts to
+/// `C:\<20 hex digits>\Setup.exe ... /x86 /x64 /ia64 /web`): under Proton it sat for over 8
+/// minutes doing nothing (Clean'em Up), as winetricks' dotnet20sp2 did, so the installer never
+/// finished. Wine Mono stands in for .NET; stopped, the installer went on to its last page.
+/// Watches while `installer` (umu-run starting it) runs, then until the prefix is quiet.
+/// Whether one was stopped.
+pub fn wait_for_installer(prefix: &Path, installer: &mut std::process::Child) -> bool {
+    let keys: Vec<String> = ["WINEPREFIX=", "STEAM_COMPAT_DATA_PATH="].iter().map(|k| format!("{k}{}", prefix.display())).collect();
+    let mut quiet = 0;
+    let mut stopped = false;
+    while quiet < 3 {
+        let mut busy = installer.try_wait().is_ok_and(|s| s.is_none());
+        for entry in fs::read_dir("/proc").into_iter().flatten().flatten() {
+            let ours = fs::read(entry.path().join("environ")).is_ok_and(|env| {
+                env.split(|&b| b == 0).any(|v| keys.iter().any(|k| v == k.as_bytes() || (v.starts_with(k.as_bytes()) && v.get(k.len()) == Some(&b'/'))))
+            });
+            if !ours {
+                continue;
+            }
+            busy = true;
+            let cmdline = String::from_utf8_lossy(&fs::read(entry.path().join("cmdline")).unwrap_or_default()).to_lowercase();
+            if dotnet_setup(&cmdline) {
+                if let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() {
+                    stopped |= Command::new("kill").arg(pid.to_string()).status().is_ok_and(|s| s.success());
+                }
+            }
+        }
+        quiet = if busy { 0 } else { quiet + 1 };
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    stopped
+}
+
+/// Whether a Wine process's command line (lower case) is Microsoft's .NET Framework setup.
+fn dotnet_setup(cmdline: &str) -> bool {
+    let program = cmdline.split('\0').next().unwrap_or("");
+    let name = program.rsplit(['\\', '/']).next().unwrap_or("");
+    name.starts_with("dotnetfx") || (name.starts_with("ndp") && name.contains("-kb")) || (name == "setup.exe" && cmdline.contains("/x86\0/x64"))
+}
+
 /// Names of installed programs that aren't the game.
 const NOT_THE_PROGRAM: &[&str] = &["unins", "uninst", "readme", "help", "setup", "install", "regist", "update", "website", "manual", "support", "dxsetup"];
 
@@ -331,6 +372,15 @@ pub(crate) fn resolve(root: &Path, win: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dotnet_setups() {
+        assert!(dotnet_setup("c:\\users\\steamuser\\appdata\\local\\temp\\is-e23k3.tmp\\dotnetfx40_full_setup.exe\0/q\0/noreboot\0"));
+        assert!(dotnet_setup("c:\\c19dba6b2141b69dada0\\\\setup.exe\0/q\0/noreboot\0/x86\0/x64\0/ia64\0/web\0"));
+        assert!(dotnet_setup("c:\\temp\\ndp48-kb4486153-x86-x64-allos-enu.exe\0/q\0"));
+        assert!(!dotnet_setup("c:\\gamefix-setup\\cleanemup-setup.exe\0"));
+        assert!(!dotnet_setup("c:\\gamefix-setup\\setup.exe\0"));
+    }
 
     #[test]
     fn link_targets() {
