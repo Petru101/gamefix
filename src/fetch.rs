@@ -82,8 +82,13 @@ pub fn fetch(libs: &[String], bits: u8, dest: &Path) -> Fetched {
             }
         }
         copy_libs(&root, bits, dest, &mut out.files);
-        // What the copied libraries need that's nowhere yet.
+        // What the copied libraries need that's nowhere yet; a package's private library in a
+        // subfolder its RUNPATH names (Debian's libpulse0: pulseaudio/libpulsecommon-16.1.so,
+        // a folder other systems don't have) comes from the unpacked package first.
         want = needs(dest, bits, &system, &mut out.needs_runtime);
+        if copy_private(&root, bits, dest, &want, &mut out.files) {
+            want = needs(dest, bits, &system, &mut out.needs_runtime);
+        }
     }
     let _ = fs::remove_dir_all(&tmp);
     // Asked for but not there after all (a package that didn't download or unpack).
@@ -128,9 +133,14 @@ fn debian_package(lib: &str, bits: u8, suites: &[&'static str]) -> Option<(&'sta
     let keyword = lib.replace('+', "%2B");
     suites.iter().find_map(|&suite| {
         let page = get(&format!("https://packages.debian.org/search?searchon=contents&keywords={keyword}&mode=exactfilename&suite={suite}&arch={arch}"))?;
+        // The first row whose file sits right in a library folder: apulse's fake libpulse is
+        // in /usr/lib/x86_64-linux-gnu/apulse/ and came first, alphabetically, before libpulse0.
         let marker = format!("<a href=\"/{suite}/");
-        let start = page.find(&marker)? + marker.len();
-        let pkg = page[start..].split('"').next()?.to_string();
+        let pkg = page.split("<tr>").find_map(|row| {
+            let folder = row.split("<td class=\"file\">").nth(1)?.split("<span").next()?;
+            let start = row.find(&marker)? + marker.len();
+            library_folder(folder).then(|| row[start..].split('"').next().map(String::from)).flatten()
+        })?;
         let download = get(&format!("https://packages.debian.org/{suite}/{arch}/{pkg}/download"))?;
         // Mirror links look like http://ftp.us.debian.org/debian/pool/main/l/lua5.2/x.deb; a
         // package with security updates only has security.debian.org/debian-security/pool/updates/
@@ -144,6 +154,13 @@ fn debian_package(lib: &str, bits: u8, suites: &[&'static str]) -> Option<(&'sta
         let pool = &path[path.find("/pool/")?..];
         Some((suite, pkg, vec![format!("https://deb.debian.org/debian{pool}"), format!("https://archive.debian.org/debian{pool}")]))
     })
+}
+
+/// Whether a package's folder is one ld.so looks in (with or without the leading slash), not
+/// a subfolder of it.
+fn library_folder(folder: &str) -> bool {
+    let folder = folder.trim().trim_start_matches('/').trim_end_matches('/');
+    ["usr/lib", "lib", "usr/lib64", "lib64", "usr/lib/x86_64-linux-gnu", "lib/x86_64-linux-gnu", "usr/lib/i386-linux-gnu", "lib/i386-linux-gnu"].contains(&folder)
 }
 
 /// A library from one Debian release's package into `dest`, whether or not the system has its
@@ -200,6 +217,19 @@ fn copy_libs(root: &Path, bits: u8, dest: &Path, files: &mut Vec<PathBuf>) {
                 continue;
             }
             let copied = match fs::read_link(entry.path()) {
+                // A link to an absolute path (Ubuntu 16.04's libpng12.so.0 ->
+                // /lib/x86_64-linux-gnu/libpng12.so.0) would point into the system: followed
+                // inside the package to the real file, which is copied too, and linked by name.
+                Ok(target) if target.is_absolute() => match resolve_in(root, &entry.path()) {
+                    Some(real) => {
+                        let file = dest.join(real.file_name().unwrap_or_default());
+                        if !file.exists() && fs::copy(&real, &file).is_ok() {
+                            files.push(file.clone());
+                        }
+                        std::os::unix::fs::symlink(real.file_name().unwrap_or_default(), &to).is_ok()
+                    }
+                    None => false,
+                },
                 Ok(target) => std::os::unix::fs::symlink(target, &to).is_ok(),
                 Err(_) => entry.file_type().is_ok_and(|t| t.is_file()) && fs::copy(entry.path(), &to).is_ok(),
             };
@@ -208,6 +238,40 @@ fn copy_libs(root: &Path, bits: u8, dest: &Path, files: &mut Vec<PathBuf>) {
             }
         }
     }
+}
+
+/// Libraries named in `wanted` from one folder below the library folders of the unpacked
+/// packages into `dest`. Whether any was copied.
+fn copy_private(root: &Path, bits: u8, dest: &Path, wanted: &[String], files: &mut Vec<PathBuf>) -> bool {
+    let dirs: &[&str] = if bits == 64 { &["usr/lib64", "usr/lib/x86_64-linux-gnu"] } else { &["usr/lib", "usr/lib/i386-linux-gnu"] };
+    let mut copied = false;
+    for sub in dirs.iter().flat_map(|d| fs::read_dir(root.join(d)).into_iter().flatten().flatten()) {
+        for name in wanted {
+            let (from, to) = (sub.path().join(name), dest.join(name));
+            if sub.path().is_dir() && !to.exists() {
+                if let Some(real) = resolve_in(root, &from) {
+                    if fs::copy(&real, &to).is_ok() {
+                        files.push(to);
+                        copied = true;
+                    }
+                }
+            }
+        }
+    }
+    copied
+}
+
+/// Where a link inside an unpacked package leads, absolute targets taken inside `root`.
+fn resolve_in(root: &Path, link: &Path) -> Option<PathBuf> {
+    let mut path = link.to_path_buf();
+    for _ in 0..8 {
+        match fs::read_link(&path) {
+            Ok(target) if target.is_absolute() => path = root.join(target.strip_prefix("/").ok()?),
+            Ok(target) => path = path.parent()?.join(target),
+            Err(_) => return path.is_file().then_some(path),
+        }
+    }
+    None
 }
 
 /// Libraries the ones in `dest` need that neither the system nor `dest` has; ones only Steam's
@@ -254,7 +318,8 @@ fn ubuntu_package(lib: &str, bits: u8) -> Option<(&'static str, String, String)>
     let escaped: String = lib.chars().flat_map(|c| if ".+[]()*?^$|\\".contains(c) { vec!['\\', c] } else { vec![c] }).collect();
     UBUNTU_SUITES.iter().find_map(|&suite| {
         let contents = cached(&format!("https://archive.ubuntu.com/ubuntu/dists/{suite}/Contents-{arch}.gz"), &cache.join(format!("{suite}-Contents-{arch}.gz")))?;
-        let out = Command::new("zgrep").args(["-m1", "-E", &format!("^\\S*/{escaped}[[:space:]]")]).arg(&contents).output().ok()?;
+        // Right in a library folder, as for Debian's (not apulse's subfolder).
+        let out = Command::new("zgrep").args(["-m1", "-E", &format!("^(usr/)?lib(64|/x86_64-linux-gnu|/i386-linux-gnu)?/{escaped}[[:space:]]")]).arg(&contents).output().ok()?;
         let line = String::from_utf8_lossy(&out.stdout).into_owned();
         // The last field: "section/package", several separated by commas.
         let pkg = line.split_whitespace().last()?.split(',').next()?.rsplit('/').next()?.to_string();
@@ -281,4 +346,28 @@ fn cached(url: &str, path: &Path) -> Option<PathBuf> {
         fs::rename(&part, path).ok()?;
     }
     Some(path.to_path_buf())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn library_folders_and_links() {
+        assert!(library_folder("/usr/lib/x86_64-linux-gnu/") && library_folder("/lib/x86_64-linux-gnu/"));
+        assert!(!library_folder("/usr/lib/x86_64-linux-gnu/apulse/"));
+        let dir = std::env::temp_dir().join(format!("gamefix-fetchlinks-{}", std::process::id()));
+        let (root, dest) = (dir.join("root"), dir.join("dest"));
+        fs::create_dir_all(root.join("lib/x86_64-linux-gnu")).unwrap();
+        fs::create_dir_all(root.join("usr/lib/x86_64-linux-gnu")).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+        fs::write(root.join("lib/x86_64-linux-gnu/libpng12.so.0.54.0"), b"elf").unwrap();
+        std::os::unix::fs::symlink("libpng12.so.0.54.0", root.join("lib/x86_64-linux-gnu/libpng12.so.0")).unwrap();
+        std::os::unix::fs::symlink("/lib/x86_64-linux-gnu/libpng12.so.0", root.join("usr/lib/x86_64-linux-gnu/libpng12.so.0")).unwrap();
+        let mut files = Vec::new();
+        copy_libs(&root, 64, &dest, &mut files);
+        assert_eq!(fs::read_link(dest.join("libpng12.so.0")).unwrap(), PathBuf::from("libpng12.so.0.54.0"));
+        assert!(dest.join("libpng12.so.0").is_file());
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
