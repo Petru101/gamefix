@@ -672,16 +672,8 @@ fn check_files(game: &Game, system: &System) -> Report {
         match game.portable.map(|i| &game.files[i]) {
             Some(f) if matches!(f.binary, Binary::Love) => problems.push(Problem::Love { file: f.path.clone(), version: game.engine.as_ref().and_then(|e| e.version.clone()), love: system.love() }),
             Some(f) if matches!(f.binary, Binary::Jar) => {
-                let needs = binary::jar_needs(&game.full(f));
-                let java = if needs.nashorn {
-                    system.java_up_to(14).or_else(|| system.java())
-                } else if needs.old_lwjgl3 {
-                    system.java_up_to(16).or_else(|| system.java())
-                } else if needs.applet {
-                    system.java_lts().or_else(|| system.java())
-                } else {
-                    system.java()
-                };
+                let (_, min, max) = binary::jar_needs(&game.full(f)).java_range();
+                let java = system.java_between(min, max).or_else(|| system.java());
                 problems.push(Problem::Java { file: f.path.clone(), java });
             }
             Some(f) if matches!(f.binary, Binary::Script) => {
@@ -2416,7 +2408,12 @@ impl Report {
                     }
                     let needs = binary::jar_needs(&game.root.join(file));
                     let major = System::java_major(java);
-                    if needs.nashorn && !major.is_some_and(|v| v <= 14) {
+                    let (_, min, _) = needs.java_range();
+                    if major.is_some_and(|v| v < min) {
+                        let _ = writeln!(out, "✗ It's built for Java {min} or newer, and the Java it would get is {}: it would quit at", major.unwrap_or(0));
+                        let _ = writeln!(out, "  start (UnsupportedClassVersionError).");
+                        let _ = writeln!(out, "    Fix: gamefix setup offers to download Java {} for it.", needs.java_range().0);
+                    } else if needs.nashorn && !major.is_some_and(|v| v <= 14) {
                         let _ = writeln!(out, "  It runs JavaScript through Java's own engine (Nashorn), which Java 15 removed: it needs");
                         let _ = writeln!(out, "  Java 14 or older: gamefix setup offers to download Java 11 for it.");
                     } else if needs.old_lwjgl3 && !major.is_some_and(|v| v <= 16) {

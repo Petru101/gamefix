@@ -367,11 +367,49 @@ pub struct JarNeeds {
     /// (`user.home` + "/sheepfarmsimulator/log.txt"): Sheep Farm Simulator never makes it and
     /// quits on its log file (FileNotFoundException) when it isn't there.
     pub home_dir: Option<String>,
+    /// The oldest Java that can load its classes, its bundled libraries' included (a class
+    /// file's major version minus 44; 8 when they're older): an older one quits with
+    /// UnsupportedClassVersionError. Multi-release parts (META-INF/versions/) and
+    /// module-info.class, which older Java skips, don't count.
+    pub min_java: u32,
+}
+
+impl JarNeeds {
+    /// The Java to get when none installed fits, and the oldest and newest that run the jar:
+    /// 11 up to 14 for Nashorn, 11 up to 16 for LWJGL 3 before 3.1, 21 up to 25 for applets
+    /// (the versions tested with each), else the newest long-term one, 25. Its classes can
+    /// raise the oldest and the one to get.
+    pub fn java_range(&self) -> (u32, u32, u32) {
+        let (want, max) = if self.nashorn {
+            (11, 14)
+        } else if self.old_lwjgl3 {
+            (11, 16)
+        } else if self.applet {
+            (21, 25)
+        } else {
+            (25, u32::MAX)
+        };
+        let min = self.min_java.min(max);
+        (want.max(min), min, max)
+    }
+}
+
+/// The newest class-file version among class files laid end to end (`unzip -p` of many),
+/// as a Java version: each starts CAFEBABE, a minor and a major version (52 is Java 8).
+fn class_java(bytes: &[u8]) -> u32 {
+    bytes
+        .windows(8)
+        .filter(|w| w[..4] == [0xca, 0xfe, 0xba, 0xbe])
+        .map(|w| u16::from_be_bytes([w[6], w[7]]) as u32)
+        .filter(|m| (45..=90).contains(m))
+        .map(|m| m - 44)
+        .max()
+        .unwrap_or(0)
 }
 
 pub fn jar_needs(jar: &Path) -> JarNeeds {
     const LIBRARIES: &[&str] = &["org/lwjgl/", "org/newdawn/", "com/badlogic/", "net/java/", "com/jcraft/", "javazoom/", "paulscode/", "de/matthiasmann/", "org/jogamp/", "com/jogamp/", "jogamp/", "javax/", "kotlin/", "org/apache/", "com/google/", "org/json/", "com/esotericsoftware/", "org/ninjacave/"];
-    let mut needs = JarNeeds { applet: false, nashorn: false, old_lwjgl3: false, shader: None, home_dir: None };
+    let mut needs = JarNeeds { applet: false, nashorn: false, old_lwjgl3: false, shader: None, home_dir: None, min_java: 8 };
     let mut home = false;
     let mut folders: Vec<String> = Vec::new();
     let Ok(list) = std::process::Command::new("unzip").arg("-Z1").arg(jar).output() else { return needs };
@@ -383,13 +421,19 @@ pub fn jar_needs(jar: &Path) -> JarNeeds {
         let text = std::process::Command::new("unzip").arg("-p").arg(jar).arg(n).output().map(|o| o.stdout).unwrap_or_default();
         glsl_mismatch(&String::from_utf8_lossy(&text))
     }).map(String::from);
-    let names: Vec<&str> = all.lines().filter(|n| n.ends_with(".class") && !LIBRARIES.iter().any(|l| n.starts_with(l))).collect();
+    let names: Vec<&str> = all.lines().filter(|n| n.ends_with(".class") && !LIBRARIES.iter().any(|l| n.starts_with(l)) && !n.starts_with("META-INF/") && !n.ends_with("module-info.class")).collect();
     for chunk in names.chunks(500) {
         let out = std::process::Command::new("unzip").arg("-p").arg(jar).args(chunk).output().map(|o| o.stdout).unwrap_or_default();
         needs.applet |= out.windows(12).any(|w| w == b"java/applet/");
         needs.nashorn |= !engine && out.windows(32).any(|w| w == b"javax/script/ScriptEngineManager");
         home |= out.windows(9).any(|w| w == b"user.home");
+        needs.min_java = needs.min_java.max(class_java(&out));
         folders.extend(class_paths(&out).filter_map(|p| p.strip_prefix('/').and_then(|p| p.split_once('/')).map(|(dir, _)| dir.to_string())));
+    }
+    let libraries: Vec<&str> = all.lines().filter(|n| n.ends_with(".class") && LIBRARIES.iter().any(|l| n.starts_with(l)) && !n.ends_with("module-info.class")).collect();
+    for chunk in libraries.chunks(500) {
+        let out = std::process::Command::new("unzip").arg("-p").arg(jar).args(chunk).output().map(|o| o.stdout).unwrap_or_default();
+        needs.min_java = needs.min_java.max(class_java(&out));
     }
     // Only a folder named like the game: the jar's name or its folder's, letters and digits
     // compared ("sheepfarmsimulator" in "Sheep Farm Simulator 0.23.4.jar").
@@ -1518,5 +1562,22 @@ mod glsl_tests {
         assert!(!glsl_mismatch("#version 300 es\nvoid main(){ ivec2 s = textureSize(t, 0); }"));
         assert!(!glsl_mismatch("#version 330 compatibility\nvarying vec2 v;\nvoid main(){ gl_FragColor = vec4(1); }"));
         assert!(!glsl_mismatch("// textureSize(t, 0)\n/* texelFetch(t) */\nvoid main(){ gl_FragColor = vec4(1); }"));
+    }
+}
+
+#[cfg(test)]
+mod java_version_tests {
+    use super::{class_java, JarNeeds};
+
+    #[test]
+    fn class_versions_and_range() {
+        let class = |major: u16| [&[0xca, 0xfe, 0xba, 0xbe, 0, 0][..], &major.to_be_bytes(), b"\x00\x10rest of the class"].concat();
+        assert_eq!(class_java(&[class(50), class(52), class(49)].concat()), 8);
+        assert_eq!(class_java(&[class(52), class(65)].concat()), 21);
+        assert_eq!(class_java(b"no classes here"), 0);
+        let needs = |min_java, applet| JarNeeds { applet, nashorn: false, old_lwjgl3: false, shader: None, home_dir: None, min_java };
+        assert_eq!(needs(8, false).java_range(), (25, 8, u32::MAX));
+        assert_eq!(needs(27, false).java_range(), (27, 27, u32::MAX));
+        assert_eq!(needs(17, true).java_range(), (21, 17, 25));
     }
 }

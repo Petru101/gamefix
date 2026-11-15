@@ -1082,25 +1082,13 @@ pub fn missing_runner(game: &Game, report: &Report) -> Option<Runner> {
 /// The Java to download for a Java game when none on the system fits it (None: one does, or
 /// it isn't a Java game). Asking first is the caller's part, as for Flathub runners. 11 for
 /// Nashorn and LWJGL 3 before 3.1, 21 for applets and Processing (the versions tested with
-/// them), else 25, the newest long-term one.
+/// them), else 25, the newest long-term one, or the version its classes are built for when
+/// that's newer (`JarNeeds::java_range`).
 pub fn missing_java(game: &Game, report: &Report) -> Option<u32> {
     let (file, java) = report.problems.iter().find_map(|p| if let Problem::Java { file, java } = p { Some((file, java)) } else { None })?;
-    let (want, max) = if file.extension().is_some_and(|e| e == "jar") {
-        let needs = crate::binary::jar_needs(&game.root.join(file));
-        if needs.nashorn {
-            (11, 14)
-        } else if needs.old_lwjgl3 {
-            (11, 16)
-        } else if needs.applet {
-            (21, 25)
-        } else {
-            (25, u32::MAX)
-        }
-    } else {
-        (21, 25)
-    };
+    let (want, min, max) = if file.extension().is_some_and(|e| e == "jar") { crate::binary::jar_needs(&game.root.join(file)).java_range() } else { (21, 8, 25) };
     // A Java the game brings (Processing's java/, install4j's jre/) is the one it was made with.
-    let fits = java.as_ref().is_some_and(|j| j.starts_with(&game.root) || crate::system::System::java_major(j).map_or(max == u32::MAX, |v| v <= max));
+    let fits = java.as_ref().is_some_and(|j| j.starts_with(&game.root) || crate::system::System::java_major(j).map_or(max == u32::MAX && min <= 8, |v| (min..=max).contains(&v)));
     (!fits).then_some(want)
 }
 

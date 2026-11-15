@@ -39,8 +39,9 @@ In more detail:
   is open, and a one-colour screen on start.
 - **Games another program runs**, set up with the right version of that program:
   - LÖVE games on the LÖVE version they were made for (0.8, 0.9, 0.10 or 11)
-  - Java games on a Java version that still runs them (downloaded for you, after asking, when
-    none is installed)
+  - Java games on a Java version that runs them: new enough for what the game was built for,
+    old enough for the parts of Java it uses that newer versions removed (downloaded for you,
+    after asking, when none installed fits)
   - Python games in a Python of their own, with the packages they need
   - .NET games on Microsoft's .NET
   - DOS games in DOSBox Staging, GOG's DOS releases too (instead of the Windows DOSBox they bring)

@@ -214,6 +214,17 @@ impl System {
         found.pop().map(|(_, j)| j)
     }
 
+    /// A Java from `min` to `max`: the one `java()` finds when it's in range, else the newest
+    /// in range among Homebrew's openjdk@N and the runtimes gamefix downloaded. A Java whose
+    /// version can't be read counts only when there's no upper limit and the jar runs on 8.
+    pub fn java_between(&self, min: u32, max: u32) -> Option<PathBuf> {
+        let fits = |j: &Path| Self::java_major(j).map_or(max == u32::MAX && min <= 8, |v| (min..=max).contains(&v));
+        if let Some(java) = self.java().filter(|j| fits(j)) {
+            return Some(java);
+        }
+        self.java_up_to(max).filter(|j| fits(j))
+    }
+
     /// A Java's major version: one of Homebrew's openjdk@N by its folder, any other by its
     /// `release` file.
     pub fn java_major(java: &Path) -> Option<u32> {
