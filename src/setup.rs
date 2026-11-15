@@ -1920,13 +1920,23 @@ fn setup_install(game: &Game, installer: Installer, targets: &Targets) -> Result
     if game_folder.is_some_and(|f| rune_emulator(f, 0)) {
         add_rune(&mut env, &own, &mut done);
     }
-    let workdir = exe.parent().unwrap_or(&prefix);
+    // Unreal's launcher (an installed game's shortcut often points to it: Witch Cabin Cleanup's
+    // WCC.exe) only checks for Microsoft's VC++ runtime and refuses Proton's, then starts the
+    // game's program, which runs on it: started directly, as setup_windows does for downloads.
+    let (start, args): (PathBuf, Vec<String>) = match crate::binary::unreal_bootstrap(&exe) {
+        Some((target, own)) => {
+            done.push(format!("Starts {} directly, as Unreal's launcher would after checking for Microsoft's VC++ runtime (newer launchers refuse the one Proton brings).", target.strip_prefix(exe.parent().unwrap_or(&prefix)).unwrap_or(&target).display()));
+            (target, own.split_whitespace().map(String::from).collect())
+        }
+        None => (exe.clone(), Vec::new()),
+    };
+    let workdir = start.parent().unwrap_or(&prefix);
     let icon = windows_icon(game, &exe, &mut record);
     let fixed = fixes_tool.is_some();
     let tool = fixes_tool.unwrap_or(tool);
     if targets.menu {
         let umu_run = proton::umu_run(&mut done)?;
-        let exec = umu_command(&umu_run, steam.tool_dir(&tool).as_deref(), &env, &exe, &[]);
+        let exec = umu_command(&umu_run, steam.tool_dir(&tool).as_deref(), &env, &start, &args);
         let entry = write_entry_as(game, &name, &exec.iter().map(|a| exec_arg(a)).collect::<Vec<_>>(), workdir, &icon, false)?;
         // Undo goes backwards: the entry first in the file is removed last.
         record.insert(0, format!("created\t{}", entry.display()));
@@ -1936,9 +1946,9 @@ fn setup_install(game: &Game, installer: Installer, targets: &Targets) -> Result
         }
     }
     if targets.steam {
-        let line = launch_options(&env, &[], "");
+        let line = if args.is_empty() { launch_options(&env, &[], "") } else { shortcut_options(&env, &args) };
         let shortcuts = steam.shortcuts();
-        let shortcut = steam::Shortcut { name: &name, exe: &exe, start_dir: workdir, icon: if icon.starts_with('/') { &icon } else { "" }, launch_options: &line };
+        let shortcut = steam::Shortcut { name: &name, exe: &start, start_dir: workdir, icon: if icon.starts_with('/') { &icon } else { "" }, launch_options: &line };
         let appid = steam::add_shortcut(&shortcuts, &shortcut)?;
         record.push(format!("steam-shortcut\t{appid}\t{}", shortcuts.display()));
         let config = steam.config();

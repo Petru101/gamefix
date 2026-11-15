@@ -321,7 +321,7 @@ mod case_tests {
 
     #[test]
     fn wrong_case_names() {
-        let root = std::env::temp_dir().join(format!("gamefix-case-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("gamefix-rpgcase-{}", std::process::id()));
         let www = root.join("Game/www");
         for d in ["data", "js/plugins", "img/titles1", "img/system", "audio/se"] {
             fs::create_dir_all(www.join(d)).unwrap();
