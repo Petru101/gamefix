@@ -873,6 +873,17 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
                 }
             }
             Problem::UnityH264(_) => not_fixed.push("Its H.264 videos: Unity's Linux player can't play them; the Windows download with Proton can.".into()),
+            Problem::WrongCase(files) => {
+                let mut made = 0;
+                for (file, wanted) in files {
+                    let link = file.with_file_name(wanted);
+                    if link.symlink_metadata().is_err() && std::os::unix::fs::symlink(file.file_name().unwrap_or_default(), &link).is_ok() {
+                        record.push(format!("created\t{}", link.display()));
+                        made += 1;
+                    }
+                }
+                done.push(format!("Added {made} link{} under the names the game asks for, whose upper/lower case differs from its files' (Windows doesn't mind, Linux does).", if made == 1 { "" } else { "s" }));
+            }
             Problem::NwjsFonts(_) => {
                 env.push(("FONTCONFIG_FILE", plain_fonts()?.display().to_string()));
                 done.push("Gives its NW.js a plain font list it can read (at launch; the first start takes longer).".into());

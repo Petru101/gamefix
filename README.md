@@ -32,6 +32,9 @@ In more detail:
   whose FMOD sound fails, programs with their own copy of a library the graphics driver also
   uses, and pygame bundles that can't play MP3.
 - **Libraries newer glibc refuses** ("cannot enable executable stack").
+- **RPG Maker MV and MZ games that stop with "Loading Error":** they ask for a file as
+  `Ninja_00.png` when it's `ninja_00.png`, which only Windows forgives. gamefix adds the name
+  the game asks for as a link next to the file.
 - **Old Unity games:** blank menus with no text (no Arial font), quitting at once while Steam
   is open, and a one-colour screen on start.
 - **Games another program runs**, set up with the right version of that program:

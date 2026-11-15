@@ -157,6 +157,9 @@ pub enum Problem {
     /// NW.js on Chromium 59-73 quits at start with "Could not find the default font" under
     /// current fontconfig rules (lilac & her light and others, 65; 38-58 and 74-78 are fine). The Chromium version.
     NwjsFonts(String),
+    /// RPG Maker MV/MZ files asked for by a name whose case differs from the file's
+    /// (`rpgmaker::wrong_case`): the file and the name to link to it.
+    WrongCase(Vec<(PathBuf, String)>),
     /// Native libraries FNA.dll.config maps to that are neither shipped nor installed
     /// (Shipwreck's download has empty lib/ and lib64/).
     FnaLibs(Vec<String>),
@@ -1200,6 +1203,10 @@ fn check_files(game: &Game, system: &System) -> Report {
     if !statics.is_empty() {
         problems.push(Problem::DotnetStatic(statics));
     }
+    let wrong = crate::rpgmaker::wrong_case(&game.root);
+    if !wrong.is_empty() {
+        problems.push(Problem::WrongCase(wrong));
+    }
     if game.engine.as_ref().is_some_and(|e| e.name == "NW.js") {
         let lib = [main_dir.join("lib/libnw.so"), game.full(main)].into_iter().find(|p| p.is_file());
         if let Some(version) = lib.and_then(|l| chromium_version(&l)).filter(|v| v.split('.').next().and_then(|m| m.parse::<u32>().ok()).is_some_and(|m| (59..74).contains(&m))) {
@@ -1882,6 +1889,14 @@ impl Report {
                     let _ = writeln!(out, "✗ There's no program to run here, but there's an archive the game may still be packed in:");
                     let _ = writeln!(out, "      {}", path.display());
                     let _ = writeln!(out, "    Fix: unpack it (right-click → Extract), then check the folder it makes.");
+                }
+                Problem::WrongCase(files) => {
+                    let (file, wanted) = &files[0];
+                    let more = if files.len() > 1 { format!(" and {} more", files.len() - 1) } else { String::new() };
+                    let _ = writeln!(out, "✗ It asks for files by names whose upper and lower case differ from the files' own:");
+                    let _ = writeln!(out, "  {wanted} is {}{more}. Windows doesn't mind, Linux does: the game stops with", file.file_name().unwrap_or_default().to_string_lossy());
+                    let _ = writeln!(out, "  its \"Loading Error\" when it gets there.");
+                    let _ = writeln!(out, "    Fix: a link under each asked-for name next to the file; gamefix setup adds them.");
                 }
                 Problem::NwjsFonts(version) => {
                     let _ = writeln!(out, "✗ Its NW.js (Chromium {version}) may quit at start with \"Could not find the default font\":");

@@ -116,6 +116,96 @@ pub fn unpack(file: &Path, to: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// RPG Maker MV/MZ files the game asks for by a name whose upper and lower case differ from
+/// the file's: Windows finds them anyway, Linux doesn't, and the game stops with its own
+/// "Loading Error" (Quidget: its title plugin asks for img/titles1/Ninja_00, the file is
+/// ninja_00.png). The names are every quoted or path piece of its data (`data/*.json`) and
+/// plugins (`js/plugins.js`, `js/plugins/*.js`) that matches an image, sound or movie's name
+/// apart from case, with or without its ending. Each as (the file, the name to add beside it,
+/// with the file's own ending). The game's folder is `www/` (MV) or the top (MZ), at most one
+/// folder down.
+pub fn wrong_case(root: &Path) -> Vec<(PathBuf, String)> {
+    let candidates = [root.to_path_buf(), root.join("www")].into_iter().chain(fs::read_dir(root).into_iter().flatten().flatten().flat_map(|e| [e.path(), e.path().join("www")]));
+    let Some(dir) = candidates.into_iter().find(|d| d.join("data/System.json").is_file() && d.join("js").is_dir()) else { return Vec::new() };
+    // Asset files by their name in lower case without the ending (and with it).
+    let mut assets: std::collections::HashMap<String, Vec<PathBuf>> = std::collections::HashMap::new();
+    let mut todo: Vec<(PathBuf, u32)> = ["img", "audio", "movies"].iter().map(|d| (dir.join(d), 0)).collect();
+    while let Some((d, depth)) = todo.pop() {
+        for entry in fs::read_dir(&d).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if depth < 3 {
+                    todo.push((path, depth + 1));
+                }
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let stem = name.split('.').next().unwrap_or(&name).to_lowercase();
+            assets.entry(stem).or_default().push(path.clone());
+            assets.entry(name.to_lowercase()).or_default().push(path);
+        }
+    }
+    let mut sources: Vec<PathBuf> = fs::read_dir(dir.join("data")).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "json")).collect();
+    sources.push(dir.join("js/plugins.js"));
+    sources.extend(fs::read_dir(dir.join("js/plugins")).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "js")));
+    let mut out: Vec<(PathBuf, String)> = Vec::new();
+    for source in sources {
+        let Ok(text) = fs::read_to_string(&source) else { continue };
+        for piece in quoted_values(&text).iter().flat_map(|v| v.split(['/', ',']).map(str::trim).collect::<Vec<_>>()) {
+            if piece.is_empty() || piece.len() > 120 {
+                continue;
+            }
+            let Some(files) = assets.get(&piece.to_lowercase()) else { continue };
+            for file in files {
+                let name = file.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                // The asked-for name with the file's own ending ("Ninja_00" + ".png").
+                let wanted = if name.to_lowercase() == piece.to_lowercase() { piece.to_string() } else { format!("{piece}{}", &name[name.find('.').unwrap_or(name.len())..]) };
+                if wanted != name && !file.with_file_name(&wanted).exists() && !out.iter().any(|(f, w)| f == file && *w == wanted) {
+                    out.push((file.clone(), wanted));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The quoted strings of JSON or JavaScript that aren't keys (not followed by ':': the data's
+/// `"damage": {...}` isn't img/system/Damage.png), escapes honoured; a string holding quotes
+/// itself (plugins.js keeps plugin settings as JSON inside strings) is read the same way.
+fn quoted_values(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let quote = chars[i];
+        if quote != '"' && quote != '\'' && quote != '`' {
+            i += 1;
+            continue;
+        }
+        let mut value = String::new();
+        let mut j = i + 1;
+        while j < chars.len() && chars[j] != quote && chars[j] != '\n' {
+            if chars[j] == '\\' && j + 1 < chars.len() {
+                j += 1;
+            }
+            value.push(chars[j]);
+            j += 1;
+        }
+        if j >= chars.len() || chars[j] == '\n' {
+            i = j + 1;
+            continue;
+        }
+        let key = chars[j + 1..].iter().find(|c| !c.is_whitespace()) == Some(&':');
+        if !key && value.contains('"') {
+            out.extend(quoted_values(&value));
+        } else if !key && !value.is_empty() && value.len() <= 300 {
+            out.push(value);
+        }
+        i = j + 1;
+    }
+    out
+}
+
 fn data_home() -> PathBuf {
     std::env::var_os("XDG_DATA_HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/share"))
 }
@@ -222,5 +312,29 @@ mod tests {
         assert_eq!(kind_of(&names(&["Game.ini", "Game.rgss3a"])), Some("RPG Maker VX Ace"));
         assert_eq!(kind_of(&names(&["SKELETON.exe", "data.win"])), None);
         assert_eq!(ini_value("[Game]\r\nLibrary=RGSS102E.dll\r\nRTP1=Standard\r\n", "library").as_deref(), Some("RGSS102E.dll"));
+    }
+}
+
+#[cfg(test)]
+mod case_tests {
+    use super::*;
+
+    #[test]
+    fn wrong_case_names() {
+        let root = std::env::temp_dir().join(format!("gamefix-case-{}", std::process::id()));
+        let www = root.join("Game/www");
+        for d in ["data", "js/plugins", "img/titles1", "img/system", "audio/se"] {
+            fs::create_dir_all(www.join(d)).unwrap();
+        }
+        fs::write(www.join("data/System.json"), r#"{"damage":{"x":1},"title1Name":"empty","sounds":[{"name":"Cursor1"}]}"#).unwrap();
+        fs::write(www.join("js/plugins.js"), r#"var $plugins = [{"parameters":{"Logo":"{\"file\":\"img/titles1/Logo\"}"}}];"#).unwrap();
+        fs::write(www.join("js/plugins/Title.js"), "var images = [\"Ninja_00\", 'Ninja_01'];").unwrap();
+        for f in ["img/titles1/ninja_00.png", "img/titles1/ninja_01.rpgmvp", "img/titles1/logo.png", "img/system/Damage.png", "audio/se/Cursor1.ogg"] {
+            fs::write(www.join(f), b"x").unwrap();
+        }
+        let mut found: Vec<String> = wrong_case(&root.join("Game")).into_iter().map(|(f, w)| format!("{}>{w}", f.file_name().unwrap().to_string_lossy())).collect();
+        found.sort();
+        assert_eq!(found, ["logo.png>Logo.png", "ninja_00.png>Ninja_00.png", "ninja_01.rpgmvp>Ninja_01.rpgmvp"]);
+        let _ = fs::remove_dir_all(&root);
     }
 }
