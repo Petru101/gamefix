@@ -2317,7 +2317,9 @@ fn setup_windows(game: &Game, report: &Report, exe: &crate::scan::Found, targets
         shortcut_id = Some(appid);
     }
     match (&own_prefix, shortcut_id) {
-        (Some(prefix), _) => winetricks_into(&steam, &proton, prefix, &components, &game.root, &mut done, &mut not_fixed),
+        (Some(prefix), _) => {
+            winetricks_into(steam.tool_dir(&proton).as_deref(), prefix, &components, &game.root, &mut done, &mut not_fixed);
+        }
         (None, Some(appid)) => install_components(&steam, game, appid, &components, &mut done, &mut not_fixed, &mut record),
         (None, None) => {}
     }
@@ -2394,24 +2396,30 @@ fn gog_prefix(steam: &Steam, tool: &str, game: &Game, gog: &crate::gog::Info, he
 }
 
 /// Windows components (winetricks) for a game run in a prefix of gamefix's own, which
-/// protontricks doesn't know: umu-run's winetricks into that prefix.
-fn winetricks_into(steam: &Steam, tool: &str, prefix: &Path, components: &[&str], game_root: &Path, done: &mut Vec<String>, not_fixed: &mut Vec<String>) {
+/// protontricks doesn't know, or a Steam prefix on a system without protontricks: umu-run's
+/// winetricks into that prefix (`prefix` is the folder holding `pfx`), with the Proton in
+/// `tool_dir`. Whether all of them went in.
+fn winetricks_into(tool_dir: Option<&Path>, prefix: &Path, components: &[&str], game_root: &Path, done: &mut Vec<String>, not_fixed: &mut Vec<String>) -> bool {
+    let mut all = true;
     // XNA goes in by its own installer: winetricks' recipes install Microsoft's .NET first
     // (dotnet20sp2 for 3.1, dotnet40 for 4.0), which hung in GE-Proton's prefix with nothing
     // running, and XNA doesn't need it: on Wine Mono ColorLogic (XNA 3.1) plays.
     let (xna, components): (Vec<&str>, Vec<&str>) = components.iter().partition(|c| matches!(**c, "xna31" | "xna40"));
     for component in xna {
-        match proton::umu_run(done).map_err(|e| e.to_string()).and_then(|umu| install_xna(&umu, steam.tool_dir(tool).as_deref(), prefix, component, game_root)) {
+        match proton::umu_run(done).map_err(|e| e.to_string()).and_then(|umu| install_xna(&umu, tool_dir, prefix, component, game_root)) {
             Ok(note) => done.push(note),
-            Err(e) => not_fixed.push(e),
+            Err(e) => {
+                all = false;
+                not_fixed.push(e);
+            }
         }
     }
     if components.is_empty() {
-        return;
+        return all;
     }
     let list = components.join(" ");
-    let installed = proton::umu_run(done).ok().zip(steam.tool_dir(tool)).is_some_and(|(umu, tool_dir)| {
-        let status = Command::new(umu).arg("winetricks").arg("-q").args(proton::winetricks_args(Some(&tool_dir), &components)).env("WINEPREFIX", prefix).env("PROTONPATH", tool_dir).env("GAMEID", "umu-0").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
+    let installed = proton::umu_run(done).ok().zip(tool_dir).is_some_and(|(umu, tool_dir)| {
+        let status = Command::new(umu).arg("winetricks").arg("-q").args(proton::winetricks_args(Some(tool_dir), &components)).env("WINEPREFIX", prefix).env("PROTONPATH", tool_dir).env("GAMEID", "umu-0").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
         crate::disc::wait_for_prefix(prefix);
         status.is_ok_and(|s| s.success())
     });
@@ -2420,6 +2428,14 @@ fn winetricks_into(steam: &Steam, tool: &str, prefix: &Path, components: &[&str]
     } else {
         not_fixed.push(format!("Installing {list} with winetricks failed; `WINEPREFIX={} umu-run winetricks {list}` in a terminal shows why.", prefix.display()));
     }
+    all && installed
+}
+
+/// The Proton that last ran in a Steam prefix (`compatdata`: the folder holding `pfx`): Proton
+/// writes its own fonts folder as the second line of `config_info` there.
+fn prefix_proton(compatdata: &Path) -> Option<PathBuf> {
+    let info = fs::read_to_string(compatdata.join("config_info")).ok()?;
+    Path::new(info.lines().nth(1)?.trim()).ancestors().find(|d| d.join("proton").is_file()).map(Path::to_path_buf)
 }
 
 /// Microsoft's XNA redistributable (`component`: xna31 or xna40) into `prefix` with msiexec,
@@ -2729,7 +2745,8 @@ fn shortcut_options(env: &[(&str, String)], args: &[String]) -> String {
 }
 
 /// Installs winetricks components into the game's Proton prefix with protontricks (the host's,
-/// else Flathub's). The prefix only exists once Steam has started the game, so before that
+/// else Flathub's); on a system with neither, with umu-run's winetricks and the Proton that last
+/// ran in the prefix (another one would convert it). The prefix only exists once Steam has started the game, so before that
 /// it says to start it once and set it up again. Undo leaves them: a prefix can't be cleanly
 /// rolled back, and they're harmless there.
 fn install_components(steam: &Steam, game: &Game, appid: u32, components: &[&str], done: &mut Vec<String>, not_fixed: &mut Vec<String>, record: &mut Vec<String>) {
@@ -2745,10 +2762,23 @@ fn install_components(steam: &Steam, game: &Game, appid: u32, components: &[&str
     let run = |mut command: Command| command.arg(appid.to_string()).arg("-q").args(&args).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().is_ok_and(|s| s.success());
     let installed = match Command::new("protontricks").arg("--version").output() {
         Ok(_) => run(Command::new("protontricks")),
-        Err(_) => {
+        Err(_) if Command::new("flatpak").args(["info", "com.github.Matoking.protontricks"]).output().is_ok_and(|o| o.status.success()) => {
             let mut flatpak = Command::new("flatpak");
             flatpak.args(["run", "com.github.Matoking.protontricks"]);
             run(flatpak)
+        }
+        Err(_) => {
+            let compatdata = steam.prefix(&game.root, appid);
+            let compatdata = compatdata.parent().unwrap_or(&compatdata);
+            match prefix_proton(compatdata) {
+                Some(tool_dir) => {
+                    if winetricks_into(Some(&tool_dir), compatdata, components, &game.root, done, not_fixed) {
+                        record.push(format!("installed\t{appid}\t{list}"));
+                    }
+                }
+                None => not_fixed.push(format!("The Windows parts it needs ({list}) weren't installed: this system has no protontricks, and which Proton made the game's prefix couldn't be read. Protontricks (on Flathub) can install them: `protontricks {appid} {list}`.")),
+            }
+            return;
         }
     };
     if installed {
