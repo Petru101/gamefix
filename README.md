@@ -60,7 +60,10 @@ In more detail:
   [protonfixes](https://github.com/Open-Wine-Components/umu-protonfixes) has a fix for, it
   tells protonfixes which game it is. GOG games start the way GOG Galaxy
   starts them, and GOG's first-run helper is run once. It runs installers and installs from disc
-  images once, then adds the installed game to Steam. Repacks (FitGirl's and the like) install
+  images once, then adds the installed game to your app menu or Steam; when an installer starts
+  Microsoft's .NET setup, which hangs under Proton, gamefix stops it (Wine's own .NET stands
+  in). XNA games packaged with ClickOnce (a `setup.exe` beside an `Application Files` folder)
+  run straight from their files. Repacks (FitGirl's and the like) install
   with GE-Proton, whose memory layout their unpacker needs; optional parts you didn't download
   aren't offered, and the installed files are checked against the repack's own list. Games
   using RUNE's Steam emulator get the Wine settings it needs. Games whose controller code
@@ -68,7 +71,9 @@ In more detail:
   with gilrs before 0.6.8) start without controller support instead, playable with keyboard and
   mouse. Games packed in an Unreal Development
   Kit installer (`UDKInstall-<name>.exe`) are unpacked next to it instead. It can also add Windows parts an old game needs
-  (MFC, Visual Basic 6, XNA, and whatever else winetricks can install) to its Proton setup.
+  (MFC, Visual Basic 6, XNA 3.1 and 4.0, and whatever else winetricks can install) to its Proton
+  setup. Games made with XNA 3.0 or older can't be helped: Microsoft no longer offers those, and
+  gamefix says so.
 
 A download that hasn't finished is caught before anything runs: gamefix says which files aren't
 all there yet and leaves the game alone until they are.
@@ -153,8 +158,9 @@ gamefix prefers changes that work from any shortcut, made where they belong:
   - an app-menu entry in `~/.local/share/applications`
   - a Steam shortcut, or the Steam game's own launch options (fixes for a game's Linux
     version turn themselves off if you later switch it to Proton in Steam)
-- **In gamefix's own folders** (`~/.local/share/gamefix`): libraries, runtimes, fonts, and
-  Wine prefixes for games that need one of their own (undo keeps those: your saves are in them).
+- **In gamefix's own folders** (`~/.local/share/gamefix`): libraries, runtimes, fonts, links
+  that let a ClickOnce game run under its files' real names, and Wine prefixes for games that
+  need one of their own (undo keeps those: your saves are in them).
 
 Every change is recorded, and `gamefix undo` takes it back. Shared downloads stay after undo
 because other games can use them: LÖVE builds, .NET, Python and Java runtimes, GE-Proton,
@@ -162,7 +168,10 @@ and Flathub apps.
 
 gamefix never runs a game's files to find out what's wrong; it only reads them. It downloads
 only what a fix needs: distribution packages, LÖVE's own builds, Microsoft's .NET, Python
-builds, GE-Proton, umu-launcher (when the system has no umu-run), RPG Maker's runtime package and Java (Eclipse Temurin, from adoptium.net).
+builds, GE-Proton, umu-launcher (when the system has no umu-run), RPG Maker's runtime package,
+Windows parts through winetricks, Microsoft's XNA installer (from the Internet Archive's copy,
+checked against winetricks' checksum, unless the game brings one) and Java (Eclipse Temurin,
+from adoptium.net).
 Before installing an app from Flathub or downloading Java, it asks.
 
 ## Reporting problems
@@ -181,7 +190,8 @@ on GitHub are welcome too.
 
 gamefix is young. It's built and tested on Bazzite (Fedora) with KDE Plasma, against several
 hundred itch.io games from 2014 to 2025 run in a virtual machine, and the author's own Steam
-library. It's written for any distribution, but others are untested. The right-click menu
+library. It's written for any distribution and checked in virtual machines with Ubuntu 24.04
+and 26.04, Fedora 44 and Arch; other distributions are untested. The right-click menu
 needs Dolphin. On other desktops, use the commands; results show in a notification.
 
 ## Building
