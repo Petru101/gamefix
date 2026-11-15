@@ -190,11 +190,33 @@ fn download(url: &str, to: &Path) -> bool {
 
 /// A .deb is an `ar` archive holding data.tar.*: unpack that into `root`.
 pub fn extract_deb(deb: &Path, root: &Path, work: &Path) -> bool {
-    if fs::create_dir_all(work).is_err() || !Command::new("ar").arg("x").arg(deb).current_dir(work).status().is_ok_and(|s| s.success()) {
-        return false;
-    }
-    let Some(data) = fs::read_dir(work).into_iter().flatten().flatten().map(|e| e.path()).find(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("data.tar"))) else { return false };
+    let Some(data) = fs::create_dir_all(work).ok().and_then(|()| ar_member(deb, "data.tar", work)) else { return false };
     Command::new("tar").arg("-xf").arg(&data).arg("-C").arg(root).status().is_ok_and(|s| s.success())
+}
+
+/// The first member of a Unix `ar` archive (a .deb is one) whose name starts with `prefix`,
+/// written into `dir`. Read here rather than with binutils' `ar`, which minimal Arch and Ubuntu
+/// desktops needn't have. Members: a 60-byte header (name in 16 bytes, "/"-ended in GNU's
+/// form; size in decimal at 48..58), the data, a padding byte after odd sizes.
+fn ar_member(archive: &Path, prefix: &str, dir: &Path) -> Option<PathBuf> {
+    let data = fs::read(archive).ok()?;
+    let mut pos = b"!<arch>\n".len();
+    if !data.starts_with(b"!<arch>\n") {
+        return None;
+    }
+    while pos + 60 <= data.len() {
+        let header = &data[pos..pos + 60];
+        let name = String::from_utf8_lossy(&header[..16]).trim_end().trim_end_matches('/').to_string();
+        let size: usize = String::from_utf8_lossy(&header[48..58]).trim().parse().ok()?;
+        let start = pos + 60;
+        let end = start.checked_add(size).filter(|&e| e <= data.len())?;
+        if name.starts_with(prefix) && !name.contains('/') && !name.contains("..") {
+            let out = dir.join(&name);
+            return fs::write(&out, &data[start..end]).ok().map(|()| out);
+        }
+        pos = end + (size & 1);
+    }
+    None
 }
 
 /// `rpm2cpio x.rpm | cpio -idm` in `root`.
@@ -351,6 +373,30 @@ fn cached(url: &str, path: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ar_members() {
+        let dir = std::env::temp_dir().join(format!("gamefix-ar-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let member = |name: &str, body: &[u8]| {
+            let mut m = format!("{:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n", name, 0, 0, 0, 100644, body.len()).into_bytes();
+            m.extend_from_slice(body);
+            if body.len() % 2 == 1 {
+                m.push(b'\n');
+            }
+            m
+        };
+        let mut deb = b"!<arch>\n".to_vec();
+        deb.extend(member("debian-binary", b"2.0\n"));
+        deb.extend(member("control.tar.xz/", b"abc"));
+        deb.extend(member("data.tar.zst/", b"payload"));
+        fs::write(dir.join("x.deb"), &deb).unwrap();
+        let out = ar_member(&dir.join("x.deb"), "data.tar", &dir).unwrap();
+        assert_eq!(out, dir.join("data.tar.zst"));
+        assert_eq!(fs::read(&out).unwrap(), b"payload");
+        assert!(ar_member(&dir.join("x.deb"), "nothing", &dir).is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn library_folders_and_links() {
