@@ -698,6 +698,21 @@ fn console_image(path: &Path, f: &mut File, head: &[u8], ext: &str) -> Option<&'
     }
 }
 
+/// An Electron program's versions, from the user-agent text Chromium builds into it
+/// ("Chrome/85.0.4183.121 Electron/10.4.7"): Electron's version and Chromium's major one, both
+/// read from that one text.
+pub fn electron(program: &Path) -> Option<(String, u32)> {
+    // Every " Electron/" in turn: the first may be the template ("Chrome/%s Electron/10.4.7").
+    let data = std::fs::read(program).ok()?;
+    data.windows(10).enumerate().filter(|(_, w)| *w == b" Electron/").find_map(|(at, _)| {
+        let before = String::from_utf8_lossy(&data[at.saturating_sub(48)..at]).into_owned();
+        let chrome: u32 = before.rsplit_once("Chrome/")?.1.split('.').next()?.parse().ok()?;
+        let electron: String = String::from_utf8_lossy(&data[at + 10..(at + 30).min(data.len())]).chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+        let electron = electron.trim_end_matches('.').to_string();
+        (!electron.is_empty()).then_some((electron, chrome))
+    })
+}
+
 fn read_at(f: &mut File, off: u64, len: usize) -> Option<Vec<u8>> {
     let mut buf = vec![0; len];
     f.seek(SeekFrom::Start(off)).ok()?;

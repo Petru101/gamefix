@@ -592,8 +592,14 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
             Problem::OwnLibstdcxx(Some(_)) | Problem::OwnHarfbuzz(_, Some(_), _) | Problem::Shadowed(.., Some(_)) | Problem::ExecStack(_) | Problem::DotnetIcu(_) | Problem::NwjsFonts(_) | Problem::OldPulse(_) | Problem::Alsa32(Some(_))
         )
     });
+    // Arguments for the program itself, after it (Electron's --disable-gpu-sandbox).
+    let mut game_args: Vec<String> = Vec::new();
     for problem in report.problems.iter().chain(inside) {
         match problem {
+            Problem::OldElectron { electron, .. } => {
+                game_args.push("--disable-gpu-sandbox".into());
+                done.push(format!("Starts its Electron {electron} without the sandbox of its graphics process, which today's system calls stop (at launch)."));
+            }
             Problem::NotExecutable(_) => {
                 let mode = fs::metadata(&program).map_err(|e| e.to_string())?.permissions().mode();
                 fs::set_permissions(&program, fs::Permissions::from_mode(mode | 0o111)).map_err(|e| e.to_string())?;
@@ -949,6 +955,7 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
             exec.extend(["sh", "-c", &format!("{wrap} exec \"$@\" \"$0\"")].map(exec_arg));
         }
         exec.push(exec_arg(&start.display().to_string()));
+        exec.extend(game_args.iter().map(|a| exec_arg(a)));
         let entry = write_entry(game, &exec, workdir, &icon, terminal)?;
         record.push(format!("created\t{}", entry.display()));
         done.push(format!("Added \"{}\" to the app menu, under Games{}.", game.name, if terminal { " (it opens in a terminal)" } else { "" }));
@@ -961,7 +968,7 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
         // A Steam game: its own launch options, keeping whatever was there.
         let file = steam.localconfig();
         let previous = steam::launch_options(&file, appid)?;
-        let options = native_options(&env, old_runtime.as_deref(), wrap.as_deref(), previous.as_deref().unwrap_or(""));
+        let options = with_game_args(native_options(&env, old_runtime.as_deref(), wrap.as_deref(), previous.as_deref().unwrap_or("")), &game_args);
         if options != previous.clone().unwrap_or_default() {
             steam::set_launch_options(&file, appid, Some(&options))?;
             let previous = previous.map_or("-".to_string(), |p| format!("={p}"));
@@ -975,7 +982,7 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
             exe: &start,
             start_dir: workdir,
             icon: if icon.starts_with('/') { &icon } else { "" },
-            launch_options: &native_options(&env, old_runtime.as_deref(), wrap.as_deref(), ""),
+            launch_options: &with_game_args(native_options(&env, old_runtime.as_deref(), wrap.as_deref(), ""), &game_args),
         };
         let appid = steam::add_shortcut(&file, &shortcut)?;
         record.push(format!("steam-shortcut\t{appid}\t{}", file.display()));
@@ -2551,6 +2558,23 @@ fn umu_command(umu_run: &Path, tool_dir: Option<&Path>, env: &[(&str, String)], 
     command
 }
 
+/// Launch options with arguments for the program after it: Steam puts the program last in
+/// whatever it runs, so they go through `sh -c 'exec "$@" <args>' sh %command%`, as for Windows
+/// shortcuts (`shortcut_options`). Unchanged when there are none, or they're already there.
+fn with_game_args(options: String, args: &[String]) -> String {
+    if args.is_empty() || options.contains("exec \"$@\"") {
+        return options;
+    }
+    let script = format!("exec \"$@\" {}", args.iter().map(|a| sh_word(a)).collect::<Vec<_>>().join(" "));
+    let wrapped = format!("sh -c {} sh %command%", sh_word(&script));
+    if options.contains("%command%") {
+        options.replacen("%command%", &wrapped, 1)
+    } else {
+        // Bare game arguments (or nothing) were all there was: they stay after the program.
+        format!("{wrapped} {options}").trim_end().to_string()
+    }
+}
+
 /// A non-Steam shortcut's launch options. Steam drops `%command%` from them and puts its launch
 /// helpers and the program at the very end (seen in its console log), so arguments for the
 /// program can't follow `%command%`: `sh -c 'exec "$@" <arguments>' sh %command%` puts them
@@ -2871,6 +2895,14 @@ fn refresh_menu() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn game_args_in_launch_options() {
+        let args = vec!["--disable-gpu-sandbox".to_string()];
+        assert_eq!(with_game_args("A=1 %command%".into(), &args), "A=1 sh -c 'exec \"$@\" --disable-gpu-sandbox' sh %command%");
+        assert_eq!(with_game_args(String::new(), &args), "sh -c 'exec \"$@\" --disable-gpu-sandbox' sh %command%");
+        assert_eq!(with_game_args("A=1 %command%".into(), &[]), "A=1 %command%");
+    }
 
     #[test]
     fn runtime_words() {

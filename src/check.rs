@@ -47,6 +47,11 @@ pub enum Problem {
     /// window can't open (ScreenSelector.so needs GTK 2): one colour fills the screen (Baldi's
     /// Basics, Brownie Cove, Precedence). Steam's runtime has GTK 2; its run.sh, if any.
     UnityResolution(Option<PathBuf>),
+    /// An Electron program on a Chromium older than 94 (its version strings): its GPU process's
+    /// sandbox kills it on today's glibc (clone3 and other calls it doesn't know; Chromium
+    /// handled them from mid-2021), and after a few tries Chromium quits ("GPU process isn't
+    /// usable. Goodbye."). GameCore (Electron 10.4.7, Chromium 85) did; Electron 21 and 22 ran.
+    OldElectron { electron: String, chrome: u32 },
     /// A Unity program without its `<name>_Data` folder: the upload is incomplete (PicoPico's
     /// is the Linux program alone; ESCAPE's the Windows one; Car Crash's the .exe and a loose
     /// mainData), and Unity quits with "There is no data folder".
@@ -1037,6 +1042,9 @@ fn check_files(game: &Game, system: &System) -> Report {
     // none and the game gets no sound (Sascha's PyInstaller bundle, libpulse 0.9.22).
     let old_pulse = game.files.iter().any(|f| f.path.file_name().is_some_and(|n| n.to_string_lossy().starts_with("libpulsecommon-0.")))
         || (elf.pyinstaller && binary::contains(&game.full(main), b"libpulsecommon-0."));
+    if let Some((electron, chrome)) = binary::electron(&game.full(main)).filter(|(_, chrome)| *chrome < 94) {
+        problems.push(Problem::OldElectron { electron, chrome });
+    }
     if old_pulse {
         problems.push(Problem::OldPulse(pulse_socket()));
     }
@@ -2163,6 +2171,12 @@ impl Report {
                     let _ = writeln!(out, "• {} is an installer (Epic's UDK installer) with the game packed inside it.", file.display());
                     let _ = writeln!(out, "  gamefix setup unpacks the game into the folder \"{}\" next to it, without running", crate::setup::unpacked_name(file));
                     let _ = writeln!(out, "  the installer, and sets that up.");
+                }
+                Problem::OldElectron { electron, chrome } => {
+                    let _ = writeln!(out, "✗ It's built on Electron {electron} (Chromium {chrome}), from before Chromium knew today's");
+                    let _ = writeln!(out, "  system calls: the sandbox of its graphics process stops it, and the game quits at once");
+                    let _ = writeln!(out, "  (\"GPU process isn't usable. Goodbye.\").");
+                    let _ = writeln!(out, "    Fix (at launch): start it with --disable-gpu-sandbox (only that process's sandbox); gamefix setup adds it.");
                 }
                 Problem::UnityResolution(run) => {
                     let _ = writeln!(out, "✗ When its start-up resolution window is on (most games), this Unity version (2018.2-2018.3)");
