@@ -152,7 +152,9 @@ pub fn relocate(from: &Path, to: &Path) -> Result<Vec<String>, String> {
         records.iter().flat_map(|(_, t)| t.lines().filter_map(|l| l.strip_prefix(kind)?.strip_prefix('\t').map(|r| r.split('\t').map(String::from).collect())).collect::<Vec<_>>()).collect()
     };
     let shortcuts: Vec<(u32, PathBuf)> = lines("steam-shortcut").into_iter().filter_map(|f| Some((f.first()?.parse().ok()?, PathBuf::from(f.get(1)?)))).collect();
-    let change = |s: &str| repoint(s, from, to, true);
+    // Launch options are a command line: a path that now has a space gets quoted. Exe and
+    // StartDir are already in double quotes, the icon is a plain path.
+    let change = |key: &str, s: &str| if key.eq_ignore_ascii_case("LaunchOptions") { repoint_command(s, from, to, sh_word) } else { repoint(s, from, to, false) };
     let due: Vec<&(u32, PathBuf)> = shortcuts.iter().filter(|(id, file)| steam::edit_shortcut(file, *id, &change, false).unwrap_or(false)).collect();
     if !due.is_empty() && Steam::find().is_some_and(|s| s.running()) {
         return Err(STEAM_OPEN.into());
@@ -167,7 +169,7 @@ pub fn relocate(from: &Path, to: &Path) -> Result<Vec<String>, String> {
     texts.extend(lines("installed-game").into_iter().filter_map(|f| f.into_iter().next()).map(|p| PathBuf::from(repoint(&p, from, to, false)).join(INSTALL_NOTE)));
     for file in texts {
         let Ok(text) = fs::read_to_string(&file) else { continue };
-        let new = repoint(&text, from, to, file.extension().is_some_and(|x| x == "desktop"));
+        let new = if file.extension().is_some_and(|x| x == "desktop") { repoint_entry(&text, from, to) } else { repoint(&text, from, to, false) };
         if new != text {
             let tmp = file.with_extension("gamefix-tmp");
             fs::write(&tmp, &new).and_then(|()| fs::rename(&tmp, &file)).map_err(|e| format!("{}: {e}", file.display()))?;
@@ -200,6 +202,79 @@ pub fn relocate(from: &Path, to: &Path) -> Result<Vec<String>, String> {
         done.push(format!("Pointed {named} of gamefix's game records at {}.", to.display()));
     }
     Ok(done)
+}
+
+/// A command line (`quote`: `sh_word` for launch options, `exec_arg` for menu entries) with the
+/// folder `from` replaced by `to` word by word, each changed word quoted again: a move into a
+/// folder with a space ("Downloaded Games") left `--filesystem=/…/Downloaded Games/simant`
+/// bare in SimAnt's Exec, which then started nothing.
+fn repoint_command(text: &str, from: &Path, to: &Path, quote: fn(&str) -> String) -> String {
+    let mut out = String::new();
+    let mut last = 0;
+    for (start, end, value) in command_words(text) {
+        let new = repoint(&value, from, to, false);
+        if new != value {
+            out.push_str(&text[last..start]);
+            out.push_str(&quote(&new));
+            last = end;
+        }
+    }
+    out + &text[last..]
+}
+
+/// A desktop entry with `from` replaced by `to`: Exec lines (Lobby's kept copy of one too) as
+/// command lines, the rest (Path, Icon, X-Gamefix-Game) as plain values. An Exec value is
+/// escaped twice: as a string (`\\` for a backslash, `\s` a space ...), then as a command line
+/// (double quotes, a backslash before `"`, `` ` ``, `$`, `\`); the words are read and quoted at
+/// the command line's level, the string escaping undone first and done again after.
+fn repoint_entry(text: &str, from: &Path, to: &Path) -> String {
+    fn quote(arg: &str) -> String {
+        if !arg.is_empty() && arg.chars().all(|c| c.is_ascii_alphanumeric() || "/-_.=+:,%".contains(c)) {
+            return arg.to_string();
+        }
+        let mut out = String::from("\"");
+        for c in arg.chars() {
+            if matches!(c, '"' | '`' | '$' | '\\') {
+                out.push('\\');
+            }
+            out.push(c);
+        }
+        out + "\""
+    }
+    let unescape = |v: &str| {
+        let mut out = String::new();
+        let mut chars = v.chars();
+        while let Some(c) = chars.next() {
+            if c != '\\' {
+                out.push(c);
+                continue;
+            }
+            match chars.next() {
+                Some('s') => out.push(' '),
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('r') => out.push('\r'),
+                Some(o) => out.push(o),
+                None => out.push('\\'),
+            }
+        }
+        out
+    };
+    let mut out: Vec<String> = text
+        .lines()
+        .map(|l| match l.split_once('=') {
+            Some((key, value)) if key.ends_with("Exec") && !key.starts_with("Try") => {
+                let command = unescape(value);
+                let new = repoint_command(&command, from, to, quote);
+                if new == command { l.to_string() } else { format!("{key}={}", new.replace('\\', "\\\\")) }
+            }
+            _ => repoint(l, from, to, false),
+        })
+        .collect();
+    if text.ends_with('\n') {
+        out.push(String::new());
+    }
+    out.join("\n")
 }
 
 /// `text` with the folder `from` replaced by `to` where it's a whole path or the start of one:
@@ -2687,7 +2762,7 @@ pub fn repair_runtime() -> Vec<String> {
                 let file = Path::new(file);
                 match *kind {
                     "steam-shortcut" => {
-                        let change = |s: &str| repoint_runtime(s, &new, sh_word).unwrap_or_else(|| s.to_string());
+                        let change = |_: &str, s: &str| repoint_runtime(s, &new, sh_word).unwrap_or_else(|| s.to_string());
                         if steam::edit_shortcut(file, appid, &change, true).unwrap_or(false) {
                             changed.push(format!("{} (shortcut {appid})", file.display()));
                         }
@@ -3189,6 +3264,27 @@ mod tests {
         assert_eq!(setup_folder_name("Mycopunk", false), ".Mycopunk (Windows setup)");
         assert_eq!(setup_folder_name("A/B", false), ".A B (Windows setup)");
         assert_eq!(setup_folder_name(".hidden", false), ".hidden (Windows setup)");
+    }
+
+    #[test]
+    fn moved_paths_with_spaces_are_quoted() {
+        let (from, to) = (Path::new("/home/u/Downloads/simant"), Path::new("/home/u/Downloads/Downloaded Games/simant"));
+        // SimAnt's entry: bare words that now hold a space get quoted; Path stays a plain value.
+        let entry = "[Desktop Entry]\nExec=flatpak run --filesystem=/home/u/Downloads/simant io.github.dosbox-staging -conf /home/u/Downloads/simant/a.conf %%f\nPath=/home/u/Downloads/simant\n";
+        let new = repoint_entry(entry, from, to);
+        assert_eq!(new, "[Desktop Entry]\nExec=flatpak run \"--filesystem=/home/u/Downloads/Downloaded Games/simant\" io.github.dosbox-staging -conf \"/home/u/Downloads/Downloaded Games/simant/a.conf\" %%f\nPath=/home/u/Downloads/Downloaded Games/simant\n");
+        let exec = new.lines().nth(1).unwrap().strip_prefix("Exec=").unwrap();
+        let words: Vec<String> = command_words(exec).into_iter().map(|w| w.2).collect();
+        assert_eq!(words[2], "--filesystem=/home/u/Downloads/Downloaded Games/simant");
+        // A word already quoted, with characters both escapings touch: stays one word, text kept.
+        let entry = "Exec=env \"WINEPREFIX=/g/a\\\\$b c\" x\n";
+        let new = repoint_entry(entry, Path::new("/g"), Path::new("/h h"));
+        assert_eq!(new, "Exec=env \"WINEPREFIX=/h h/a\\\\$b c\" x\n");
+        // Untouched lines stay byte for byte.
+        assert_eq!(repoint_entry("Exec=\"/other/x\" \\s\nName=A\n", from, to), "Exec=\"/other/x\" \\s\nName=A\n");
+        // Steam launch options: single quotes.
+        assert_eq!(repoint_command("STEAM_COMPAT_DATA_PATH=/home/u/Downloads/simant/pfx %command%", from, to, sh_word), "'STEAM_COMPAT_DATA_PATH=/home/u/Downloads/Downloaded Games/simant/pfx' %command%");
+        assert_eq!(repoint_command("A='/home/u/Downloads/simant/x y' %command%", from, to, sh_word), "'A=/home/u/Downloads/Downloaded Games/simant/x y' %command%");
     }
 
     #[test]
