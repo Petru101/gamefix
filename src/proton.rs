@@ -251,6 +251,25 @@ pub enum Provider {
     OldXna(&'static str),
 }
 
+/// Whether a Wine prefix (its `drive_c`) already has a part setup installed there: the DLL in
+/// the Windows folder the program's bitness loads from (system32 for 64-bit or in a 32-bit
+/// prefix, syswow64 for 32-bit in a 64-bit one), XNA where its installer puts XnaNative.dll.
+/// Kenshi's check kept asking for mfc100u.dll after winetricks had put it in its prefix.
+pub fn in_prefix(drive_c: &Path, dll: &str, provider: &Provider, bits64: bool) -> bool {
+    let xna = match provider {
+        Provider::Component("xna40") => Some("4.0"),
+        Provider::Component("xna31") => Some("3.1"),
+        _ => None,
+    };
+    if let Some(version) = xna {
+        return drive_c.join(format!("Program Files (x86)/Common Files/Microsoft Shared/XNA/Framework/v{version}/XnaNative.dll")).is_file();
+    }
+    let windows = drive_c.join("windows");
+    let folder = if bits64 || !windows.join("syswow64").is_dir() { windows.join("system32") } else { windows.join("syswow64") };
+    let want = dll.to_lowercase();
+    folder.join(&want).is_file() || fs::read_dir(&folder).into_iter().flatten().flatten().any(|e| e.file_name().to_string_lossy().to_lowercase() == want && e.path().is_file())
+}
+
 /// The winetricks component providing a DLL Wine lacks: Microsoft's debug runtimes are a
 /// developer's build (never redistributable); else what winetricks itself says installs it
 /// (`winetricks_dlls`); else the short list of what old games use, for when no winetricks is

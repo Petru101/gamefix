@@ -789,7 +789,15 @@ fn check_files(game: &Game, system: &System) -> Report {
             if let Some(version) = crate::proton::gilrs_crash(&game.full(&game.files[i])) {
                 problems.push(Problem::GamepadCrash(version));
             }
-            let parts = crate::proton::missing_parts(&game.full(&game.files[i]));
+            let program = game.full(&game.files[i]);
+            let mut parts = crate::proton::missing_parts(&program);
+            // Not what setup already put into the game's own prefix (winetricks' mfc100 for
+            // Kenshi's installed copy).
+            if !parts.is_empty() {
+                let prefixes = crate::setup::known_prefixes(&program, &game.root);
+                let bits64 = matches!(crate::binary::identify(&program), Some(crate::binary::Binary::Pe(pe)) if pe.bits == 64);
+                parts.retain(|(dll, provider)| !prefixes.iter().any(|p| crate::proton::in_prefix(p, dll, provider, bits64)));
+            }
             if !parts.is_empty() {
                 problems.push(Problem::MissingWindowsParts(parts));
             }

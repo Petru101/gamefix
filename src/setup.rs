@@ -84,6 +84,46 @@ fn record_for(name: &str) -> PathBuf {
     data_home().join("gamefix/games").join(format!("{}.log", slug(name)))
 }
 
+/// The Wine prefixes (their `drive_c` folders) the Windows program `program` runs in, as far as
+/// gamefix knows: what a record of its setup names (a prefix of its own, an installed game's,
+/// a Steam shortcut's compatdata) and Steam's for a Steam game. A record is the program's when
+/// it installed it or its app-menu entry starts it.
+pub fn known_prefixes(program: &Path, root: &Path) -> Vec<PathBuf> {
+    let real = |p: &Path| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let me = real(program);
+    let named = |text: &str| text.contains(&*program.to_string_lossy()) || text.contains(&*me.to_string_lossy());
+    let steam = Steam::find();
+    let mut found = Vec::new();
+    let records = fs::read_dir(data_home().join("gamefix/games")).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == "log"));
+    for record in records {
+        let text = fs::read_to_string(&record).unwrap_or_default();
+        let lines: Vec<Vec<&str>> = text.lines().map(|l| l.split('\t').collect()).collect();
+        let mine = lines.iter().any(|f| match f.as_slice() {
+            ["installed-game", _, exe, ..] => real(Path::new(exe)) == me,
+            ["created", entry] if entry.ends_with(".desktop") => fs::read_to_string(entry).unwrap_or_default().lines().any(|l| l.starts_with("Exec=") && named(l)),
+            _ => false,
+        });
+        if !mine {
+            continue;
+        }
+        for f in &lines {
+            match f.as_slice() {
+                ["game-prefix", p] | ["installed-game", p, ..] => found.push(PathBuf::from(p)),
+                ["steam-shortcut", id, ..] => found.extend(id.parse().ok().zip(steam.as_ref()).map(|(id, s)| s.prefix(root, id))),
+                _ => {}
+            }
+        }
+    }
+    if let (Some(appid), Some(s)) = (steam::installed_app(root), &steam) {
+        found.push(s.prefix(root, appid));
+    }
+    // umu's prefixes hold drive_c themselves (and `pfx -> .`), Steam's keep it under pfx.
+    let mut drives: Vec<PathBuf> = found.iter().flat_map(|p| [p.join("drive_c"), p.join("pfx/drive_c")]).filter(|d| d.is_dir()).map(|d| real(&d)).collect();
+    drives.sort();
+    drives.dedup();
+    drives
+}
+
 /// Whether a game named this has been set up (has a record).
 pub fn set_up_as(name: &str) -> bool {
     record_for(name).exists()
