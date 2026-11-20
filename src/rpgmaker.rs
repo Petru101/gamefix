@@ -119,9 +119,11 @@ pub fn unpack(file: &Path, to: &Path) -> Result<(), String> {
 /// RPG Maker MV/MZ files the game asks for by a name whose upper and lower case differ from
 /// the file's: Windows finds them anyway, Linux doesn't, and the game stops with its own
 /// "Loading Error" (Quidget: its title plugin asks for img/titles1/Ninja_00, the file is
-/// ninja_00.png). The names are every quoted or path piece of its data (`data/*.json`) and
-/// plugins (`js/plugins.js`, `js/plugins/*.js`) that matches an image, sound or movie's name
-/// apart from case, with or without its ending. Each as (the file, the name to add beside it,
+/// ninja_00.png). The names are every quoted or path piece of its data (`data/*.json`),
+/// plugins (`js/plugins.js`, `js/plugins/*.js`) and style sheets (`fonts/*.css`, `css/*.css`:
+/// Natari's gamefont.css asks for MainFont.TTF, the file is MainFont.ttf, and its boot scene
+/// waits for the font on "Now Loading..." for ever) that matches an image, sound, movie or
+/// font's name apart from case, with or without its ending. Each as (the file, the name to add beside it,
 /// with the file's own ending). The game's folder is `www/` (MV) or the top (MZ), at most one
 /// folder down.
 pub fn wrong_case(root: &Path) -> Vec<(PathBuf, String)> {
@@ -129,7 +131,7 @@ pub fn wrong_case(root: &Path) -> Vec<(PathBuf, String)> {
     let Some(dir) = candidates.into_iter().find(|d| d.join("data/System.json").is_file() && d.join("js").is_dir()) else { return Vec::new() };
     // Asset files by their name in lower case without the ending (and with it).
     let mut assets: std::collections::HashMap<String, Vec<PathBuf>> = std::collections::HashMap::new();
-    let mut todo: Vec<(PathBuf, u32)> = ["img", "audio", "movies"].iter().map(|d| (dir.join(d), 0)).collect();
+    let mut todo: Vec<(PathBuf, u32)> = ["img", "audio", "movies", "fonts"].iter().map(|d| (dir.join(d), 0)).collect();
     while let Some((d, depth)) = todo.pop() {
         for entry in fs::read_dir(&d).into_iter().flatten().flatten() {
             let path = entry.path();
@@ -140,6 +142,12 @@ pub fn wrong_case(root: &Path) -> Vec<(PathBuf, String)> {
                 continue;
             }
             let name = entry.file_name().to_string_lossy().into_owned();
+            // Fonts only from fonts/: its gamefont.css would match the "GameFont" family name
+            // plugins write (Koi, Quidget), a name nothing loads as a file.
+            let font = [".ttf", ".otf", ".woff", ".woff2"].iter().any(|x| name.to_lowercase().ends_with(x));
+            if d.starts_with(dir.join("fonts")) && !font {
+                continue;
+            }
             let stem = name.split('.').next().unwrap_or(&name).to_lowercase();
             assets.entry(stem).or_default().push(path.clone());
             assets.entry(name.to_lowercase()).or_default().push(path);
@@ -148,6 +156,7 @@ pub fn wrong_case(root: &Path) -> Vec<(PathBuf, String)> {
     let mut sources: Vec<PathBuf> = fs::read_dir(dir.join("data")).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "json")).collect();
     sources.push(dir.join("js/plugins.js"));
     sources.extend(fs::read_dir(dir.join("js/plugins")).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "js")));
+    sources.extend(["fonts", "css"].iter().flat_map(|d| fs::read_dir(dir.join(d)).into_iter().flatten().flatten()).map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("css"))));
     let mut out: Vec<(PathBuf, String)> = Vec::new();
     for source in sources {
         let Ok(text) = fs::read_to_string(&source) else { continue };
@@ -323,18 +332,20 @@ mod case_tests {
     fn wrong_case_names() {
         let root = std::env::temp_dir().join(format!("gamefix-rpgcase-{}", std::process::id()));
         let www = root.join("Game/www");
-        for d in ["data", "js/plugins", "img/titles1", "img/system", "audio/se"] {
+        for d in ["data", "js/plugins", "img/titles1", "img/system", "audio/se", "fonts"] {
             fs::create_dir_all(www.join(d)).unwrap();
         }
         fs::write(www.join("data/System.json"), r#"{"damage":{"x":1},"title1Name":"empty","sounds":[{"name":"Cursor1"}]}"#).unwrap();
         fs::write(www.join("js/plugins.js"), r#"var $plugins = [{"parameters":{"Logo":"{\"file\":\"img/titles1/Logo\"}"}}];"#).unwrap();
-        fs::write(www.join("js/plugins/Title.js"), "var images = [\"Ninja_00\", 'Ninja_01'];").unwrap();
-        for f in ["img/titles1/ninja_00.png", "img/titles1/ninja_01.rpgmvp", "img/titles1/logo.png", "img/system/Damage.png", "audio/se/Cursor1.ogg"] {
+        fs::write(www.join("js/plugins/Title.js"), "var images = [\"Ninja_00\", 'Ninja_01']; var f = 'GameFont';").unwrap();
+        for f in ["img/titles1/ninja_00.png", "img/titles1/ninja_01.rpgmvp", "img/titles1/logo.png", "img/system/Damage.png", "audio/se/Cursor1.ogg", "fonts/MainFont.ttf", "fonts/mplus-1m-regular.ttf"] {
             fs::write(www.join(f), b"x").unwrap();
         }
+        // Natari's gamefont.css (CRLF, and a missing ";" as in the real one); the stock one matches.
+        fs::write(www.join("fonts/gamefont.css"), "@font-face {\r\n    font-family: GameFont;\r\n    src: url(\"MainFont.TTF\");\r\n}\r\n@font-face { font-family: B\r\n src: url(\"mplus-1m-regular.ttf\"); }\r\n").unwrap();
         let mut found: Vec<String> = wrong_case(&root.join("Game")).into_iter().map(|(f, w)| format!("{}>{w}", f.file_name().unwrap().to_string_lossy())).collect();
         found.sort();
-        assert_eq!(found, ["logo.png>Logo.png", "ninja_00.png>Ninja_00.png", "ninja_01.rpgmvp>Ninja_01.rpgmvp"]);
+        assert_eq!(found, ["MainFont.ttf>MainFont.TTF", "logo.png>Logo.png", "ninja_00.png>Ninja_00.png", "ninja_01.rpgmvp>Ninja_01.rpgmvp"]);
         let _ = fs::remove_dir_all(&root);
     }
 }
