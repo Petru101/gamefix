@@ -1573,9 +1573,13 @@ fn program_path(name: &str) -> Option<PathBuf> {
 /// "<game> (Windows setup)" when the installer put the game elsewhere, often beside it under
 /// the game's own name (Mycopunk's repack: the game in E:\Mycopunk, its prefix "Mycopunk 2",
 /// which read like a second copy).
+/// The installed game's Windows folder (its prefix): the game's name when the game is inside,
+/// else ".<name> (Windows setup)", hidden: its drive links (Z: is the whole system, D: onwards
+/// each drive) sent Dolphin's file search in the games folder through every drive, and Dolphin
+/// never goes into hidden folders. Lobby gives older ones the same name.
 fn setup_folder_name(name: &str, game_inside: bool) -> String {
     let base = folder_name(name);
-    if game_inside { base } else { format!("{base} (Windows setup)") }
+    if game_inside { base } else { format!(".{base} (Windows setup)") }
 }
 
 /// What a Windows game is installed from.
@@ -1934,7 +1938,10 @@ fn setup_install(game: &Game, installer: Installer, targets: &Targets) -> Result
     add_no_gamepad(&mut env, proton::gilrs_crash(&exe).as_deref(), &mut done);
     // Windows parts the installed program needs that Proton lacks (an XNA game whose installer
     // only got as far as .NET: Clean'em Up), into the install's prefix.
-    let parts = proton::missing_parts(&exe);
+    let mut parts = proton::missing_parts(&exe);
+    // Not what's in the prefix already (set up again: Kenshi's mfc100).
+    let bits64 = matches!(crate::binary::identify(&exe), Some(crate::binary::Binary::Pe(pe)) if pe.bits == 64);
+    parts.retain(|(dll, provider)| ![prefix.join("drive_c"), prefix.join("pfx/drive_c")].iter().any(|d| proton::in_prefix(d, dll, provider, bits64)));
     if let Some(version) = parts.iter().find_map(|(_, p)| if let proton::Provider::OldXna(v) = p { Some(*v) } else { None }) {
         not_fixed.push(format!("XNA {version}, which it's made with: nothing installs it any more (Microsoft took it down; winetricks has 3.1 and 4.0), so it won't start until a copy of xnafx{}_redist.msi is installed into its prefix.", version.replace('.', "")));
     }
@@ -3179,8 +3186,9 @@ mod tests {
     #[test]
     fn setup_folder_names() {
         assert_eq!(setup_folder_name("Bookworm Deluxe", true), "Bookworm Deluxe");
-        assert_eq!(setup_folder_name("Mycopunk", false), "Mycopunk (Windows setup)");
-        assert_eq!(setup_folder_name("A/B", false), "A B (Windows setup)");
+        assert_eq!(setup_folder_name("Mycopunk", false), ".Mycopunk (Windows setup)");
+        assert_eq!(setup_folder_name("A/B", false), ".A B (Windows setup)");
+        assert_eq!(setup_folder_name(".hidden", false), ".hidden (Windows setup)");
     }
 
     #[test]
