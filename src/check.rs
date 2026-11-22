@@ -715,6 +715,9 @@ fn check_files(game: &Game, system: &System) -> Report {
                 let plan = (!v2).then(|| crate::python::plan(&game.root, &game.files, &f.path));
                 problems.push(Problem::Python { file: f.path.clone(), v2, plan });
             }
+            // A script pointed at that starts something other than the folder's own program
+            // (`scan::scan`): nothing of the folder's is the game, and what it starts isn't read.
+            None if game.alone.as_ref().is_some_and(|a| game.files.iter().any(|f| &f.path == a && matches!(f.binary, Binary::Script))) => {}
             None => {
                 let damaged = game.files.iter().find(|f| matches!(f.binary, Binary::Damaged));
                 // A Windows program as high up as the package is the game: PvZ2 Reflourished's
@@ -1810,6 +1813,9 @@ impl Report {
                 _ => "Python game".into(),
             };
             let _ = writeln!(out, "  Runs:  {} ({what})", f.path.display());
+        }
+        if let Some(script) = game.alone.as_ref().filter(|a| game.main().is_none() && game.portable.is_none() && game.files.iter().any(|f| &f.path == *a && matches!(f.binary, Binary::Script))) {
+            let _ = writeln!(out, "  Starts: {} (a script: gamefix doesn't follow what it starts; check that game's own program or folder for it)", script.display());
         }
         if !self.windows.is_empty() && game.windows.is_none() && game.cd_installer.is_none() {
             let _ = writeln!(out, "  {}: {}", if game.main().is_some() { "Also has a Windows build" } else { "Windows build" }, self.windows.iter().map(|(p, bits)| format!("{} ({bits}-bit)", p.display())).collect::<Vec<_>>().join(", "));

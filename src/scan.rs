@@ -103,7 +103,7 @@ pub fn scan(path: &Path) -> Option<Game> {
     // Absolute, so what setup writes works from anywhere.
     let path = &fs::canonicalize(path).ok()?;
     let meta = fs::metadata(path).ok()?;
-    let (root, chosen) = if meta.is_dir() {
+    let (root, mut chosen) = if meta.is_dir() {
         (path.to_path_buf(), None)
     } else {
         (path.parent()?.to_path_buf(), Some(PathBuf::from(path.file_name()?)))
@@ -113,6 +113,7 @@ pub fn scan(path: &Path) -> Option<Game> {
     // games beside it): the file is named after itself, so two games there don't share a
     // record, and the other downloads are left out of its report.
     let mut among_others = false;
+    let (mut launcher, mut lone_script) = (false, false);
     match &chosen {
         Some(c) => {
             let binary = binary::identify(&root.join(c));
@@ -121,6 +122,24 @@ pub fn scan(path: &Path) -> Option<Game> {
             if shared_folder(&root) || binary.as_ref().is_some_and(self_contained) {
                 among_others = shared_folder(&root) || other_downloads_beside(&root, c);
                 files.extend(binary.map(|binary| Found { path: c.clone(), binary }));
+            } else if binary.as_ref().is_some_and(|b| matches!(b, Binary::Script)) {
+                // A script pointed at is how the game starts. One that starts the folder's own
+                // program (a developer's launcher: Gravitus Minus' run.sh, a Processing export's
+                // script) means the folder, as if it had been pointed at; any other is checked
+                // alone: the user's Skyrim play-test script starts Proton from a folder of their
+                // own .NET tools, which were reported as a Windows build needing .NET.
+                walk(&root, Path::new(""), 0, &mut files);
+                let pick = pick_main(&root, &files).or_else(|| pick_portable(&root, &files)).map(|i| files[i].path.clone());
+                // Not an install or uninstall script (GOG's support/postinst.sh starts its yad
+                // dialog tool; an install.sh copies the game elsewhere).
+                let name = c.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+                let installs = ["install", "postinst", "preinst", "preuninst", "postrm", "prerm", "uninst"].iter().any(|w| name.starts_with(w));
+                if !installs && pick.is_some_and(|p| p == *c || p.file_name().is_some_and(|n| binary::starts_program(&root.join(c), &n.to_string_lossy()))) {
+                    launcher = true;
+                } else {
+                    files.retain(|f| &f.path == c);
+                    lone_script = true;
+                }
             } else {
                 walk(&root, Path::new(""), 0, &mut files);
                 let own = pick_main(&root, &files).or_else(|| pick_windows(&root, &files)).map(|i| files[i].path.clone());
@@ -134,6 +153,11 @@ pub fn scan(path: &Path) -> Option<Game> {
         }
         None => walk(&root, Path::new(""), 0, &mut files),
     }
+    if launcher {
+        chosen = None;
+    }
+    // A lone script in a shared folder (Downloads) is checked alone too.
+    lone_script |= chosen.as_ref().is_some_and(|c| files.len() == 1 && files[0].path == *c && matches!(files[0].binary, Binary::Script));
 
     // The file pointed at, if it's the kind wanted; never an installer, which is only run to
     // install the game (it used to be added to Steam as the game).
@@ -212,11 +236,11 @@ pub fn scan(path: &Path) -> Option<Game> {
         _ => program.and_then(|i| engine(&root, &files[i].path, &files)),
     };
     let unity = program.and_then(|i| unity_product(&root, &files[i].path));
-    let lone = chosen.as_ref().filter(|_| among_others).map(|c| file_title(&root, c));
+    let lone = chosen.as_ref().filter(|_| among_others || lone_script).map(|c| file_title(&root, c));
     // The title the game's own files give (NW.js, RPG Maker MV/MZ): a folder named "mz-kh4"
     // or "Game49-Win64/Windows" says little. Not for a file among other downloads.
     let program_dir = program.or(portable).map(|i| root.join(files[i].path.parent().unwrap_or(Path::new(""))));
-    let own = if among_others { None } else { program_dir.as_deref().and_then(own_title).or_else(|| own_title(&root)) };
+    let own = if among_others || lone_script { None } else { program_dir.as_deref().and_then(own_title).or_else(|| own_title(&root)) };
     let name = unity
         .clone()
         .or_else(|| lone.clone())
@@ -233,7 +257,7 @@ pub fn scan(path: &Path) -> Option<Game> {
         .or_else(|| root.file_name().map(|n| n.to_string_lossy().into_owned()))
         .unwrap_or_else(|| root.display().to_string());
     let name = if earlier != name && crate::setup::set_up_as(&earlier) && !crate::setup::set_up_as(&name) { earlier } else { name };
-    let alone = chosen.filter(|c| among_others || files.iter().any(|f| &f.path == c && matches!(f.binary, Binary::Archive | Binary::Disc)));
+    let alone = chosen.filter(|c| among_others || lone_script || files.iter().any(|f| &f.path == c && matches!(f.binary, Binary::Archive | Binary::Disc)));
     Some(Game { root, name, files, main, windows, portable, cd_installer, linux_installer, packed, disc, archive, engine, alone })
 }
 
@@ -1000,6 +1024,27 @@ fn unity_product(root: &Path, main: &Path) -> Option<String> {
 mod tests {
     use super::{file_title, folder_title, love_guess_code, own_title, platform_title};
     use std::path::Path;
+
+    #[test]
+    fn scripts_pointed_at() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("gamefix-scripts-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("tools")).unwrap();
+        // A Linux program of the folder's own, its launcher, and a script starting something else.
+        std::fs::copy("/bin/true", dir.join("mygame")).unwrap();
+        std::fs::write(dir.join("run.sh"), "#!/bin/sh\ncd \"$(dirname \"$0\")\"\nexec ./mygame \"$@\"\n").unwrap();
+        std::fs::write(dir.join("play-other.sh"), "#!/bin/sh\nexec proton waitforexitandrun /games/Other/Other.exe\n").unwrap();
+        for f in ["mygame", "run.sh", "play-other.sh"] {
+            std::fs::set_permissions(dir.join(f), std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let launcher = super::scan(&dir.join("run.sh")).unwrap();
+        assert!(launcher.main.is_some() && launcher.alone.is_none(), "the launcher means the folder");
+        let other = super::scan(&dir.join("play-other.sh")).unwrap();
+        assert!(other.main.is_none() && other.files.len() == 1, "another script is checked alone");
+        assert_eq!(other.alone.as_deref(), Some(Path::new("play-other.sh")));
+        assert_eq!(other.name, "play-other");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn names_files_and_folders() {

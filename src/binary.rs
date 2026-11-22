@@ -330,6 +330,33 @@ pub fn names_program(script: &Path, name: &str) -> bool {
     name_forms(name).iter().any(|f| text.contains(f.as_str()))
 }
 
+/// Whether a script starts the program as a command: some command on a line (after `&&`, `;`,
+/// `|`, settings like VAR=value, `exec`, `env`) is the program, by its name or a path ending
+/// in it, quotes taken out (GOG's start.sh: `./"openttd"`; YAW's run.sh: `LD_LIBRARY_PATH=...
+/// exec ./YAW`). Mentioning it isn't enough: a build script copying an AppImage names it too.
+pub fn starts_program(script: &Path, name: &str) -> bool {
+    let Ok(text) = std::fs::read(script) else { return false };
+    let forms = name_forms(name);
+    let is_it = |w: &str| {
+        let w: String = w.chars().filter(|c| *c != '"' && *c != '\'').collect();
+        forms.iter().any(|f| {
+            if let Some(prefix) = f.strip_suffix('$') {
+                w == *f || w.starts_with(f.as_str()) || w.contains(&format!("/{prefix}$"))
+            } else {
+                w == *f || w.ends_with(&format!("/{f}"))
+            }
+        })
+    };
+    String::from_utf8_lossy(&text).lines().any(|line| {
+        let l = line.trim();
+        !l.starts_with('#')
+            && l.split(['&', ';', '|']).any(|part| {
+                let first = part.split_whitespace().find(|w| !(w.contains('=') && !w.starts_with(['"', '\'', '$', '/', '.'])) && !matches!(*w, "exec" | "env" | "nohup" | "then" | "do" | "else" | "(" | "{"));
+                first.is_some_and(|w| is_it(w))
+            })
+    })
+}
+
 /// Whether a script runs `path` (a path ending in /<program name>) on some line, rather than
 /// only preparing it: Alcarys Complex's install script `chmod`s Alcarys_Complex/runner and
 /// writes a desktop shortcut, and doesn't start the game.

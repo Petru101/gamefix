@@ -676,6 +676,7 @@ pub fn setup(game: &Game, report: &Report, targets: &Targets) -> Result<Outcome,
             None if report.problems.iter().any(|p| matches!(p, Problem::Package(_, "apk"))) => Err("It's an Android app; get the game's Linux or Windows download instead.".into()),
             None if report.problems.iter().any(|p| matches!(p, Problem::Package(..))) => Err("It's a package to install into the system; get the game's .tar.gz, .zip or AppImage download instead.".into()),
             None if runner_needed(report).is_some() => Err(runner_needed(report).unwrap()),
+            None if game.alone.as_ref().is_some_and(|a| game.files.iter().any(|f| &f.path == a && matches!(f.binary, crate::binary::Binary::Script))) => Err("It's a script that starts something else: gamefix sets up games, not scripts. Set up the game it starts (its program or folder) instead.".into()),
             None => Err("No game program in this folder. If it's an installer, install the game first and set up the folder it installs to.".into()),
         };
     };
