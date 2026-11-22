@@ -134,7 +134,11 @@ pub fn scan(path: &Path) -> Option<Game> {
                 // dialog tool; an install.sh copies the game elsewhere).
                 let name = c.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
                 let installs = ["install", "postinst", "preinst", "preuninst", "postrm", "prerm", "uninst"].iter().any(|w| name.starts_with(w));
-                if !installs && pick.is_some_and(|p| p == *c || p.file_name().is_some_and(|n| binary::starts_program(&root.join(c), &n.to_string_lossy()))) {
+                // Or it starts another program of the folder's own that leads there: GOG's
+                // start.sh runs game/Terraria, a script that runs game/Terraria.bin.x86_64.
+                let starts = |p: &Path| p.file_name().is_some_and(|n| binary::starts_program(&root.join(c), &n.to_string_lossy()));
+                let starts_own = files.iter().filter(|f| f.path != *c && matches!(f.binary, Binary::Elf(_) | Binary::Script)).any(|f| starts(&f.path));
+                if !installs && pick.as_ref().is_some_and(|p| *p == *c || starts(p) || starts_own) {
                     launcher = true;
                 } else {
                     files.retain(|f| &f.path == c);
@@ -1039,6 +1043,16 @@ mod tests {
         }
         let launcher = super::scan(&dir.join("run.sh")).unwrap();
         assert!(launcher.main.is_some() && launcher.alone.is_none(), "the launcher means the folder");
+        // GOG's start.sh: runs game/<name>, a script that runs the real program.
+        std::fs::create_dir_all(dir.join("gog/game")).unwrap();
+        std::fs::copy("/bin/true", dir.join("gog/game/Gog.bin.x86_64")).unwrap();
+        std::fs::write(dir.join("gog/game/Gog"), "#!/bin/bash\nexec ./Gog.bin.x86_64 \"$@\"\n").unwrap();
+        std::fs::write(dir.join("gog/start.sh"), "#!/bin/bash\nrun_game() {\ncd \"${CURRENT_DIR}/game\"\n ./\"Gog\"\n}\n").unwrap();
+        for f in ["gog/game/Gog.bin.x86_64", "gog/game/Gog", "gog/start.sh"] {
+            std::fs::set_permissions(dir.join(f), std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let gog = super::scan(&dir.join("gog/start.sh")).unwrap();
+        assert!(gog.main.is_some() && gog.alone.is_none(), "GOG's start.sh means the game");
         let other = super::scan(&dir.join("play-other.sh")).unwrap();
         assert!(other.main.is_none() && other.files.len() == 1, "another script is checked alone");
         assert_eq!(other.alone.as_deref(), Some(Path::new("play-other.sh")));
